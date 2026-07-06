@@ -1,0 +1,17 @@
+build/
+DIMM_Release/
+.vscode/
+*.user
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+*.log
+*.obj
+*.pdb
+*.ilk
+*.recipe
+*.tlog
+*.dll
+*.exe
