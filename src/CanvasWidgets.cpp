@@ -1,13 +1,16 @@
 #include "CanvasWidgets.h"
+
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QResizeEvent>
+#include <QSizePolicy>
+#include <QStringList>
 #include <QWheelEvent>
-#include <QMouseEvent>
-#include <algorithm>
 
-// ============================================================
-// FullFrameCanvas
-// ============================================================
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
 FullFrameCanvas::FullFrameCanvas(QWidget* parent)
     : QWidget(parent)
@@ -19,8 +22,17 @@ FullFrameCanvas::FullFrameCanvas(QWidget* parent)
 
 void FullFrameCanvas::setImage(const cv::Mat& image)
 {
-    m_image = image;
-    m_imageDirty = true; // 标记需要重新转换QImage
+    m_image = image.empty() ? cv::Mat() : image;
+    m_imageDirty = true;
+
+    if (m_image.empty()) {
+        m_qimage = QImage();
+        m_scale = 1.0;
+        m_offset = QPointF();
+        m_hasViewTransform = false;
+        m_followImageFit = true;
+    }
+
     update();
 }
 
@@ -36,11 +48,46 @@ void FullFrameCanvas::setCurrentRoi(int index)
     update();
 }
 
+void FullFrameCanvas::setAlignmentOverlay(const AlignmentOverlay& overlay)
+{
+    m_alignmentOverlay = overlay;
+    update();
+}
+
+void FullFrameCanvas::clearAlignmentOverlay()
+{
+    m_alignmentOverlay = AlignmentOverlay();
+    update();
+}
+
+void FullFrameCanvas::setStarCandidateOverlays(const QVector<StarCandidateOverlay>& candidates)
+{
+    m_starCandidateOverlays = candidates;
+    update();
+}
+
+void FullFrameCanvas::clearStarCandidateOverlays()
+{
+    if (m_starCandidateOverlays.isEmpty()) {
+        return;
+    }
+    m_starCandidateOverlays.clear();
+    update();
+}
+
 void FullFrameCanvas::clear()
 {
     m_image = cv::Mat();
+    m_qimage = QImage();
+    m_imageDirty = true;
     m_rois.clear();
     m_currentRoiIndex = -1;
+    m_alignmentOverlay = AlignmentOverlay();
+    m_starCandidateOverlays.clear();
+    m_scale = 1.0;
+    m_offset = QPointF();
+    m_hasViewTransform = false;
+    m_followImageFit = true;
     update();
 }
 
@@ -54,10 +101,18 @@ QPointF FullFrameCanvas::imageToWidget(QPointF imagePos) const
     return imagePos * m_scale + m_offset;
 }
 
-void FullFrameCanvas::resizeEvent(QResizeEvent*)
+void FullFrameCanvas::resizeEvent(QResizeEvent* event)
 {
-    if (parentWidget()) {
-        resize(parentWidget()->size());
+    QWidget::resizeEvent(event);
+
+    if (m_image.empty()) {
+        return;
+    }
+
+    if (m_followImageFit || !m_hasViewTransform) {
+        fitImageToViewport();
+    } else {
+        clampOffset();
     }
 }
 
@@ -66,53 +121,92 @@ void FullFrameCanvas::paintEvent(QPaintEvent*)
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     painter.setRenderHint(QPainter::SmoothPixmapTransform);
-
-    // 背景
     painter.fillRect(rect(), QColor(17, 17, 17));
 
     if (m_image.empty()) {
-        painter.setPen(QColor(51, 51, 51));
+        painter.setPen(QColor(70, 70, 70));
         painter.setFont(QFont("Microsoft YaHei", 14));
-        painter.drawText(rect(), Qt::AlignCenter, "无图像数据");
+        painter.drawText(rect(), Qt::AlignCenter, "No image");
         return;
     }
 
     drawImage(painter);
+    drawAlignmentOverlay(painter);
     drawRoiOverlays(painter);
+    drawStarCandidateOverlays(painter);
     drawScaleBar(painter);
     drawInfo(painter);
 }
 
+void FullFrameCanvas::fitImageToViewport()
+{
+    if (m_qimage.isNull() || width() <= 0 || height() <= 0) {
+        return;
+    }
+
+    const double scaleX = static_cast<double>(width()) / m_qimage.width();
+    const double scaleY = static_cast<double>(height()) / m_qimage.height();
+    m_scale = std::min(scaleX, scaleY);
+    m_offset = QPointF((width() - m_qimage.width() * m_scale) / 2.0,
+                       (height() - m_qimage.height() * m_scale) / 2.0);
+    m_hasViewTransform = true;
+}
+
+void FullFrameCanvas::clampOffset()
+{
+    if (m_qimage.isNull() || width() <= 0 || height() <= 0) {
+        return;
+    }
+
+    const double scaledWidth = m_qimage.width() * m_scale;
+    const double scaledHeight = m_qimage.height() * m_scale;
+
+    if (scaledWidth <= width()) {
+        m_offset.setX((width() - scaledWidth) / 2.0);
+    } else {
+        const double minX = width() - scaledWidth;
+        m_offset.setX(std::clamp(m_offset.x(), minX, 0.0));
+    }
+
+    if (scaledHeight <= height()) {
+        m_offset.setY((height() - scaledHeight) / 2.0);
+    } else {
+        const double minY = height() - scaledHeight;
+        m_offset.setY(std::clamp(m_offset.y(), minY, 0.0));
+    }
+}
+
 void FullFrameCanvas::drawImage(QPainter& painter)
 {
-    // 仅在图像变化时重新转换为QImage（缓存优化）
     if (m_imageDirty && !m_image.empty()) {
         if (m_image.channels() == 3) {
             cv::Mat rgb;
             cv::cvtColor(m_image, rgb, cv::COLOR_BGR2RGB);
             m_qimage = QImage(rgb.data, rgb.cols, rgb.rows,
-                static_cast<int>(rgb.step), QImage::Format_RGB888).copy();
+                              static_cast<int>(rgb.step), QImage::Format_RGB888)
+                           .copy();
         } else if (m_image.channels() == 1) {
             m_qimage = QImage(m_image.data, m_image.cols, m_image.rows,
-                static_cast<int>(m_image.step), QImage::Format_Grayscale8).copy();
+                              static_cast<int>(m_image.step), QImage::Format_Grayscale8)
+                           .copy();
+        } else {
+            m_qimage = QImage();
         }
         m_imageDirty = false;
     }
 
-    if (m_qimage.isNull()) return;
+    if (m_qimage.isNull()) {
+        return;
+    }
 
-    // 计算缩放和偏移（居中显示）
-    double scaleX = static_cast<double>(width()) / m_qimage.width();
-    double scaleY = static_cast<double>(height()) / m_qimage.height();
-    m_scale = std::min(scaleX, scaleY);
+    if (!m_hasViewTransform || m_followImageFit) {
+        fitImageToViewport();
+    } else {
+        clampOffset();
+    }
 
-    double offsetX = (width() - m_qimage.width() * m_scale) / 2.0;
-    double offsetY = (height() - m_qimage.height() * m_scale) / 2.0;
-    m_offset = QPointF(offsetX, offsetY);
-
-    // 绘制图像
-    QRectF targetRect(m_offset.x(), m_offset.y(),
-        m_qimage.width() * m_scale, m_qimage.height() * m_scale);
+    const QRectF targetRect(m_offset.x(), m_offset.y(),
+                            m_qimage.width() * m_scale, m_qimage.height() * m_scale);
     painter.drawImage(targetRect, m_qimage);
 }
 
@@ -120,75 +214,254 @@ void FullFrameCanvas::drawRoiOverlays(QPainter& painter)
 {
     for (int i = 0; i < m_rois.size(); ++i) {
         const auto& roi = m_rois[i];
-        QPointF topLeft = imageToWidget(QPointF(roi.x, roi.y));
-        QPointF bottomRight = imageToWidget(QPointF(roi.x + roi.w, roi.y + roi.h));
-        QRectF roiRect(topLeft, bottomRight);
+        const QPointF topLeft = imageToWidget(QPointF(roi.x, roi.y));
+        const QPointF bottomRight = imageToWidget(QPointF(roi.x + roi.w, roi.y + roi.h));
+        const QRectF roiRect(topLeft, bottomRight);
+        const bool isCurrent = (i == m_currentRoiIndex);
 
-        bool isCurrent = (i == m_currentRoiIndex);
-
-        // 半透明填充
-        QColor fillColor = isCurrent ? QColor(255, 0, 0, 50) : QColor(79, 195, 247, 30);
-        painter.fillRect(roiRect, fillColor);
-
-        // 边框
-        QPen pen = isCurrent ? QPen(QColor(255, 0, 0), 2) : QPen(QColor(79, 195, 247), 1);
-        painter.setPen(pen);
+        painter.fillRect(roiRect, isCurrent ? QColor(255, 82, 82, 56)
+                                            : QColor(79, 195, 247, 32));
+        painter.setPen(isCurrent ? QPen(QColor(255, 82, 82), 2)
+                                 : QPen(QColor(79, 195, 247), 1));
         painter.drawRect(roiRect);
 
-        // ROI编号标签
         painter.setPen(QColor(255, 255, 255));
         painter.setFont(QFont("Consolas", 8));
-        QString label = QString("#%1").arg(i);
-        painter.drawText(roiRect.topLeft() + QPointF(2, 12), label);
+        painter.drawText(roiRect.topLeft() + QPointF(4, 14), QString("#%1").arg(i));
     }
+}
+
+void FullFrameCanvas::drawStarCandidateOverlays(QPainter& painter)
+{
+    if (m_starCandidateOverlays.isEmpty() || m_image.empty()) {
+        return;
+    }
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setFont(QFont("Consolas", 9, QFont::Bold));
+
+    for (const StarCandidateOverlay& candidate : m_starCandidateOverlays) {
+        const QPointF topLeft = imageToWidget(candidate.bbox.topLeft());
+        const QPointF bottomRight = imageToWidget(candidate.bbox.bottomRight());
+        const QRectF box(topLeft, bottomRight);
+        const QPointF center = imageToWidget(candidate.center);
+
+        const QColor color = candidate.selected ? QColor(255, 82, 82) : QColor(255, 210, 90);
+        painter.setPen(QPen(color, candidate.selected ? 2.0 : 1.3));
+        painter.drawRect(box);
+        painter.drawLine(center + QPointF(-6.0, 0.0), center + QPointF(6.0, 0.0));
+        painter.drawLine(center + QPointF(0.0, -6.0), center + QPointF(0.0, 6.0));
+
+        painter.setPen(QColor(255, 255, 255));
+        painter.drawText(box.topLeft() + QPointF(4.0, 14.0),
+                         QStringLiteral("#%1").arg(candidate.index));
+    }
+
+    painter.restore();
+}
+
+void FullFrameCanvas::drawAlignmentOverlay(QPainter& painter)
+{
+    if (!m_alignmentOverlay.enabled || m_image.empty() || m_scale <= 0.0) {
+        return;
+    }
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    const QPointF center = imageToWidget(m_alignmentOverlay.orbitCenter);
+    const double radius = std::max(0.0, m_alignmentOverlay.orbitRadiusPx * m_scale);
+    const QRectF imageRect(m_offset.x(),
+                           m_offset.y(),
+                           m_qimage.width() * m_scale,
+                           m_qimage.height() * m_scale);
+
+    painter.setFont(QFont("Microsoft YaHei", 8));
+    for (const CatalogMatchOverlay& match : m_alignmentOverlay.catalogMatches) {
+        const QPointF detected = imageToWidget(match.detectedPosition);
+        const QPointF predicted = imageToWidget(match.predictedPosition);
+        const QColor matchColor = match.isPolaris ? QColor(255, 86, 86, 220)
+                                                  : QColor(120, 235, 190, 185);
+
+        painter.setPen(QPen(QColor(255, 255, 255, 80), 1.0, Qt::DashLine));
+        painter.drawLine(detected, predicted);
+        painter.setPen(QPen(matchColor, match.isPolaris ? 2.0 : 1.2));
+        painter.drawEllipse(detected, match.isPolaris ? 5.0 : 3.5, match.isPolaris ? 5.0 : 3.5);
+        painter.drawLine(predicted + QPointF(-4.0, 0.0), predicted + QPointF(4.0, 0.0));
+        painter.drawLine(predicted + QPointF(0.0, -4.0), predicted + QPointF(0.0, 4.0));
+        if (match.isPolaris || match.residualPx > 2.0) {
+            const QString text = match.label.isEmpty()
+                                     ? QStringLiteral("%1 px").arg(match.residualPx, 0, 'f', 1)
+                                     : match.label;
+            painter.drawText(detected + QPointF(6.0, -6.0), text);
+        }
+    }
+
+    const QPen crossPen(QColor(34, 121, 255, 190), 1.2);
+    painter.setPen(crossPen);
+    painter.drawLine(QPointF(imageRect.left(), center.y()), QPointF(imageRect.right(), center.y()));
+    painter.drawLine(QPointF(center.x(), imageRect.top()), QPointF(center.x(), imageRect.bottom()));
+
+    if (radius > 1.0) {
+        painter.setPen(QPen(QColor(40, 92, 255, 220), 2.0));
+        painter.drawEllipse(center, radius, radius);
+    }
+
+    painter.setFont(QFont("Microsoft YaHei", 9));
+    if (m_alignmentOverlay.hasPredictedPolaris || m_alignmentOverlay.hasDetectedPolaris) {
+        const QPointF polarisForLine =
+            imageToWidget(m_alignmentOverlay.hasDetectedPolaris
+                              ? m_alignmentOverlay.detectedPolarisPosition
+                              : m_alignmentOverlay.predictedPolarisPosition);
+        painter.setPen(QPen(QColor(255, 235, 120, 180), 1.4, Qt::DashLine));
+        painter.drawLine(center, polarisForLine);
+    }
+
+    if (m_alignmentOverlay.hasPredictedPolaris) {
+        const QPointF predicted = imageToWidget(m_alignmentOverlay.predictedPolarisPosition);
+        painter.setPen(QPen(QColor(255, 160, 70), 2.0, Qt::DashLine));
+        painter.drawEllipse(predicted, 8.0, 8.0);
+        painter.drawLine(predicted + QPointF(-11.0, 0.0), predicted + QPointF(11.0, 0.0));
+        painter.drawLine(predicted + QPointF(0.0, -11.0), predicted + QPointF(0.0, 11.0));
+    }
+
+    if (m_alignmentOverlay.hasDetectedPolaris) {
+        const QPointF detected = imageToWidget(m_alignmentOverlay.detectedPolarisPosition);
+        painter.setPen(QPen(QColor(255, 86, 86), 2.4, Qt::SolidLine));
+        painter.drawEllipse(detected, 7.0, 7.0);
+        painter.drawLine(detected + QPointF(-10.0, 0.0), detected + QPointF(10.0, 0.0));
+        painter.drawLine(detected + QPointF(0.0, -10.0), detected + QPointF(0.0, 10.0));
+    }
+
+    if (m_alignmentOverlay.hasPredictedPolaris && m_alignmentOverlay.hasDetectedPolaris) {
+        const QPointF predicted = imageToWidget(m_alignmentOverlay.predictedPolarisPosition);
+        const QPointF detected = imageToWidget(m_alignmentOverlay.detectedPolarisPosition);
+        painter.setPen(QPen(QColor(255, 255, 255, 150), 1.2, Qt::DotLine));
+        painter.drawLine(predicted, detected);
+    }
+
+    if (m_alignmentOverlay.hasStar) {
+        const QPointF star = imageToWidget(m_alignmentOverlay.starPosition);
+        if (!m_alignmentOverlay.hasPredictedPolaris && !m_alignmentOverlay.hasDetectedPolaris) {
+            painter.setPen(QPen(QColor(255, 86, 86), 2.0));
+            painter.drawEllipse(star, 7.0, 7.0);
+            painter.drawLine(star + QPointF(-10.0, 0.0), star + QPointF(10.0, 0.0));
+            painter.drawLine(star + QPointF(0.0, -10.0), star + QPointF(0.0, 10.0));
+        }
+
+        const QString label = m_alignmentOverlay.label.isEmpty()
+                                  ? QStringLiteral("偏离轨道: %1 px")
+                                        .arg(m_alignmentOverlay.deviationPx, 0, 'f', 1)
+                                  : m_alignmentOverlay.label;
+        painter.setPen(QColor(255, 210, 90));
+        painter.drawText(star + QPointF(10.0, -10.0), label);
+    } else {
+        painter.setPen(QColor(255, 190, 70));
+        painter.drawText(imageRect.adjusted(12.0, 28.0, -12.0, -12.0).topLeft(),
+                         QStringLiteral("未检测到北极星"));
+    }
+
+    if (m_alignmentOverlay.matchedStarCount > 0) {
+        painter.setPen(QColor(210, 235, 255));
+        painter.drawText(imageRect.adjusted(12.0, 12.0, -12.0, -12.0).topLeft(),
+                         QStringLiteral("匹配 %1 星 | RMS %2 px | %3\"/px")
+                             .arg(m_alignmentOverlay.matchedStarCount)
+                             .arg(m_alignmentOverlay.rmsPx, 0, 'f', 2)
+                             .arg(m_alignmentOverlay.plateScaleArcsecPx, 0, 'f', 3));
+    }
+
+    QStringList detailLines;
+    if (!m_alignmentOverlay.solveStateText.isEmpty()) {
+        detailLines << m_alignmentOverlay.solveStateText;
+    }
+    if (m_alignmentOverlay.polarisNcpDistancePx > 0.0) {
+        detailLines << QStringLiteral("NCP-Polaris %1 px / %2'")
+                           .arg(m_alignmentOverlay.polarisNcpDistancePx, 0, 'f', 1)
+                           .arg(m_alignmentOverlay.polarisNcpDistanceArcmin, 0, 'f', 2);
+    }
+    if (!m_alignmentOverlay.orbitSource.isEmpty()) {
+        detailLines << QStringLiteral("轨道: %1").arg(m_alignmentOverlay.orbitSource);
+    }
+    if (m_alignmentOverlay.solveTotalMs > 0.0) {
+        detailLines << QStringLiteral("耗时 %1 ms")
+                           .arg(m_alignmentOverlay.solveTotalMs, 0, 'f', 1);
+    }
+    if (m_alignmentOverlay.mirroredKnown) {
+        detailLines << QStringLiteral("镜像: %1")
+                           .arg(m_alignmentOverlay.mirrored ? QStringLiteral("是")
+                                                            : QStringLiteral("否"));
+    }
+    if (!m_alignmentOverlay.warningText.isEmpty()) {
+        detailLines << m_alignmentOverlay.warningText;
+    }
+    if (!detailLines.isEmpty()) {
+        painter.setFont(QFont("Microsoft YaHei", 8));
+        painter.setPen(m_alignmentOverlay.warningText.isEmpty()
+                           ? QColor(210, 235, 255)
+                           : QColor(255, 190, 70));
+        painter.drawText(imageRect.adjusted(12.0, 46.0, -12.0, -12.0).topLeft(),
+                         detailLines.join(QLatin1String(" | ")));
+    }
+
+    painter.restore();
 }
 
 void FullFrameCanvas::drawScaleBar(QPainter& painter)
 {
-    if (m_image.empty()) return;
+    if (m_image.empty()) {
+        return;
+    }
 
-    // 右下角比例尺
     static constexpr int kScaleBarPixels = 100;
+    const int x = width() - 120;
+    const int y = height() - 30;
+
     painter.setPen(QPen(QColor(200, 200, 200), 2));
-    int x = width() - 120;
-    int y = height() - 30;
     painter.drawLine(x, y, x + kScaleBarPixels, y);
     painter.drawLine(x, y - 5, x, y + 5);
     painter.drawLine(x + kScaleBarPixels, y - 5, x + kScaleBarPixels, y + 5);
 
     painter.setPen(QColor(200, 200, 200));
     painter.setFont(QFont("Consolas", 8));
-    painter.drawText(x + 20, y - 8, "100px");
+    painter.drawText(x + 20, y - 8, "100 px");
 }
 
 void FullFrameCanvas::drawInfo(QPainter& painter)
 {
-    if (m_image.empty()) return;
+    if (m_image.empty()) {
+        return;
+    }
 
-    // 左上角显示图像信息
     painter.setPen(QColor(150, 150, 150));
     painter.setFont(QFont("Consolas", 9));
-    QString info = QString("%1×%2").arg(m_image.cols).arg(m_image.rows);
+    const QString info = QString("%1x%2  zoom %3%")
+                             .arg(m_image.cols)
+                             .arg(m_image.rows)
+                             .arg(static_cast<int>(m_scale * 100.0));
     painter.drawText(10, 20, info);
 }
 
 void FullFrameCanvas::wheelEvent(QWheelEvent* event)
 {
-    if (m_image.empty()) return;
+    if (m_image.empty() || m_qimage.isNull()) {
+        return;
+    }
 
-    double factor = (event->angleDelta().y() > 0) ? 1.2 : 1.0 / 1.2;
-    double newScale = m_scale * factor;
+    const double factor = (event->angleDelta().y() > 0) ? 1.2 : (1.0 / 1.2);
+    const double newScale = m_scale * factor;
+    if (newScale < 0.05 || newScale > 20.0) {
+        return;
+    }
 
-    // 限制缩放范围
-    if (newScale < 0.05 || newScale > 20.0) return;
-
-    // 以鼠标位置为中心缩放
-    QPointF mousePos = event->position();
-    QPointF imagePos = widgetToImage(mousePos);
+    const QPointF mousePos = event->position();
+    const QPointF imagePos = widgetToImage(mousePos);
 
     m_scale = newScale;
     m_offset = mousePos - imagePos * m_scale;
-
+    m_followImageFit = false;
+    m_hasViewTransform = true;
+    clampOffset();
     update();
 }
 
@@ -204,17 +477,19 @@ void FullFrameCanvas::mousePressEvent(QMouseEvent* event)
 void FullFrameCanvas::mouseMoveEvent(QMouseEvent* event)
 {
     if (m_isDragging) {
-        QPointF delta = event->pos() - m_lastMousePos;
+        const QPointF delta = event->pos() - m_lastMousePos;
         m_offset += delta;
         m_lastMousePos = event->pos();
+        m_followImageFit = false;
+        m_hasViewTransform = true;
+        clampOffset();
         update();
     }
 
-    // 发送鼠标位置信号
     if (!m_image.empty()) {
-        QPointF imgPos = widgetToImage(event->position());
-        int ix = static_cast<int>(imgPos.x());
-        int iy = static_cast<int>(imgPos.y());
+        const QPointF imgPos = widgetToImage(event->position());
+        const int ix = static_cast<int>(imgPos.x());
+        const int iy = static_cast<int>(imgPos.y());
         if (ix >= 0 && ix < m_image.cols && iy >= 0 && iy < m_image.rows) {
             emit mousePositionChanged(ix, iy);
         }
@@ -228,10 +503,6 @@ void FullFrameCanvas::mouseReleaseEvent(QMouseEvent* event)
     setCursor(Qt::ArrowCursor);
 }
 
-// ============================================================
-// RoiStarCanvas
-// ============================================================
-
 RoiStarCanvas::RoiStarCanvas(QWidget* parent)
     : QWidget(parent)
 {
@@ -240,16 +511,14 @@ RoiStarCanvas::RoiStarCanvas(QWidget* parent)
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 }
 
-void RoiStarCanvas::resizeEvent(QResizeEvent*)
+void RoiStarCanvas::resizeEvent(QResizeEvent* event)
 {
-    if (parentWidget()) {
-        resize(parentWidget()->size());
-    }
+    QWidget::resizeEvent(event);
 }
 
 void RoiStarCanvas::setRoiImage(const cv::Mat& roiImage)
 {
-    m_roiImage = roiImage;
+    m_roiImage = roiImage.empty() ? cv::Mat() : roiImage.clone();
     m_imageDirty = true;
     update();
 }
@@ -265,6 +534,8 @@ void RoiStarCanvas::setCentroid(double x, double y)
 void RoiStarCanvas::clear()
 {
     m_roiImage = cv::Mat();
+    m_qimage = QImage();
+    m_imageDirty = true;
     m_hasCentroid = false;
     update();
 }
@@ -273,14 +544,12 @@ void RoiStarCanvas::paintEvent(QPaintEvent*)
 {
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
-
-    // 背景
     painter.fillRect(rect(), QColor(17, 17, 17));
 
     if (m_roiImage.empty()) {
-        painter.setPen(QColor(51, 51, 51));
+        painter.setPen(QColor(70, 70, 70));
         painter.setFont(QFont("Microsoft YaHei", 10));
-        painter.drawText(rect(), Qt::AlignCenter, "无ROI数据");
+        painter.drawText(rect(), Qt::AlignCenter, "No ROI data");
         return;
     }
 
@@ -293,124 +562,124 @@ void RoiStarCanvas::paintEvent(QPaintEvent*)
 
 void RoiStarCanvas::drawImage(QPainter& painter)
 {
-    // 仅在图像变化时重新转换为QImage（缓存优化）
     if (m_imageDirty && !m_roiImage.empty()) {
         if (m_roiImage.channels() == 3) {
             cv::Mat rgb;
             cv::cvtColor(m_roiImage, rgb, cv::COLOR_BGR2RGB);
             m_qimage = QImage(rgb.data, rgb.cols, rgb.rows,
-                static_cast<int>(rgb.step), QImage::Format_RGB888).copy();
+                              static_cast<int>(rgb.step), QImage::Format_RGB888)
+                           .copy();
         } else if (m_roiImage.channels() == 1) {
+            cv::Mat gray;
             if (m_roiImage.type() == CV_64F) {
-                cv::Mat display;
-                double minVal, maxVal;
-                cv::minMaxLoc(m_roiImage, &minVal, &maxVal);
-                if (maxVal > minVal) {
-                    m_roiImage.convertTo(display, CV_8U, 255.0 / (maxVal - minVal),
-                        -255.0 * minVal / (maxVal - minVal));
-                } else {
-                    display = cv::Mat(m_roiImage.size(), CV_8U, cv::Scalar(128));
-                }
-                m_qimage = QImage(display.data, display.cols, display.rows,
-                    static_cast<int>(display.step), QImage::Format_Grayscale8).copy();
+                gray = m_roiImage;
             } else {
-                m_qimage = QImage(m_roiImage.data, m_roiImage.cols, m_roiImage.rows,
-                    static_cast<int>(m_roiImage.step), QImage::Format_Grayscale8).copy();
+                m_roiImage.convertTo(gray, CV_64F);
             }
+
+            cv::Mat display;
+            double minVal = 0.0;
+            double maxVal = 0.0;
+            cv::minMaxLoc(gray, &minVal, &maxVal);
+            if (maxVal > minVal) {
+                gray.convertTo(display, CV_8U, 255.0 / (maxVal - minVal),
+                               -255.0 * minVal / (maxVal - minVal));
+            } else {
+                display = cv::Mat(gray.size(), CV_8U, cv::Scalar(128));
+            }
+
+            m_qimage = QImage(display.data, display.cols, display.rows,
+                              static_cast<int>(display.step), QImage::Format_Grayscale8)
+                           .copy();
+        } else {
+            m_qimage = QImage();
         }
         m_imageDirty = false;
     }
 
-    if (m_qimage.isNull()) return;
+    if (m_qimage.isNull()) {
+        return;
+    }
 
-    // 居中缩放
-    double scaleX = static_cast<double>(width()) / m_qimage.width();
-    double scaleY = static_cast<double>(height()) / m_qimage.height();
-    double scale = std::min(scaleX, scaleY);
+    const double scaleX = static_cast<double>(width()) / m_qimage.width();
+    const double scaleY = static_cast<double>(height()) / m_qimage.height();
+    const double scale = std::min(scaleX, scaleY);
+    const double offsetX = (width() - m_qimage.width() * scale) / 2.0;
+    const double offsetY = (height() - m_qimage.height() * scale) / 2.0;
 
-    double offsetX = (width() - m_qimage.width() * scale) / 2.0;
-    double offsetY = (height() - m_qimage.height() * scale) / 2.0;
-
-    QRectF targetRect(offsetX, offsetY, m_qimage.width() * scale, m_qimage.height() * scale);
-    painter.drawImage(targetRect, m_qimage);
+    painter.drawImage(QRectF(offsetX, offsetY, m_qimage.width() * scale, m_qimage.height() * scale),
+                      m_qimage);
 }
 
 void RoiStarCanvas::drawGrid(QPainter& painter)
 {
-    if (m_roiImage.empty()) return;
+    if (m_roiImage.empty()) {
+        return;
+    }
 
-    double scaleX = static_cast<double>(width()) / m_roiImage.cols;
-    double scaleY = static_cast<double>(height()) / m_roiImage.rows;
-    double scale = std::min(scaleX, scaleY);
-
-    double offsetX = (width() - m_roiImage.cols * scale) / 2.0;
-    double offsetY = (height() - m_roiImage.rows * scale) / 2.0;
+    const double scaleX = static_cast<double>(width()) / m_roiImage.cols;
+    const double scaleY = static_cast<double>(height()) / m_roiImage.rows;
+    const double scale = std::min(scaleX, scaleY);
+    const double offsetX = (width() - m_roiImage.cols * scale) / 2.0;
+    const double offsetY = (height() - m_roiImage.rows * scale) / 2.0;
 
     painter.setPen(QPen(QColor(50, 50, 50), 0.5));
 
-    // 垂直线
     for (int x = 0; x <= m_roiImage.cols; ++x) {
-        double px = offsetX + x * scale;
+        const double px = offsetX + x * scale;
         painter.drawLine(QPointF(px, offsetY), QPointF(px, offsetY + m_roiImage.rows * scale));
     }
 
-    // 水平线
     for (int y = 0; y <= m_roiImage.rows; ++y) {
-        double py = offsetY + y * scale;
+        const double py = offsetY + y * scale;
         painter.drawLine(QPointF(offsetX, py), QPointF(offsetX + m_roiImage.cols * scale, py));
     }
 }
 
 void RoiStarCanvas::drawCentroid(QPainter& painter)
 {
-    if (m_roiImage.empty()) return;
+    if (m_roiImage.empty()) {
+        return;
+    }
 
-    double scaleX = static_cast<double>(width()) / m_roiImage.cols;
-    double scaleY = static_cast<double>(height()) / m_roiImage.rows;
-    double scale = std::min(scaleX, scaleY);
+    const double scaleX = static_cast<double>(width()) / m_roiImage.cols;
+    const double scaleY = static_cast<double>(height()) / m_roiImage.rows;
+    const double scale = std::min(scaleX, scaleY);
+    const double offsetX = (width() - m_roiImage.cols * scale) / 2.0;
+    const double offsetY = (height() - m_roiImage.rows * scale) / 2.0;
+    const double cx = offsetX + m_centroidX * scale;
+    const double cy = offsetY + m_centroidY * scale;
 
-    double offsetX = (width() - m_roiImage.cols * scale) / 2.0;
-    double offsetY = (height() - m_roiImage.rows * scale) / 2.0;
-
-    double cx = offsetX + m_centroidX * scale;
-    double cy = offsetY + m_centroidY * scale;
-
-    // 十字线
     painter.setPen(QPen(QColor(255, 0, 0), 1));
-    double crossSize = 10;
+    const double crossSize = 10.0;
     painter.drawLine(QPointF(cx - crossSize, cy), QPointF(cx + crossSize, cy));
     painter.drawLine(QPointF(cx, cy - crossSize), QPointF(cx, cy + crossSize));
-
-    // 中心圆
-    painter.setPen(QPen(QColor(255, 0, 0), 1));
     painter.setBrush(Qt::NoBrush);
     painter.drawEllipse(QPointF(cx, cy), 5, 5);
 
-    // 坐标值
     painter.setPen(QColor(0, 200, 255));
     painter.setFont(QFont("Consolas", 9));
-    QString coordText = QString("(%1, %2)")
-        .arg(m_centroidX, 0, 'f', 1)
-        .arg(m_centroidY, 0, 'f', 1);
-    painter.drawText(QPointF(cx + 12, cy - 5), coordText);
+    painter.drawText(QPointF(cx + 12, cy - 5),
+                     QString("(%1, %2)").arg(m_centroidX, 0, 'f', 1).arg(m_centroidY, 0, 'f', 1));
 }
 
 void RoiStarCanvas::mouseMoveEvent(QMouseEvent* event)
 {
-    if (m_roiImage.empty()) return;
+    if (m_roiImage.empty()) {
+        return;
+    }
 
-    double scaleX = static_cast<double>(width()) / m_roiImage.cols;
-    double scaleY = static_cast<double>(height()) / m_roiImage.rows;
-    double scale = std::min(scaleX, scaleY);
+    const double scaleX = static_cast<double>(width()) / m_roiImage.cols;
+    const double scaleY = static_cast<double>(height()) / m_roiImage.rows;
+    const double scale = std::min(scaleX, scaleY);
+    const double offsetX = (width() - m_roiImage.cols * scale) / 2.0;
+    const double offsetY = (height() - m_roiImage.rows * scale) / 2.0;
 
-    double offsetX = (width() - m_roiImage.cols * scale) / 2.0;
-    double offsetY = (height() - m_roiImage.rows * scale) / 2.0;
-
-    int px = static_cast<int>((event->pos().x() - offsetX) / scale);
-    int py = static_cast<int>((event->pos().y() - offsetY) / scale);
+    const int px = static_cast<int>((event->pos().x() - offsetX) / scale);
+    const int py = static_cast<int>((event->pos().y() - offsetY) / scale);
 
     if (px >= 0 && px < m_roiImage.cols && py >= 0 && py < m_roiImage.rows) {
-        double value = 0;
+        double value = 0.0;
         if (m_roiImage.type() == CV_64F) {
             value = m_roiImage.at<double>(py, px);
         } else if (m_roiImage.type() == CV_8U) {
@@ -420,37 +689,33 @@ void RoiStarCanvas::mouseMoveEvent(QMouseEvent* event)
     }
 }
 
-// ============================================================
-// ChartWidget
-// ============================================================
-
 ChartWidget::ChartWidget(QWidget* parent)
-    : QWidget(parent)
+    : ChartWidget(SeriesKind::R0, parent)
 {
-    setMinimumSize(200, 150);
 }
 
-void ChartWidget::addDataPoint(double r0, double seeing, double centroidX, double centroidY)
+ChartWidget::ChartWidget(SeriesKind kind, QWidget* parent)
+    : QWidget(parent)
+    , m_kind(kind)
+    , m_data(WINDOW_SECONDS, std::numeric_limits<double>::quiet_NaN())
 {
-    m_r0Data.append(r0);
-    m_seeingData.append(seeing);
-    m_trajectoryData.append(QPointF(centroidX, centroidY));
-    m_timeCounter++;
+    setMinimumSize(260, 220);
+}
 
-    // 限制数据量
-    while (m_r0Data.size() > MAX_POINTS) m_r0Data.removeFirst();
-    while (m_seeingData.size() > MAX_POINTS) m_seeingData.removeFirst();
-    while (m_trajectoryData.size() > MAX_POINTS) m_trajectoryData.removeFirst();
-
+void ChartWidget::setSecondValue(int second, double value)
+{
+    if (second < 0 || second >= WINDOW_SECONDS) {
+        return;
+    }
+    m_data[second] = value;
     update();
 }
 
 void ChartWidget::clear()
 {
-    m_r0Data.clear();
-    m_seeingData.clear();
-    m_trajectoryData.clear();
-    m_timeCounter = 0;
+    std::fill(m_data.begin(), m_data.end(), std::numeric_limits<double>::quiet_NaN());
+    m_displayMinY = 0.0;
+    m_displayMaxY = std::numeric_limits<double>::quiet_NaN();
     update();
 }
 
@@ -458,158 +723,187 @@ void ChartWidget::paintEvent(QPaintEvent*)
 {
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
-
-    // 背景
     painter.fillRect(rect(), QColor(17, 17, 17));
 
-    if (m_r0Data.isEmpty()) {
-        painter.setPen(QColor(51, 51, 51));
+    const bool hasAnyValue =
+        std::any_of(m_data.cbegin(), m_data.cend(), [](double value) { return !std::isnan(value); });
+
+    if (!hasAnyValue) {
+        painter.setPen(QColor(70, 70, 70));
         painter.setFont(QFont("Microsoft YaHei", 10));
-        painter.drawText(rect(), Qt::AlignCenter, "无数据");
+        painter.drawText(rect(), Qt::AlignCenter, "No data");
         return;
     }
 
-    // 将区域分为3部分
-    int w = width();
-    int h = height();
-    int chartW = w / 3 - 10;
-
-    QRect r0Rect(5, 5, chartW, h - 10);
-    QRect seeingRect(chartW + 15, 5, chartW, h - 10);
-    QRect trajectoryRect(2 * chartW + 25, 5, w - 2 * chartW - 30, h - 10);
-
-    drawR0Chart(painter, r0Rect);
-    drawSeeingChart(painter, seeingRect);
-    drawTrajectory(painter, trajectoryRect);
+    drawSeriesChart(painter, rect().adjusted(0, 0, -1, -1));
 }
 
-void ChartWidget::drawR0Chart(QPainter& painter, QRect rect)
+void ChartWidget::drawSeriesChart(QPainter& painter, QRect rect)
 {
-    // 标题
-    painter.setPen(QColor(79, 195, 247));
-    painter.setFont(QFont("Microsoft YaHei", 9, QFont::Bold));
-    painter.drawText(rect.x() + 5, rect.y() + 15, "大气相干长度 r₀");
+    const bool isR0 = m_kind == SeriesKind::R0;
+    const QColor lineColor = isR0 ? QColor(79, 195, 247) : QColor(139, 195, 74);
+    const QString title = isR0 ? QStringLiteral("r0") : QStringLiteral("Seeing");
+    const QString unit = isR0 ? QStringLiteral("cm") : QStringLiteral("arcsec");
+    const double minY = m_displayMinY;
+    const double maxY = smoothDisplayMaxY(computeTargetMaxY());
 
-    QRect chartRect(rect.x() + 5, rect.y() + 25, rect.width() - 10, rect.height() - 35);
+    painter.setPen(QPen(QColor(52, 52, 82), 1));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRoundedRect(rect.adjusted(1, 1, -2, -2), 8, 8);
 
-    // 背景
+    painter.setPen(lineColor);
+    painter.setFont(QFont("Microsoft YaHei", 11, QFont::Bold));
+    painter.drawText(rect.x() + 16, rect.y() + 26, title);
+
+    const QRect chartRect(rect.x() + 46, rect.y() + 42, rect.width() - 64, rect.height() - 70);
     painter.fillRect(chartRect, QColor(30, 30, 48));
+    drawAxes(painter, chartRect, m_data, minY, maxY, unit);
 
-    if (m_r0Data.isEmpty()) return;
-
-    drawAxes(painter, chartRect, m_r0Data, 0, 20, "cm");
-
-    // 绘制曲线
-    if (m_r0Data.size() < 2) return;
-
-    QPen curvePen(QColor(79, 195, 247), 1.5);
-    painter.setPen(curvePen);
-
-    double minY = 0, maxY = 20;
-    double xStep = static_cast<double>(chartRect.width()) / (MAX_POINTS - 1);
+    painter.setPen(QPen(lineColor, 2.0));
+    const double xStep = static_cast<double>(chartRect.width()) / (WINDOW_SECONDS - 1);
 
     QPainterPath path;
-    for (int i = 0; i < m_r0Data.size(); ++i) {
-        double x = chartRect.x() + i * xStep;
-        double y = chartRect.y() + chartRect.height() -
-            (m_r0Data[i] - minY) / (maxY - minY) * chartRect.height();
-        if (i == 0) path.moveTo(x, y);
-        else path.lineTo(x, y);
+    bool hasStarted = false;
+    for (int i = 0; i < m_data.size(); ++i) {
+        if (std::isnan(m_data[i])) {
+            continue;
+        }
+        const double x = chartRect.x() + i * xStep;
+        const double normalized = std::clamp((m_data[i] - minY) / (maxY - minY), 0.0, 1.0);
+        const double y = chartRect.y() + chartRect.height() - normalized * chartRect.height();
+        if (!hasStarted) {
+            path.moveTo(x, y);
+            hasStarted = true;
+        } else {
+            path.lineTo(x, y);
+        }
     }
-    painter.drawPath(path);
-}
-
-void ChartWidget::drawSeeingChart(QPainter& painter, QRect rect)
-{
-    painter.setPen(QColor(139, 195, 74));
-    painter.setFont(QFont("Microsoft YaHei", 9, QFont::Bold));
-    painter.drawText(rect.x() + 5, rect.y() + 15, "视宁度");
-
-    QRect chartRect(rect.x() + 5, rect.y() + 25, rect.width() - 10, rect.height() - 35);
-    painter.fillRect(chartRect, QColor(30, 30, 48));
-
-    if (m_seeingData.isEmpty()) return;
-
-    drawAxes(painter, chartRect, m_seeingData, 0, 5, "角秒");
-
-    if (m_seeingData.size() < 2) return;
-
-    QPen curvePen(QColor(139, 195, 74), 1.5);
-    painter.setPen(curvePen);
-
-    double minY = 0, maxY = 5;
-    double xStep = static_cast<double>(chartRect.width()) / (MAX_POINTS - 1);
-
-    QPainterPath path;
-    for (int i = 0; i < m_seeingData.size(); ++i) {
-        double x = chartRect.x() + i * xStep;
-        double y = chartRect.y() + chartRect.height() -
-            (m_seeingData[i] - minY) / (maxY - minY) * chartRect.height();
-        if (i == 0) path.moveTo(x, y);
-        else path.lineTo(x, y);
-    }
-    painter.drawPath(path);
-}
-
-void ChartWidget::drawTrajectory(QPainter& painter, QRect rect)
-{
-    painter.setPen(QColor(255, 152, 0));
-    painter.setFont(QFont("Microsoft YaHei", 9, QFont::Bold));
-    painter.drawText(rect.x() + 5, rect.y() + 15, "质心轨迹");
-
-    QRect chartRect(rect.x() + 5, rect.y() + 25, rect.width() - 10, rect.height() - 35);
-    painter.fillRect(chartRect, QColor(30, 30, 48));
-
-    if (m_trajectoryData.isEmpty()) return;
-
-    // 计算范围
-    double minX = m_trajectoryData[0].x(), maxX = minX;
-    double minY = m_trajectoryData[0].y(), maxY = minY;
-    for (const auto& p : m_trajectoryData) {
-        minX = std::min(minX, p.x()); maxX = std::max(maxX, p.x());
-        minY = std::min(minY, p.y()); maxY = std::max(maxY, p.y());
-    }
-
-    double rangeX = maxX - minX;
-    double rangeY = maxY - minY;
-    if (rangeX < 1) rangeX = 1;
-    if (rangeY < 1) rangeY = 1;
-
-    // 边距
-    minX -= rangeX * 0.1;
-    maxX += rangeX * 0.1;
-    minY -= rangeY * 0.1;
-    maxY += rangeY * 0.1;
-
-    // 绘制散点
-    painter.setPen(Qt::NoPen);
-    painter.setBrush(QColor(255, 152, 0));
-
-    for (int i = 0; i < m_trajectoryData.size(); ++i) {
-        double x = chartRect.x() +
-            (m_trajectoryData[i].x() - minX) / (maxX - minX) * chartRect.width();
-        double y = chartRect.y() + chartRect.height() -
-            (m_trajectoryData[i].y() - minY) / (maxY - minY) * chartRect.height();
-
-        // 渐变透明度（越新的点越不透明）
-        int alpha = 50 + 205 * i / m_trajectoryData.size();
-        painter.setBrush(QColor(255, 152, 0, alpha));
-        painter.drawEllipse(QPointF(x, y), 2, 2);
+    if (hasStarted) {
+        painter.drawPath(path);
     }
 }
 
-void ChartWidget::drawAxes(QPainter& painter, QRect rect, const QVector<double>& data,
+void ChartWidget::drawAxes(QPainter& painter, QRect rect, const QVector<double>&,
                            double minY, double maxY, const QString& unit)
 {
-    // 坐标轴
-    painter.setPen(QPen(QColor(80, 80, 80), 1));
+    painter.setPen(QPen(QColor(56, 56, 78), 1));
+    for (int i = 1; i <= 3; ++i) {
+        const int y = rect.top() + (rect.height() * i) / 4;
+        painter.drawLine(rect.left(), y, rect.right(), y);
+    }
+    for (int i = 1; i <= 4; ++i) {
+        const int x = rect.left() + (rect.width() * i) / 4;
+        painter.drawLine(x, rect.top(), x, rect.bottom());
+    }
+
+    painter.setPen(QPen(QColor(112, 112, 140), 1.2));
     painter.drawLine(rect.bottomLeft(), rect.bottomRight());
     painter.drawLine(rect.bottomLeft(), rect.topLeft());
 
-    // Y轴标签
-    painter.setPen(QColor(120, 120, 120));
-    painter.setFont(QFont("Consolas", 7));
-    painter.drawText(rect.x() - 30, rect.y() + 5, QString("%1%2").arg(maxY, 0, 'f', 1).arg(unit));
-    painter.drawText(rect.x() - 30, rect.y() + rect.height(),
-        QString("%1%2").arg(minY, 0, 'f', 1).arg(unit));
+    painter.setPen(QColor(170, 170, 190));
+    painter.setFont(QFont("Consolas", 8));
+    painter.drawText(QRect(rect.left() - 42, rect.top() - 6, 40, 16),
+                     Qt::AlignRight | Qt::AlignVCenter,
+                     QString::number(maxY, 'f', 1));
+    painter.drawText(QRect(rect.left() - 42, rect.center().y() - 8, 40, 16),
+                     Qt::AlignRight | Qt::AlignVCenter,
+                     QString::number((minY + maxY) / 2.0, 'f', 1));
+    painter.drawText(QRect(rect.left() - 42, rect.bottom() - 10, 40, 16),
+                     Qt::AlignRight | Qt::AlignVCenter,
+                     QString::number(minY, 'f', 1));
+
+    painter.setPen(QColor(130, 130, 156));
+    painter.drawText(QRect(rect.left() - 4, rect.top() - 18, 64, 14),
+                     Qt::AlignLeft | Qt::AlignVCenter,
+                     unit);
+
+    painter.setPen(QColor(140, 140, 166));
+    painter.drawText(QRect(rect.left() - 10, rect.bottom() + 8, 24, 14),
+                     Qt::AlignLeft | Qt::AlignVCenter,
+                     QStringLiteral("0s"));
+    painter.drawText(QRect(rect.left() + rect.width() / 4 - 18, rect.bottom() + 8, 36, 14),
+                     Qt::AlignCenter,
+                     QStringLiteral("15s"));
+    painter.drawText(QRect(rect.left() + rect.width() / 2 - 18, rect.bottom() + 8, 36, 14),
+                     Qt::AlignCenter,
+                     QStringLiteral("30s"));
+    painter.drawText(QRect(rect.left() + (rect.width() * 3) / 4 - 18, rect.bottom() + 8, 36, 14),
+                     Qt::AlignCenter,
+                     QStringLiteral("45s"));
+    painter.drawText(QRect(rect.right() - 28, rect.bottom() + 8, 36, 14),
+                     Qt::AlignRight | Qt::AlignVCenter,
+                     QStringLiteral("60s"));
+}
+
+double ChartWidget::baselineMaxY() const
+{
+    return m_kind == SeriesKind::R0 ? 20.0 : 1.0;
+}
+
+double ChartWidget::computeTargetMaxY() const
+{
+    double maxValue = 0.0;
+    bool hasValue = false;
+    for (double value : m_data) {
+        if (std::isnan(value) || !std::isfinite(value)) {
+            continue;
+        }
+        maxValue = std::max(maxValue, value);
+        hasValue = true;
+    }
+
+    if (!hasValue) {
+        return baselineMaxY();
+    }
+
+    const double paddedMax = std::max(maxValue * 1.15, baselineMaxY());
+    return niceCeil(paddedMax);
+}
+
+double ChartWidget::smoothDisplayMaxY(double targetMaxY)
+{
+    const double safeTarget = std::max(targetMaxY, baselineMaxY());
+    if (!std::isfinite(m_displayMaxY)) {
+        m_displayMaxY = safeTarget;
+        return m_displayMaxY;
+    }
+
+    const double delta = safeTarget - m_displayMaxY;
+    if (std::abs(delta) < 1e-6) {
+        return m_displayMaxY;
+    }
+
+    const double factor = delta > 0.0 ? 0.35 : 0.12;
+    m_displayMaxY += delta * factor;
+
+    if (std::abs(safeTarget - m_displayMaxY) < safeTarget * 0.02) {
+        m_displayMaxY = safeTarget;
+    }
+
+    m_displayMaxY = std::max(m_displayMaxY, baselineMaxY());
+    return m_displayMaxY;
+}
+
+double ChartWidget::niceCeil(double value)
+{
+    if (!std::isfinite(value) || value <= 0.0) {
+        return 1.0;
+    }
+
+    const double exponent = std::floor(std::log10(value));
+    const double scale = std::pow(10.0, exponent);
+    const double normalized = value / scale;
+
+    double niceNormalized = 1.0;
+    if (normalized <= 1.0) {
+        niceNormalized = 1.0;
+    } else if (normalized <= 2.0) {
+        niceNormalized = 2.0;
+    } else if (normalized <= 5.0) {
+        niceNormalized = 5.0;
+    } else {
+        niceNormalized = 10.0;
+    }
+
+    return niceNormalized * scale;
 }
