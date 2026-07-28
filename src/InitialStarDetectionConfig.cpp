@@ -1,7 +1,6 @@
 #include "InitialStarDetectionConfig.h"
 
 #include "ConfigTextUtils.h"
-#include "ImageUtils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -15,6 +14,7 @@
 #include <QTextStream>
 
 namespace {
+constexpr double kMono12MaxDn = 4095.0;
 
 InitialStarDetectionConfig loadInitialStarDetectionConfig()
 {
@@ -54,7 +54,7 @@ InitialStarDetectionConfig loadInitialStarDetectionConfig()
         }
 
         if (key == QStringLiteral("threshold_absolute") || key == QStringLiteral("absolute")) {
-            config.thresholdAbsolute = ImageUtils::normalizeThresholdToMono8(number);
+            config.thresholdAbsolute = number >= 0.0 ? number : -1.0;
         } else if (key == QStringLiteral("threshold_sigma") || key == QStringLiteral("sigma")) {
             config.sigmaThreshold = std::max(0.0, number);
         } else if (key == QStringLiteral("threshold_peak_fraction") ||
@@ -62,7 +62,7 @@ InitialStarDetectionConfig loadInitialStarDetectionConfig()
             config.peakFraction = std::clamp(number, 0.01, 0.95);
         } else if (key == QStringLiteral("threshold_min_intensity") ||
                    key == QStringLiteral("min_intensity")) {
-            config.minimumIntensity = ImageUtils::normalizeThresholdToMono8(number);
+            config.minimumIntensity = std::max(0.0, number);
         } else if (key == QStringLiteral("star_min_area")) {
             config.minArea = std::max(1, static_cast<int>(std::lround(number)));
         } else if (key == QStringLiteral("star_max_area")) {
@@ -75,10 +75,10 @@ InitialStarDetectionConfig loadInitialStarDetectionConfig()
 InitialStarDetectionConfig sanitizeInitialStarDetectionConfig(InitialStarDetectionConfig config)
 {
     config.thresholdAbsolute =
-        config.thresholdAbsolute >= 0.0 ? ImageUtils::normalizeThresholdToMono8(config.thresholdAbsolute) : -1.0;
+        config.thresholdAbsolute >= 0.0 ? std::clamp(config.thresholdAbsolute, 0.0, kMono12MaxDn) : -1.0;
     config.sigmaThreshold = std::clamp(config.sigmaThreshold, 0.0, 20.0);
     config.peakFraction = std::clamp(config.peakFraction, 0.01, 0.95);
-    config.minimumIntensity = ImageUtils::normalizeThresholdToMono8(std::max(0.0, config.minimumIntensity));
+    config.minimumIntensity = std::clamp(std::max(0.0, config.minimumIntensity), 0.0, kMono12MaxDn);
     config.minArea = std::max(1, config.minArea);
     config.maxArea = std::max(config.minArea, config.maxArea);
     return config;

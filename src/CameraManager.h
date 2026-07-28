@@ -56,6 +56,9 @@ struct RoiUpdatePauseState {
 
 struct CameraFrame {
     cv::Mat image;
+    GX_PIXEL_FORMAT_ENTRY pixelFormat = GX_PIXEL_FORMAT_UNDEFINED;
+    int bitDepth = 0;
+    double maxPixelValue = 0.0;
     quint64 frameId = 0;
     quint64 cameraTimestamp = 0;
     qint64 receivedMs = 0;

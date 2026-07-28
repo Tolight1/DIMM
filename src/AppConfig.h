@@ -4,19 +4,47 @@
 #include <QtGlobal>
 
 struct CameraConfig {
-    double exposureUs = 2000.0;
+    double exposureUs = 1000.0;
     double gainDb = 10.0;
     double continuousFrameRateHz = 200.0;
 };
 
 struct AutoExposureConfig {
     bool enabled = false;
+    bool useFittedPeak = false;
+
     double lowThreshold = 80.0;
     double highThreshold = 220.0;
     double darkRatio = 1.2;
     double brightRatio = 0.8;
+
+    double targetPeakLowDn = 3200.0;
+    double targetPeakHighDn = 3600.0;
+    double nearSaturationDn = 3800.0;
+    double hardSaturationDn = 4090.0;
+    int saturatedPixelCount = 1;
+
+    double darkSnrWarning = 8.0;
+    double darkSnrCritical = 5.0;
+    double minValidCentroidRatio = 0.50;
+    double starLostValidRatio = 0.10;
+    double brightFrameRatioThreshold = 0.30;
+    double darkFrameRatioThreshold = 0.50;
+
+    int sampleWindowSec = 60;
+    int brightPersistenceSec = 5;
+    int darkPersistenceSec = 60;
+    int starLostPersistenceSec = 120;
+    int trendConflictPersistenceSec = 30;
+    int safePersistenceSec = 60;
+    int cooldownSec = 180;
+
     double minExposureUs = 500.0;
     double maxExposureUs = 20000.0;
+    int maxTemplateStepPerAdjust = 1;
+    double maxExposureChangeRatioUp = 1.30;
+    double maxExposureChangeRatioDown = 0.70;
+    double cameraAgreementRatio = 0.50;
 };
 
 struct ProcessingConfig {

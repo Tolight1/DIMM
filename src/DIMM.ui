@@ -411,6 +411,16 @@
              <property name="text"><string>统计窗口: 200 帧</string></property>
             </widget>
            </item>
+           <item>
+            <widget class="QLabel" name="lblStatExposure">
+             <property name="text"><string>曝光: 1000 μs | AE: 关闭</string></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblStatAutoExposure">
+             <property name="text"><string>ROI峰值: --/-- | AE质量: --/--%</string></property>
+            </widget>
+           </item>
           </layout>
          </widget>
         </item>

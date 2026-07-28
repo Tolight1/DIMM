@@ -10,6 +10,8 @@
 #include "CanvasWidgets.h"
 #include "CommManager.h"
 #include "ConfigTextUtils.h"
+#include "EafFocuserManager.h"
+#include "FocuserControlWidget.h"
 #include "ImageUtils.h"
 #include "ImageProcessor.h"
 #include "InitialStarDetectionConfig.h"
@@ -70,11 +72,10 @@ constexpr int kSimulationPreviewIntervalMs = 30000;
 constexpr int kAlignmentPreviewIntervalMs = 1000;
 constexpr int kMeasurementUiIntervalMs = 100;
 constexpr int kRoiEdgeUpdateMarginPx = 8;
-constexpr int kInitialCentroidSettleRequiredFrames = 3;
 constexpr qint64 kLostCentroidRelocalizeTimeoutMs = 1500;
 constexpr qint64 kLiveRelocalizationMaxDurationMs = 15000;
-constexpr int kAutoExposureDefaultIntervalMs = 4 * 60 * 60 * 1000;
-constexpr int kAutoExposureMaxPeakSamples = 4096;
+constexpr int kInitialStarMaxWidth = 64;
+constexpr int kInitialStarMaxHeight = 64;
 constexpr double kFullFrameLocalizationPulseHz = 2.0;
 constexpr double kAlignmentDefaultPolarisPolarDistanceArcmin = 37.6;
 constexpr const char* kHardwareTriggerLine = "Line0";
@@ -282,6 +283,32 @@ cv::Mat cropFrameForRoiProcessing(const cv::Mat& frame, const RoiRect& roi)
     return frame(cv::Rect(x, y, w, h));
 }
 
+InitialStarDetectionConfig scaledInitialStarDetectionConfigForMono8()
+{
+    InitialStarDetectionConfig config = currentInitialStarDetectionConfig();
+    config.thresholdAbsolute =
+        config.thresholdAbsolute >= 0.0 ? ImageUtils::normalizeThresholdToMono8(config.thresholdAbsolute) : -1.0;
+    config.minimumIntensity = std::max(0.0, config.minimumIntensity);
+    config.minimumIntensity = ImageUtils::normalizeThresholdToMono8(config.minimumIntensity);
+    return config;
+}
+
+double rawPixelValueAt(const cv::Mat& image, int y, int x)
+{
+    switch (image.depth()) {
+    case CV_8U:
+        return static_cast<double>(image.ptr<uchar>(y)[x]);
+    case CV_16U:
+        return static_cast<double>(image.ptr<quint16>(y)[x]);
+    case CV_32F:
+        return static_cast<double>(image.ptr<float>(y)[x]);
+    case CV_64F:
+        return image.ptr<double>(y)[x];
+    default:
+        return 0.0;
+    }
+}
+
 QVector<InitialStarCandidate> detectInitialStarCandidates(const cv::Mat& grayscale,
                                                           double* peakValue = nullptr,
                                                           double* thresholdValue = nullptr)
@@ -291,18 +318,13 @@ QVector<InitialStarCandidate> detectInitialStarCandidates(const cv::Mat& graysca
         return candidates;
     }
 
-    cv::Mat mono8 = ImageUtils::normalizeMono8Frame(grayscale);
-    if (mono8.empty()) {
-        return candidates;
-    }
-
     cv::Scalar mean;
     cv::Scalar stddev;
-    cv::meanStdDev(mono8, mean, stddev);
+    cv::meanStdDev(grayscale, mean, stddev);
 
     double minValue = 0.0;
     double maxValue = 0.0;
-    cv::minMaxLoc(mono8, &minValue, &maxValue);
+    cv::minMaxLoc(grayscale, &minValue, &maxValue);
     if (peakValue) {
         *peakValue = maxValue;
     }
@@ -322,7 +344,7 @@ QVector<InitialStarCandidate> detectInitialStarCandidates(const cv::Mat& graysca
     }
 
     cv::Mat binary;
-    cv::threshold(mono8, binary, threshold, 255.0, cv::THRESH_BINARY);
+    cv::compare(grayscale, cv::Scalar(threshold), binary, cv::CMP_GT);
 
     cv::Mat labels;
     cv::Mat stats;
@@ -334,11 +356,10 @@ QVector<InitialStarCandidate> detectInitialStarCandidates(const cv::Mat& graysca
     std::vector<double> componentPeak(static_cast<size_t>(componentCount), 0.0);
     for (int y = 0; y < labels.rows; ++y) {
         const int* labelRow = labels.ptr<int>(y);
-        const uchar* imageRow = mono8.ptr<uchar>(y);
         for (int x = 0; x < labels.cols; ++x) {
             const int label = labelRow[x];
             if (label > 0 && label < componentCount) {
-                const double value = static_cast<double>(imageRow[x]);
+                const double value = rawPixelValueAt(grayscale, y, x);
                 componentSignal[static_cast<size_t>(label)] += value;
                 componentPeak[static_cast<size_t>(label)] =
                     std::max(componentPeak[static_cast<size_t>(label)], value);
@@ -350,7 +371,8 @@ QVector<InitialStarCandidate> detectInitialStarCandidates(const cv::Mat& graysca
         const int area = stats.at<int>(label, cv::CC_STAT_AREA);
         const int width = stats.at<int>(label, cv::CC_STAT_WIDTH);
         const int height = stats.at<int>(label, cv::CC_STAT_HEIGHT);
-        if (area < config.minArea || area > config.maxArea || width > 96 || height > 96) {
+        if (area < config.minArea || area > config.maxArea ||
+            width > kInitialStarMaxWidth || height > kInitialStarMaxHeight) {
             continue;
         }
 
@@ -413,7 +435,7 @@ bool detectInitialStarCentroid(const cv::Mat& grayscale, QPointF* centroid, doub
         *peakValue = maxValue;
     }
 
-    InitialStarDetectionConfig config = currentInitialStarDetectionConfig();
+    InitialStarDetectionConfig config = scaledInitialStarDetectionConfigForMono8();
     const double dynamicThreshold = std::max({config.minimumIntensity,
                                               mean[0] + config.sigmaThreshold * stddev[0],
                                               mean[0] + (maxValue - mean[0]) * config.peakFraction});
@@ -549,7 +571,7 @@ bool detectInitialStarCentroidFast(const cv::Mat& grayscale, QPointF* centroid, 
     const double localStd =
         std::sqrt(std::max(0.0, localMeanSquare - localBackground * localBackground));
 
-    InitialStarDetectionConfig config = currentInitialStarDetectionConfig();
+    InitialStarDetectionConfig config = scaledInitialStarDetectionConfigForMono8();
     const double peakContrast = maxValue - localBackground;
     if (peakContrast < std::max(2.0, localStd * 2.0)) {
         return false;
@@ -635,101 +657,6 @@ bool detectInitialStarCentroidFast(const cv::Mat& grayscale, QPointF* centroid, 
     return true;
 }
 
-bool detectInitialStarPeakCandidate(const cv::Mat& grayscale,
-                                    InitialStarCandidate* candidate,
-                                    double* peakValue)
-{
-    if (grayscale.empty() || grayscale.channels() != 1 || !candidate) {
-        return false;
-    }
-
-    cv::Mat mono8 = ImageUtils::normalizeMono8Frame(grayscale);
-    if (mono8.empty()) {
-        return false;
-    }
-
-    double minValue = 0.0;
-    double maxValue = 0.0;
-    cv::Point maxLoc;
-    cv::minMaxLoc(mono8, &minValue, &maxValue, nullptr, &maxLoc);
-    if (peakValue) {
-        *peakValue = maxValue;
-    }
-
-    constexpr int kSearchRadius = 10;
-    if (maxLoc.x < kSearchRadius || maxLoc.y < kSearchRadius ||
-        maxLoc.x >= mono8.cols - kSearchRadius ||
-        maxLoc.y >= mono8.rows - kSearchRadius) {
-        return false;
-    }
-
-    const int x0 = std::max(0, maxLoc.x - kSearchRadius);
-    const int y0 = std::max(0, maxLoc.y - kSearchRadius);
-    const int x1 = std::min(mono8.cols - 1, maxLoc.x + kSearchRadius);
-    const int y1 = std::min(mono8.rows - 1, maxLoc.y + kSearchRadius);
-
-    double backgroundSum = 0.0;
-    double backgroundSquareSum = 0.0;
-    int backgroundCount = 0;
-    for (int y = y0; y <= y1; ++y) {
-        const uchar* row = mono8.ptr<uchar>(y);
-        for (int x = x0; x <= x1; ++x) {
-            const int dx = std::abs(x - maxLoc.x);
-            const int dy = std::abs(y - maxLoc.y);
-            if (dx <= 3 && dy <= 3) {
-                continue;
-            }
-            const double value = static_cast<double>(row[x]);
-            backgroundSum += value;
-            backgroundSquareSum += value * value;
-            ++backgroundCount;
-        }
-    }
-
-    const double background =
-        backgroundCount > 0 ? backgroundSum / static_cast<double>(backgroundCount) : minValue;
-    const double peakContrast = maxValue - background;
-    if (peakContrast < 0.5) {
-        return false;
-    }
-
-    const double supportThreshold = background;
-    double weightedX = 0.0;
-    double weightedY = 0.0;
-    double weightSum = 0.0;
-    int supportPixelCount = 0;
-    for (int y = maxLoc.y - 1; y <= maxLoc.y + 1; ++y) {
-        const uchar* row = mono8.ptr<uchar>(y);
-        for (int x = maxLoc.x - 1; x <= maxLoc.x + 1; ++x) {
-            const double value = static_cast<double>(row[x]);
-            if (value < supportThreshold && !(x == maxLoc.x && y == maxLoc.y)) {
-                continue;
-            }
-            const double weight = std::max(0.0, value - background);
-            if (weight <= 0.0) {
-                continue;
-            }
-            weightedX += static_cast<double>(x) * weight;
-            weightedY += static_cast<double>(y) * weight;
-            weightSum += weight;
-            ++supportPixelCount;
-        }
-    }
-
-    if (weightSum <= 0.0 || supportPixelCount < 1) {
-        return false;
-    }
-
-    candidate->index = 1;
-    candidate->center = QPointF(weightedX / weightSum, weightedY / weightSum);
-    candidate->area = std::max(1, supportPixelCount);
-    candidate->peak = maxValue;
-    candidate->signal = std::max(maxValue, weightSum);
-    candidate->bbox = QRect(maxLoc.x - 2, maxLoc.y - 2, 5, 5);
-    candidate->distanceToPreference = std::numeric_limits<double>::infinity();
-    return true;
-}
-
 QString toggleButtonStyle(bool active)
 {
     return active
@@ -793,11 +720,20 @@ DIMM::DIMM(QWidget* parent)
     , ui(new Ui_DIMM)
 {
     qRegisterMetaType<PolarisSolveResult>("PolarisSolveResult");
+    qRegisterMetaType<TelescopeSlot>("TelescopeSlot");
+    qRegisterMetaType<EafDeviceDescriptor>("EafDeviceDescriptor");
+    qRegisterMetaType<EafDeviceState>("EafDeviceState");
+    qRegisterMetaType<QVector<EafDeviceDescriptor>>("QVector<EafDeviceDescriptor>");
 
     ui->setupUi(this);
 
-    m_autoExposureIntervalMs = kAutoExposureDefaultIntervalMs;
+    m_autoExposureController.configure(m_autoExposureConfig);
     m_settingsDialog = new SettingsDialog(this);
+    m_focuserManager = new EafFocuserManager(this);
+    m_focuserControlWidget = new FocuserControlWidget(m_settingsDialog);
+    m_focuserControlWidget->setManager(m_focuserManager);
+    m_settingsDialog->addSettingsPage(m_focuserControlWidget, QStringLiteral("自动调焦"));
+    m_focuserManager->initialize();
 
     m_lblStatusState = new QLabel(this);
     m_lblStatusState->setObjectName(QStringLiteral("lblStatusState"));
@@ -822,7 +758,9 @@ DIMM::DIMM(QWidget* parent)
     for (QLabel* label : {ui->lblStatFrames,
                           ui->lblStatValid,
                           ui->lblStatLatency,
-                          ui->lblStatWindow}) {
+                          ui->lblStatWindow,
+                          ui->lblStatExposure,
+                          ui->lblStatAutoExposure}) {
         label->setWordWrap(true);
         label->setMinimumHeight(30);
     }
@@ -881,6 +819,8 @@ DIMM::DIMM(QWidget* parent)
     m_cameraManager->init();
     m_imageProcessor = new ImageProcessor(this);
     m_imageProcessor->setTargetFrameRateHz(m_pulseGeneratorFrequencyHz);
+    m_imageProcessor->setAutoExposureMetricConfig(m_autoExposureConfig.enabled,
+                                                  m_autoExposureConfig.hardSaturationDn);
     m_polarisSolverController = new PolarisSolverController(this);
     connect(m_polarisSolverController,
             &PolarisSolverController::solveFinished,
@@ -917,6 +857,35 @@ DIMM::DIMM(QWidget* parent)
                 m_hotPixelTemplateHeight = hotSettings.height;
                 m_hotPixelTemplateExposureUs =
                     PathUtils::exposureUsFromTemplatePath(m_hotPixelCamera0MaskPath);
+                m_cachedHotPixelTemplateExposures.clear();
+                m_cachedHotPixelTemplateScanMs = -1;
+                const int selectedTemplateExposureUs =
+                    selectHotPixelTemplateExposureForCurrentExposure(m_configExposureUs);
+                if (selectedTemplateExposureUs > 0 &&
+                    selectedTemplateExposureUs != m_hotPixelTemplateExposureUs) {
+                    QString resolvedCamera0Mask;
+                    QString resolvedCamera0Excess;
+                    QString resolvedCamera1Mask;
+                    QString resolvedCamera1Excess;
+                    if (resolveHotPixelTemplatePathsForExposure(selectedTemplateExposureUs,
+                                                                &resolvedCamera0Mask,
+                                                                &resolvedCamera0Excess,
+                                                                &resolvedCamera1Mask,
+                                                                &resolvedCamera1Excess)) {
+                        m_hotPixelCamera0MaskPath = resolvedCamera0Mask;
+                        m_hotPixelCamera0ExcessPath = resolvedCamera0Excess;
+                        m_hotPixelCamera1MaskPath = resolvedCamera1Mask;
+                        m_hotPixelCamera1ExcessPath = resolvedCamera1Excess;
+                        m_hotPixelTemplateExposureUs = selectedTemplateExposureUs;
+                    }
+                }
+                m_imageProcessor->configureHotPixelTemplates(
+                    PathUtils::resolvePathFromAppDir(m_hotPixelCamera0MaskPath),
+                    PathUtils::resolvePathFromAppDir(m_hotPixelCamera0ExcessPath),
+                    PathUtils::resolvePathFromAppDir(m_hotPixelCamera1MaskPath),
+                    PathUtils::resolvePathFromAppDir(m_hotPixelCamera1ExcessPath),
+                    m_hotPixelTemplateWidth,
+                    m_hotPixelTemplateHeight);
             }
         }
     }
@@ -1095,26 +1064,15 @@ DIMM::DIMM(QWidget* parent)
         setStatusMessage(QStringLiteral("相机参数已应用"), UiStatusLevel::Success);
     };
     m_settingsDialog->onApplyAutoExposure =
-        [this](bool enabled,
-               double lowThreshold,
-               double highThreshold,
-               double darkRatio,
-               double brightRatio,
-               double minExposure,
-               double maxExposure) {
-            m_autoExposureEnabled = enabled;
-            m_autoExposureLowThreshold = lowThreshold;
-            m_autoExposureHighThreshold = highThreshold;
-            m_autoExposureDarkRatio = darkRatio;
-            m_autoExposureBrightRatio = brightRatio;
-            m_autoExposureMinUs = minExposure;
-            m_autoExposureMaxUs = maxExposure;
-            m_lastAutoExposureCheckMs = -1;
-            m_autoExposurePeakSamples[0].clear();
-            m_autoExposurePeakSamples[1].clear();
-            setStatusMessage(enabled ? QStringLiteral("自动曝光已启用: 每4小时检查ROI峰值并匹配热像素模板")
-                                     : QStringLiteral("自动曝光已关闭"),
-                             enabled ? UiStatusLevel::Success : UiStatusLevel::Warning);
+        [this](const AutoExposureConfig& config) {
+            m_autoExposureConfig = config;
+            resetAutoExposureState();
+            if (m_imageProcessor) {
+                m_imageProcessor->setAutoExposureMetricConfig(config.enabled, config.hardSaturationDn);
+            }
+            setStatusMessage(config.enabled ? QStringLiteral("自动曝光已启用: 状态机保护模式")
+                                            : QStringLiteral("自动曝光已关闭"),
+                             config.enabled ? UiStatusLevel::Success : UiStatusLevel::Warning);
         };
     m_settingsDialog->onApplyTriggerMode = [this](int mode) {
         m_configTriggerMode = mode;
@@ -1325,18 +1283,22 @@ DIMM::DIMM(QWidget* parent)
             m_hotPixelTemplateHeight = enabled ? templateHeight : 0;
             m_hotPixelTemplateExposureUs =
                 enabled ? PathUtils::exposureUsFromTemplatePath(m_hotPixelCamera0MaskPath) : 0;
+            m_cachedHotPixelTemplateExposures.clear();
+            m_cachedHotPixelTemplateScanMs = -1;
 
             bool matchedRequestedExposureTemplate = false;
             bool missingRequestedExposureTemplate = false;
             const int requestedExposureUs = static_cast<int>(std::lround(m_configExposureUs));
+            const int selectedTemplateExposureUs =
+                enabled ? selectHotPixelTemplateExposureForCurrentExposure(m_configExposureUs) : 0;
             if (enabled) {
                 QString resolvedCamera0Mask;
                 QString resolvedCamera0Excess;
                 QString resolvedCamera1Mask;
                 QString resolvedCamera1Excess;
-                if (requestedExposureUs > 0 &&
-                    requestedExposureUs != m_hotPixelTemplateExposureUs &&
-                    resolveHotPixelTemplatePathsForExposure(requestedExposureUs,
+                if (selectedTemplateExposureUs > 0 &&
+                    selectedTemplateExposureUs != m_hotPixelTemplateExposureUs &&
+                    resolveHotPixelTemplatePathsForExposure(selectedTemplateExposureUs,
                                                             &resolvedCamera0Mask,
                                                             &resolvedCamera0Excess,
                                                             &resolvedCamera1Mask,
@@ -1345,7 +1307,7 @@ DIMM::DIMM(QWidget* parent)
                     m_hotPixelCamera0ExcessPath = resolvedCamera0Excess;
                     m_hotPixelCamera1MaskPath = resolvedCamera1Mask;
                     m_hotPixelCamera1ExcessPath = resolvedCamera1Excess;
-                    m_hotPixelTemplateExposureUs = requestedExposureUs;
+                    m_hotPixelTemplateExposureUs = selectedTemplateExposureUs;
                     if (m_settingsDialog) {
                         m_settingsDialog->hotPixelCam0MaskEdit->setText(m_hotPixelCamera0MaskPath);
                         m_settingsDialog->hotPixelCam0ExcessEdit->setText(m_hotPixelCamera0ExcessPath);
@@ -1353,8 +1315,8 @@ DIMM::DIMM(QWidget* parent)
                         m_settingsDialog->hotPixelCam1ExcessEdit->setText(m_hotPixelCamera1ExcessPath);
                     }
                     matchedRequestedExposureTemplate = true;
-                } else if (requestedExposureUs > 0 &&
-                           requestedExposureUs != m_hotPixelTemplateExposureUs) {
+                } else if (selectedTemplateExposureUs > 0 &&
+                           selectedTemplateExposureUs != m_hotPixelTemplateExposureUs) {
                     missingRequestedExposureTemplate = true;
                 }
             }
@@ -1555,9 +1517,6 @@ DIMM::DIMM(QWidget* parent)
         label->setText(QStringLiteral("(%1, %2)").arg(x, 0, 'f', 1).arg(y, 0, 'f', 1));
         if (!usable || liveTrackingEdgeCentroid) {
             runtime.hasValidCentroid[camIdx] = false;
-            if (runtime.initialCentroidSettlePending) {
-                runtime.initialCentroidSettleFrameCount = 0;
-            }
             if (liveTrackingEdgeCentroid) {
                 handleLiveRoiCentroidLoss(camIdx);
             }
@@ -1572,8 +1531,6 @@ DIMM::DIMM(QWidget* parent)
             runtime.lastTargetPosition[camIdx] = QPointF(x, y);
             runtime.hasLastTargetPosition[camIdx] = true;
         }
-        applyAutoExposure(camIdx, peakValue);
-
         if (m_captureState == CaptureState::Simulation &&
             !runtime.simulationRoiSeeded &&
             !hadBothCentroids &&
@@ -1584,13 +1541,41 @@ DIMM::DIMM(QWidget* parent)
 
         if (m_captureState == CaptureState::Live &&
             m_liveStartupPhase == LiveStartupPhase::Tracking) {
-            if (tryApplyInitialCentroidSettleRoi()) {
-                return;
-            }
             if (shouldUpdateRoiForRecentering()) {
                 updateMinuteRoi(true);
             }
         }
+    });
+
+    connect(m_imageProcessor,
+            &ImageProcessor::autoExposureSampleReady,
+            this,
+            [this](int cameraIndex,
+                   double peakValue,
+                   double fitPeakValue,
+                   double background,
+                   double noiseSigma,
+                   double threshold,
+                   quint64 signalPixelCount,
+                   quint64 saturatedPixelCount,
+                   bool centroidValid,
+                   bool measurementUsable,
+                   quint64 frameId,
+                   qint64 timestampMs) {
+        AutoExposureFrameSample sample;
+        sample.cameraIndex = cameraIndex;
+        sample.peakDn = peakValue;
+        sample.fitPeakDn = fitPeakValue;
+        sample.backgroundDn = background;
+        sample.noiseSigmaDn = noiseSigma;
+        sample.thresholdDn = threshold;
+        sample.signalPixelCount = signalPixelCount;
+        sample.saturatedPixelCount = saturatedPixelCount;
+        sample.centroidValid = centroidValid;
+        sample.measurementUsable = measurementUsable;
+        sample.frameId = frameId;
+        sample.timestampMs = timestampMs;
+        handleAutoExposureSample(sample);
     });
 
     connect(m_imageProcessor,
@@ -1759,11 +1744,15 @@ DIMM::DIMM(QWidget* parent)
     hideLegacyRoiScheduleUi();
     updateMinuteRoi(true);
     refreshUi();
+    updateCaptureState(m_captureState);
 
 }
 
 DIMM::~DIMM()
 {
+    if (m_focuserManager) {
+        m_focuserManager->shutdown();
+    }
     if (m_reportTimer) {
         m_reportTimer->stop();
     }
@@ -1972,6 +1961,18 @@ void DIMM::refreshMeasurementUi()
     ui->lblStatWindow->setText(
         QStringLiteral("同步抖动: %1 μs")
             .arg(QString::number(runtime.averageSyncJitterUs, 'f', 1)));
+    ui->lblStatExposure->setText(
+        QStringLiteral("曝光: %1 μs | AE: %2")
+            .arg(QString::number(m_configExposureUs, 'f', 0),
+                 autoExposureUiStatusText()));
+    ui->lblStatAutoExposure->setText(
+        m_autoExposureConfig.enabled
+            ? QStringLiteral("ROI峰值: %1/%2 | AE质量: %3/%4%")
+                  .arg(QString::number(m_latestAutoExposurePeakDn[0], 'f', 0),
+                       QString::number(m_latestAutoExposurePeakDn[1], 'f', 0),
+                       QString::number(m_latestAutoExposureUsableRatio[0] * 100.0, 'f', 0),
+                       QString::number(m_latestAutoExposureUsableRatio[1] * 100.0, 'f', 0))
+            : QStringLiteral("ROI峰值: --/-- | AE质量: --/--%"));
 
     if (!runtime.hasValidAtmosphere) {
         ui->lblR0Value->setText(QStringLiteral("--"));
@@ -2266,9 +2267,7 @@ void DIMM::resetMeasurementState()
     m_lastRoiUpdateMs = -1;
     m_lastRoiUpdateReason.clear();
     resetLiveFrameAcceptanceGates();
-    m_autoExposurePeakSamples[0].clear();
-    m_autoExposurePeakSamples[1].clear();
-    m_lastAutoExposureCheckMs = -1;
+    resetAutoExposureState();
     if (m_r0Chart) {
         m_r0Chart->clear();
     }
@@ -2287,6 +2286,17 @@ void DIMM::resetMeasurementState()
 void DIMM::updateCaptureState(CaptureState state)
 {
     m_captureState = state;
+    const bool focuserMotionAllowed =
+        m_captureState == CaptureState::Idle || m_captureState == CaptureState::Paused;
+    const QString reason = focuserMotionAllowed
+                               ? QString()
+                               : QStringLiteral("实时采集、模拟或对准模式中禁止移动焦点。请先暂停或停止采集。");
+    if (m_focuserManager) {
+        m_focuserManager->setMotionAllowed(focuserMotionAllowed, reason);
+    }
+    if (m_focuserControlWidget) {
+        m_focuserControlWidget->setMotionAllowed(focuserMotionAllowed, reason);
+    }
     refreshUi();
 }
 
@@ -2494,64 +2504,6 @@ bool DIMM::isCentroidTooFarFromCurrentRoiCenter(int cameraIndex) const
            localY >= static_cast<double>(roi.h - 1) - m_roiRecenteringThresholdPx;
 }
 
-bool DIMM::tryApplyInitialCentroidSettleRoi()
-{
-    if (m_captureState != CaptureState::Live ||
-        m_liveStartupPhase != LiveStartupPhase::Tracking ||
-        !m_imageProcessor) {
-        return false;
-    }
-
-    auto& runtime = activeRuntime();
-    if (!runtime.initialCentroidSettlePending) {
-        return false;
-    }
-
-    if (!hasValidCentroidsForRoiUpdate()) {
-        runtime.initialCentroidSettleFrameCount = 0;
-        return true;
-    }
-
-    ++runtime.initialCentroidSettleFrameCount;
-    if (runtime.initialCentroidSettleFrameCount < kInitialCentroidSettleRequiredFrames) {
-        return true;
-    }
-
-    const RoiRect desiredRois[2] = {
-        buildCameraCentroidRoi(0),
-        buildCameraCentroidRoi(1),
-    };
-    RoiRect actualRois[2] = {
-        desiredRois[0],
-        desiredRois[1],
-    };
-
-    QString reason;
-    if (!applyLiveHardwareRois(desiredRois, &reason, actualRois)) {
-        runtime.initialCentroidSettleFrameCount = 0;
-        m_liveHardwareRoiActive = false;
-        setStatusMessage(reason.isEmpty()
-                             ? QStringLiteral("状态: 首次 ROI 居中校正失败")
-                             : reason,
-                         UiStatusLevel::Warning);
-        return true;
-    }
-
-    m_liveHardwareRoiActive = true;
-    m_imageProcessor->setPairRois(actualRois);
-    recordLiveRoiUpdate(actualRois, QStringLiteral("initial_centroid_settle"));
-    runtime.initialCentroidSettlePending = false;
-    runtime.initialCentroidSettleFrameCount = 0;
-    runtime.roiRecenteringCandidateFrameCount = 0;
-    applyRoiSummary(actualRois[0], QStringLiteral("相机1"));
-    updateFullFrameRoiOverlay(0);
-    updateFullFrameRoiOverlay(1);
-    ui->lblROITimeCurrent->setText(QStringLiteral("已完成首次 ROI 居中校正"));
-    ui->lblROITimeNext->setText(QStringLiteral("ROI 固定尺寸: 64 x 64"));
-    setStatusMessage(QStringLiteral("状态: ROI 内质心稳定，已完成首次居中校正"),
-                     UiStatusLevel::Success);
-    return true;
-}
 
 bool DIMM::shouldUpdateRoiForRecentering()
 {
@@ -2603,8 +2555,6 @@ void DIMM::requestLiveFullFrameRelocalization(const QString& reason)
 
     auto& runtime = activeRuntime();
     runtime.liveRelocalizationStartedMs = QDateTime::currentMSecsSinceEpoch();
-    runtime.initialCentroidSettlePending = false;
-    runtime.initialCentroidSettleFrameCount = 0;
     resetLiveFrameAcceptanceGates();
     QString switchReason;
     const bool fullFrameReady = applyLiveFullFrameForRelocalization(&switchReason);
@@ -3246,17 +3196,40 @@ bool DIMM::selectLiveRelocalizationCentroid(int cameraIndex,
         return false;
     }
 
-    InitialStarCandidate peakCandidate;
-    if (!detectInitialStarPeakCandidate(fullFrame, &peakCandidate, peakValue)) {
+    QVector<InitialStarCandidate> candidates = detectInitialStarCandidates(fullFrame, peakValue);
+    if (candidates.isEmpty()) {
         return false;
     }
 
     const auto& runtime = activeRuntime();
     if (runtime.hasLastTargetPosition[cameraIndex]) {
-        const QPointF delta = peakCandidate.center - runtime.lastTargetPosition[cameraIndex];
-        peakCandidate.distanceToPreference = std::hypot(delta.x(), delta.y());
+        const InitialStarSelection selection =
+            PolarisDetectionPipeline::selectInitialStarCandidate(candidates,
+                                                                 true,
+                                                                 runtime.lastTargetPosition[cameraIndex],
+                                                                 0);
+        if (!selection.selected) {
+            return false;
+        }
+        *centroid = selection.candidate.center;
+        if (peakValue) {
+            *peakValue = selection.candidate.peak;
+        }
+        return true;
     }
-    *centroid = peakCandidate.center;
+
+    InitialStarCandidate selectedCandidate;
+    const InitialStarCandidate strongestCandidate = candidates.first();
+    if (!PolarisDetectionPipeline::chooseAutomaticInitialStarCandidate(candidates,
+                                                                       strongestCandidate,
+                                                                       &selectedCandidate,
+                                                                       nullptr)) {
+        return false;
+    }
+    *centroid = selectedCandidate.center;
+    if (peakValue) {
+        *peakValue = selectedCandidate.peak;
+    }
     return true;
 }
 
@@ -3294,10 +3267,17 @@ bool DIMM::maybeSeedRoiFromFrame(int cameraIndex, const cv::Mat& frame)
     }
 
     const int camIdx = cameraIndex;
+    FullFrameCanvas* targetCanvas = cameraIndex == 0 ? m_fullFrameCanvas1 : m_fullFrameCanvas2;
     QPointF centroid;
     double peakValue = 0.0;
     if (liveLocatePhase) {
         if (!selectLiveRelocalizationCentroid(cameraIndex, grayscale, &centroid, &peakValue)) {
+            if (targetCanvas) {
+                targetCanvas->clearStarCandidateOverlays();
+            }
+            setStatusMessage(QStringLiteral("状态: 相机%1 全画幅 SDK 连通域找星未找到有效星点，等待下一帧")
+                                 .arg(cameraIndex + 1),
+                             UiStatusLevel::Warning);
             return false;
         }
         runtime.liveRelocalizationPreviewFrame[cameraIndex] = frame.clone();
@@ -3311,13 +3291,6 @@ bool DIMM::maybeSeedRoiFromFrame(int cameraIndex, const cv::Mat& frame)
                          UiStatusLevel::Info);
     } else {
         QVector<InitialStarCandidate> candidates = detectInitialStarCandidates(grayscale, &peakValue);
-        if (candidates.isEmpty()) {
-            InitialStarCandidate peakCandidate;
-            if (detectInitialStarPeakCandidate(grayscale, &peakCandidate, &peakValue)) {
-                candidates.append(peakCandidate);
-            }
-        }
-        FullFrameCanvas* targetCanvas = cameraIndex == 0 ? m_fullFrameCanvas1 : m_fullFrameCanvas2;
         const bool hasTrackedTargetPreference = runtime.hasLastTargetPosition[camIdx];
         const bool hasAlignmentPolarisPreference = runtime.hasConfirmedPolarisPosition[camIdx];
         const bool hasPreferredInitialTarget = hasTrackedTargetPreference ||
@@ -3331,24 +3304,19 @@ bool DIMM::maybeSeedRoiFromFrame(int cameraIndex, const cv::Mat& frame)
                 if (targetCanvas) {
                     targetCanvas->clearStarCandidateOverlays();
                 }
-                setStatusMessage(
-                    QStringLiteral("状态: 相机%1 Multiple star candidate confirmation is pending; "
-                                   "waiting for a valid full-frame candidate list")
-                        .arg(cameraIndex + 1),
-                    UiStatusLevel::Warning);
-                return false;
-            }
-            if (!detectInitialStarCentroid(grayscale, &centroid, &peakValue) &&
-                !detectInitialStarCentroidFast(grayscale, &centroid, &peakValue)) {
-                if (targetCanvas) {
-                    targetCanvas->clearStarCandidateOverlays();
-                }
+                setStatusMessage(QStringLiteral("状态: 相机%1 正在等待有效的全画幅 SDK 连通域候选列表")
+                                     .arg(cameraIndex + 1),
+                                 UiStatusLevel::Warning);
                 return false;
             }
             if (targetCanvas) {
                 targetCanvas->clearStarCandidateOverlays();
             }
             runtime.pendingInitialCandidateSelectionRequired[cameraIndex] = false;
+            setStatusMessage(QStringLiteral("状态: 相机%1 全画幅 SDK 连通域找星未找到有效星点，未初始化 ROI")
+                                 .arg(cameraIndex + 1),
+                             UiStatusLevel::Warning);
+            return false;
         } else {
             if (targetCanvas) {
                 targetCanvas->setStarCandidateOverlays(
@@ -3522,8 +3490,6 @@ void DIMM::showDeferredLiveRelocalizationPreview()
 void DIMM::clearPendingLiveRelocalizationRois()
 {
     auto& runtime = activeRuntime();
-    runtime.initialCentroidSettlePending = false;
-    runtime.initialCentroidSettleFrameCount = 0;
     for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
         runtime.pendingInitialRoi[cameraIndex] = RoiRect();
         runtime.pendingInitialRoiReady[cameraIndex] = false;
@@ -3580,8 +3546,6 @@ bool DIMM::commitPairedInitialRoisIfReady()
     runtime.initialRoiConfirmed[1] = true;
     runtime.pendingInitialRoiReady[0] = false;
     runtime.pendingInitialRoiReady[1] = false;
-    runtime.initialCentroidSettlePending = m_captureState == CaptureState::Live;
-    runtime.initialCentroidSettleFrameCount = 0;
     runtime.liveRelocalizationStartedMs = -1;
     if (m_fullFrameCanvas1) {
         m_fullFrameCanvas1->clearStarCandidateOverlays();
@@ -4322,16 +4286,11 @@ QVector<InitialStarCandidate> DIMM::collectAlignmentStarCandidates(
     input.candidateDetector = [mono8](const cv::Mat& grayscale, double* peak) {
         if (mono8) {
             *mono8 = ImageUtils::normalizeMono8Frame(grayscale);
-            if (mono8->empty()) {
-                return QVector<InitialStarCandidate>();
-            }
-            return detectInitialStarCandidates(*mono8, peak);
         }
-        cv::Mat normalized = ImageUtils::normalizeMono8Frame(grayscale);
-        if (normalized.empty()) {
+        if (grayscale.empty()) {
             return QVector<InitialStarCandidate>();
         }
-        return detectInitialStarCandidates(normalized, peak);
+        return detectInitialStarCandidates(grayscale, peak);
     };
     return AlignmentSession::collectCandidates(input, mono8, peakValue);
 }
@@ -4838,13 +4797,32 @@ void DIMM::onShowSettings()
         QString::number(m_configContinuousFrameRateHz, 'f', 1));
     m_settingsDialog->triggerContinuous->setChecked(m_configTriggerMode == 0);
     m_settingsDialog->triggerHardware->setChecked(m_configTriggerMode != 0);
-    m_settingsDialog->autoExposureCheck->setChecked(m_autoExposureEnabled);
-    m_settingsDialog->autoExpLowEdit->setText(QString::number(m_autoExposureLowThreshold, 'f', 1));
-    m_settingsDialog->autoExpHighEdit->setText(QString::number(m_autoExposureHighThreshold, 'f', 1));
-    m_settingsDialog->autoExpDarkRatioEdit->setText(QString::number(m_autoExposureDarkRatio, 'f', 2));
-    m_settingsDialog->autoExpBrightRatioEdit->setText(QString::number(m_autoExposureBrightRatio, 'f', 2));
-    m_settingsDialog->autoExpMinEdit->setText(QString::number(m_autoExposureMinUs, 'f', 0));
-    m_settingsDialog->autoExpMaxEdit->setText(QString::number(m_autoExposureMaxUs, 'f', 0));
+    m_settingsDialog->autoExposureCheck->setChecked(m_autoExposureConfig.enabled);
+    m_settingsDialog->autoExpUseFittedPeakCheck->setChecked(m_autoExposureConfig.useFittedPeak);
+    m_settingsDialog->autoExpTargetPeakLowEdit->setText(QString::number(m_autoExposureConfig.targetPeakLowDn, 'f', 1));
+    m_settingsDialog->autoExpTargetPeakHighEdit->setText(QString::number(m_autoExposureConfig.targetPeakHighDn, 'f', 1));
+    m_settingsDialog->autoExpNearSaturationEdit->setText(QString::number(m_autoExposureConfig.nearSaturationDn, 'f', 1));
+    m_settingsDialog->autoExpHardSaturationEdit->setText(QString::number(m_autoExposureConfig.hardSaturationDn, 'f', 1));
+    m_settingsDialog->autoExpSaturatedPixelCountEdit->setText(QString::number(m_autoExposureConfig.saturatedPixelCount));
+    m_settingsDialog->autoExpDarkSnrWarningEdit->setText(QString::number(m_autoExposureConfig.darkSnrWarning, 'f', 2));
+    m_settingsDialog->autoExpDarkSnrCriticalEdit->setText(QString::number(m_autoExposureConfig.darkSnrCritical, 'f', 2));
+    m_settingsDialog->autoExpMinValidCentroidRatioEdit->setText(QString::number(m_autoExposureConfig.minValidCentroidRatio, 'f', 2));
+    m_settingsDialog->autoExpStarLostValidRatioEdit->setText(QString::number(m_autoExposureConfig.starLostValidRatio, 'f', 2));
+    m_settingsDialog->autoExpBrightFrameRatioEdit->setText(QString::number(m_autoExposureConfig.brightFrameRatioThreshold, 'f', 2));
+    m_settingsDialog->autoExpDarkFrameRatioEdit->setText(QString::number(m_autoExposureConfig.darkFrameRatioThreshold, 'f', 2));
+    m_settingsDialog->autoExpSampleWindowSecEdit->setText(QString::number(m_autoExposureConfig.sampleWindowSec));
+    m_settingsDialog->autoExpBrightPersistenceSecEdit->setText(QString::number(m_autoExposureConfig.brightPersistenceSec));
+    m_settingsDialog->autoExpDarkPersistenceSecEdit->setText(QString::number(m_autoExposureConfig.darkPersistenceSec));
+    m_settingsDialog->autoExpStarLostPersistenceSecEdit->setText(QString::number(m_autoExposureConfig.starLostPersistenceSec));
+    m_settingsDialog->autoExpTrendConflictPersistenceSecEdit->setText(QString::number(m_autoExposureConfig.trendConflictPersistenceSec));
+    m_settingsDialog->autoExpSafePersistenceSecEdit->setText(QString::number(m_autoExposureConfig.safePersistenceSec));
+    m_settingsDialog->autoExpCooldownSecEdit->setText(QString::number(m_autoExposureConfig.cooldownSec));
+    m_settingsDialog->autoExpMinEdit->setText(QString::number(m_autoExposureConfig.minExposureUs, 'f', 0));
+    m_settingsDialog->autoExpMaxEdit->setText(QString::number(m_autoExposureConfig.maxExposureUs, 'f', 0));
+    m_settingsDialog->autoExpMaxTemplateStepEdit->setText(QString::number(m_autoExposureConfig.maxTemplateStepPerAdjust));
+    m_settingsDialog->autoExpMaxChangeUpEdit->setText(QString::number(m_autoExposureConfig.maxExposureChangeRatioUp, 'f', 2));
+    m_settingsDialog->autoExpMaxChangeDownEdit->setText(QString::number(m_autoExposureConfig.maxExposureChangeRatioDown, 'f', 2));
+    m_settingsDialog->autoExpCameraAgreementRatioEdit->setText(QString::number(m_autoExposureConfig.cameraAgreementRatio, 'f', 2));
     m_settingsDialog->procKernelSize->setText(QString::number(m_imageProcessor->gaussianKernelSize()));
     m_settingsDialog->procSigma->setText(QString::number(m_imageProcessor->gaussianSigma(), 'f', 2));
     m_settingsDialog->procGravity->setChecked(m_imageProcessor->centroidMethod() == 0);
@@ -5381,6 +5359,9 @@ void DIMM::initResultFile()
                        "roi_acquisition_generation,roi_update_count,roi_update_reason,"
                        "roi1_x,roi1_y,roi1_w,roi1_h,roi2_x,roi2_y,roi2_w,roi2_h,ms_since_last_roi_update,"
                        "continuous_frame_rate_target_hz,camera1_frame_rate_readback_hz,camera2_frame_rate_readback_hz,"
+                       "camera1_peak_dn,camera2_peak_dn,camera1_snr,camera2_snr,"
+                       "camera1_valid_ratio,camera2_valid_ratio,exposure_us,hot_pixel_template_exposure_us,"
+                       "ae_enabled,ae_state,ae_reason,ae_sequence_id,ae_target_exposure_us,ae_frames_since_adjust,"
                        "r0_cm,seeing_arcsec,theta0_arcsec,tau0_ms,"
                        "sync_residual_us,sync_jitter_us,sync_jitter_avg_us,sync_jitter_max_us,"
                        "comm_connected,reporting_enabled")
@@ -5429,8 +5410,7 @@ void DIMM::saveResultRow(int frame)
     }
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     const qint64 msSinceLastRoiUpdate = m_lastRoiUpdateMs >= 0 ? nowMs - m_lastRoiUpdateMs : -1;
-    QString roiUpdateReason = m_lastRoiUpdateReason;
-    roiUpdateReason.replace(',', ';');
+    const QString roiUpdateReason = csvSafeField(m_lastRoiUpdateReason);
 
     const QStringList fields = {
         QDateTime::currentDateTime().toString(Qt::ISODateWithMs),
@@ -5453,6 +5433,20 @@ void DIMM::saveResultRow(int frame)
         QString::number(m_configContinuousFrameRateHz, 'f', 3),
         QString::number(m_lastContinuousFrameRateReadback[0], 'f', 3),
         QString::number(m_lastContinuousFrameRateReadback[1], 'f', 3),
+        QString::number(m_latestAutoExposurePeakDn[0], 'f', 1),
+        QString::number(m_latestAutoExposurePeakDn[1], 'f', 1),
+        QString::number(m_latestAutoExposureSnr[0], 'f', 2),
+        QString::number(m_latestAutoExposureSnr[1], 'f', 2),
+        QString::number(m_latestAutoExposureValidRatio[0], 'f', 3),
+        QString::number(m_latestAutoExposureValidRatio[1], 'f', 3),
+        QString::number(m_configExposureUs, 'f', 0),
+        QString::number(m_hotPixelTemplateExposureUs),
+        m_autoExposureConfig.enabled ? QStringLiteral("1") : QStringLiteral("0"),
+        autoExposureStateName(m_autoExposureState),
+        csvSafeField(m_autoExposureReason),
+        QString::number(m_autoExposureSequenceId),
+        QString::number(m_autoExposureTargetExposureUs),
+        QString::number(m_autoExposureFramesSinceAdjust),
         QString::number(runtime.latestAtmosphere.r0, 'f', 3),
         QString::number(runtime.latestAtmosphere.seeing, 'f', 3),
         QString::number(runtime.latestAtmosphere.theta0, 'f', 3),
@@ -5727,79 +5721,67 @@ void DIMM::reportDeviceStatus()
                                     uptimeMs);
 }
 
-void DIMM::applyAutoExposure(int cameraIndex, double peakValue)
+void DIMM::handleAutoExposureSample(const AutoExposureFrameSample& sample)
 {
-    if (!m_autoExposureEnabled || m_captureState != CaptureState::Live) {
-        return;
-    }
-    if (cameraIndex < 0 || cameraIndex >= 2 || !m_cameraManager->isOpen(cameraIndex)) {
+    if (!m_autoExposureConfig.enabled ||
+        m_captureState != CaptureState::Live ||
+        m_liveStartupPhase != LiveStartupPhase::Tracking ||
+        sample.cameraIndex < 0 ||
+        sample.cameraIndex >= 2) {
         return;
     }
 
-    if (std::isfinite(peakValue) && peakValue > 0.0) {
-        auto& samples = m_autoExposurePeakSamples[cameraIndex];
-        samples.push_back(peakValue);
-        if (samples.size() > kAutoExposureMaxPeakSamples) {
-            samples.erase(samples.begin(), samples.begin() + (samples.size() - kAutoExposureMaxPeakSamples));
+    QVector<int> templates = scanHotPixelExposureTemplates();
+    templates.erase(std::remove_if(templates.begin(),
+                                   templates.end(),
+                                   [this](int exposureUs) {
+                                       return exposureUs < m_autoExposureConfig.minExposureUs ||
+                                              exposureUs > m_autoExposureConfig.maxExposureUs;
+                                   }),
+                    templates.end());
+
+    const int currentExposure = static_cast<int>(std::lround(std::max(1.0, m_configExposureUs)));
+    const AutoExposureState previousState = m_autoExposureState;
+    AutoExposureDecision decision =
+        m_autoExposureController.addSampleAndEvaluate(sample, currentExposure, templates, sample.timestampMs);
+
+    m_autoExposureState = decision.state;
+    m_autoExposureReason = decision.reason;
+    m_latestAutoExposureTrend = decision.snapshot;
+    for (int i = 0; i < 2; ++i) {
+        m_latestAutoExposurePeakDn[i] = decision.snapshot.camera[i].peakP50Dn;
+        m_latestAutoExposureSnr[i] = decision.snapshot.camera[i].medianSnr;
+        m_latestAutoExposureValidRatio[i] = decision.snapshot.camera[i].validCentroidRatio;
+        m_latestAutoExposureUsableRatio[i] = decision.snapshot.camera[i].measurementUsableRatio;
+    }
+    if (m_autoExposureFramesSinceAdjust < std::numeric_limits<quint64>::max()) {
+        ++m_autoExposureFramesSinceAdjust;
+    }
+
+    if (m_autoExposureState != previousState) {
+        if (m_autoExposureState == AutoExposureState::StarLost) {
+            setStatusMessage(QStringLiteral("自动曝光: WEATHER_TOO_DARK / STAR_LOST，最大曝光下仍无法稳定观测星点"),
+                             UiStatusLevel::Error);
+        } else if (m_autoExposureState == AutoExposureState::TrendConflict) {
+            setStatusMessage(QStringLiteral("自动曝光: 两台相机亮度趋势冲突，保持当前曝光"),
+                             UiStatusLevel::Warning);
+        } else if (m_autoExposureReason == QStringLiteral("LOWER_EXPOSURE_UNAVAILABLE")) {
+            setStatusMessage(QStringLiteral("自动曝光: ROI 已过亮，但%1")
+                                 .arg(autoExposureUiStatusText() == QStringLiteral("最小曝光")
+                                          ? QStringLiteral("当前已到最小曝光")
+                                          : QStringLiteral("没有找到更低热像素模板")),
+                             UiStatusLevel::Warning);
         }
     }
 
-    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-    if (m_lastAutoExposureCheckMs < 0) {
-        m_lastAutoExposureCheckMs = nowMs;
-        return;
-    }
-    if (nowMs - m_lastAutoExposureCheckMs < m_autoExposureIntervalMs) {
-        return;
-    }
-    m_lastAutoExposureCheckMs = nowMs;
-
-    const double peak0 = medianOfSamples(m_autoExposurePeakSamples[0]);
-    const double peak1 = medianOfSamples(m_autoExposurePeakSamples[1]);
-    m_autoExposurePeakSamples[0].clear();
-    m_autoExposurePeakSamples[1].clear();
-    if (peak0 <= 0.0 || peak1 <= 0.0) {
-        setStatusMessage(QStringLiteral("自动曝光: 峰值样本不足，保持当前曝光"), UiStatusLevel::Warning);
+    if (!decision.shouldAdjustExposure || decision.targetExposureUs <= 0) {
         return;
     }
 
-    const bool dark0 = peak0 < m_autoExposureLowThreshold;
-    const bool dark1 = peak1 < m_autoExposureLowThreshold;
-    const bool bright0 = peak0 > m_autoExposureHighThreshold;
-    const bool bright1 = peak1 > m_autoExposureHighThreshold;
-    if ((dark0 || dark1) && (bright0 || bright1)) {
-        setStatusMessage(QStringLiteral("自动曝光: 两台相机亮度趋势冲突，保持当前曝光"), UiStatusLevel::Warning);
-        return;
-    }
-
-    double decisionPeak = (peak0 + peak1) * 0.5;
-    if (dark0 || dark1) {
-        decisionPeak = std::min(peak0, peak1);
-    } else if (bright0 || bright1) {
-        decisionPeak = std::max(peak0, peak1);
-    }
-
-    double currentExposure = m_configExposureUs;
-    if (m_cameraManager->isOpen(0)) {
-        const double cameraExposure = m_cameraManager->getExposure(0);
-        if (cameraExposure > 0.0) {
-            currentExposure = cameraExposure;
-        }
-    }
-    if (currentExposure <= 0.0) {
-        return;
-    }
-
-    const int targetExposure = selectTemplateExposureForPeak(currentExposure, decisionPeak);
-    if (targetExposure <= 0 || qAbs(static_cast<double>(targetExposure) - currentExposure) < 1.0) {
-        setStatusMessage(QStringLiteral("自动曝光: ROI峰值正常，保持 %1 μs")
-                             .arg(currentExposure, 0, 'f', 0),
-                         UiStatusLevel::Info);
-        return;
-    }
-
+    const int oldExposure = currentExposure;
     QString reason;
-    if (!applyExposureAndHotPixelTemplate(targetExposure, &reason)) {
+    if (!applyExposureAndHotPixelTemplate(decision.targetExposureUs, &reason)) {
+        m_autoExposureReason = reason;
         setStatusMessage(reason.isEmpty()
                              ? QStringLiteral("自动曝光: 曝光/热像素模板切换失败")
                              : reason,
@@ -5807,23 +5789,124 @@ void DIMM::applyAutoExposure(int cameraIndex, double peakValue)
         return;
     }
 
-    setStatusMessage(QStringLiteral("自动曝光: %1 -> %2 μs，已同步热像素模板 (峰值 %3 / %4)")
-                         .arg(currentExposure, 0, 'f', 0)
-                         .arg(targetExposure)
-                         .arg(peak0, 0, 'f', 1)
-                         .arg(peak1, 0, 'f', 1),
-                     UiStatusLevel::Success);
+    ++m_autoExposureSequenceId;
+    m_autoExposureTargetExposureUs = decision.targetExposureUs;
+    m_lastAutoExposureAdjustMs = sample.timestampMs;
+    m_autoExposureFramesSinceAdjust = 0;
+    setStatusMessage(QStringLiteral("自动曝光: %1 -> %2 μs，状态 %3")
+                         .arg(oldExposure)
+                         .arg(decision.targetExposureUs)
+                         .arg(autoExposureStateName(m_autoExposureState)),
+                     UiStatusLevel::Warning);
+}
+
+void DIMM::resetAutoExposureState()
+{
+    m_autoExposureController.configure(m_autoExposureConfig);
+    m_latestAutoExposureTrend = AutoExposureTrendSnapshot();
+    m_autoExposureState = AutoExposureState::Normal;
+    m_autoExposureReason.clear();
+    m_autoExposureTargetExposureUs = 0;
+    m_lastAutoExposureAdjustMs = -1;
+    m_autoExposureFramesSinceAdjust = 0;
+    m_latestAutoExposurePeakDn[0] = 0.0;
+    m_latestAutoExposurePeakDn[1] = 0.0;
+    m_latestAutoExposureSnr[0] = 0.0;
+    m_latestAutoExposureSnr[1] = 0.0;
+    m_latestAutoExposureValidRatio[0] = 0.0;
+    m_latestAutoExposureValidRatio[1] = 0.0;
+    m_latestAutoExposureUsableRatio[0] = 0.0;
+    m_latestAutoExposureUsableRatio[1] = 0.0;
+}
+
+QString DIMM::autoExposureStateName(AutoExposureState state) const
+{
+    switch (state) {
+    case AutoExposureState::BrightWarning:
+        return QStringLiteral("BRIGHT_WARNING");
+    case AutoExposureState::BrightAdjusting:
+        return QStringLiteral("BRIGHT_ADJUSTING");
+    case AutoExposureState::DarkWarning:
+        return QStringLiteral("DARK_WARNING");
+    case AutoExposureState::DarkAdjusting:
+        return QStringLiteral("DARK_ADJUSTING");
+    case AutoExposureState::Cooldown:
+        return QStringLiteral("COOLDOWN");
+    case AutoExposureState::StarLost:
+        return QStringLiteral("STAR_LOST");
+    case AutoExposureState::TrendConflict:
+        return QStringLiteral("TREND_CONFLICT");
+    case AutoExposureState::Normal:
+    default:
+        return QStringLiteral("NORMAL");
+    }
+}
+
+QString DIMM::autoExposureStateShortText(AutoExposureState state) const
+{
+    switch (state) {
+    case AutoExposureState::BrightWarning:
+        return QStringLiteral("亮警");
+    case AutoExposureState::BrightAdjusting:
+        return QStringLiteral("降曝");
+    case AutoExposureState::DarkWarning:
+        return QStringLiteral("暗警");
+    case AutoExposureState::DarkAdjusting:
+        return QStringLiteral("增曝");
+    case AutoExposureState::Cooldown:
+        return QStringLiteral("冷却");
+    case AutoExposureState::StarLost:
+        return QStringLiteral("丢星");
+    case AutoExposureState::TrendConflict:
+        return QStringLiteral("冲突");
+    case AutoExposureState::Normal:
+    default:
+        return QStringLiteral("正常");
+    }
+}
+
+QString DIMM::autoExposureUiStatusText() const
+{
+    if (!m_autoExposureConfig.enabled) {
+        return QStringLiteral("关闭");
+    }
+    if (m_autoExposureReason == QStringLiteral("LOWER_EXPOSURE_UNAVAILABLE")) {
+        const int currentExposure = static_cast<int>(std::lround(std::max(1.0, m_configExposureUs)));
+        return currentExposure <= int(std::lround(m_autoExposureConfig.minExposureUs))
+                   ? QStringLiteral("最小曝光")
+                   : QStringLiteral("无低档模板");
+    }
+    return autoExposureStateShortText(m_autoExposureState);
+}
+
+QString DIMM::csvSafeField(QString value) const
+{
+    value.replace(QLatin1Char(','), QLatin1Char(';'));
+    value.replace(QLatin1Char('\n'), QLatin1Char(' '));
+    value.replace(QLatin1Char('\r'), QLatin1Char(' '));
+    return value;
 }
 
 QVector<int> DIMM::scanHotPixelExposureTemplates() const
 {
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    constexpr qint64 kHotPixelTemplateCacheMs = 5000;
+    if (m_cachedHotPixelTemplateScanMs >= 0 &&
+        nowMs - m_cachedHotPixelTemplateScanMs < kHotPixelTemplateCacheMs) {
+        return m_cachedHotPixelTemplateExposures;
+    }
+
     QVector<int> exposures;
     if (!m_hotPixelTemplatesEnabled || m_hotPixelCamera0MaskPath.isEmpty()) {
+        m_cachedHotPixelTemplateExposures = exposures;
+        m_cachedHotPixelTemplateScanMs = nowMs;
         return exposures;
     }
 
     QDir exposureDir = QFileInfo(PathUtils::resolvePathFromAppDir(m_hotPixelCamera0MaskPath)).absoluteDir();
     if (!exposureDir.cdUp()) {
+        m_cachedHotPixelTemplateExposures = exposures;
+        m_cachedHotPixelTemplateScanMs = nowMs;
         return exposures;
     }
 
@@ -5851,47 +5934,26 @@ QVector<int> DIMM::scanHotPixelExposureTemplates() const
     }
 
     std::sort(exposures.begin(), exposures.end());
+    m_cachedHotPixelTemplateExposures = exposures;
+    m_cachedHotPixelTemplateScanMs = nowMs;
     return exposures;
 }
 
-int DIMM::selectTemplateExposureForPeak(double currentExposure, double peakValue) const
+int DIMM::selectHotPixelTemplateExposureForCurrentExposure(double currentExposure) const
 {
     QVector<int> exposures = scanHotPixelExposureTemplates();
     if (exposures.isEmpty()) {
         return 0;
     }
 
-    exposures.erase(std::remove_if(exposures.begin(),
-                                   exposures.end(),
-                                   [this](int exposureUs) {
-                                       return exposureUs < m_autoExposureMinUs ||
-                                              exposureUs > m_autoExposureMaxUs;
-                                   }),
-                    exposures.end());
-    if (exposures.isEmpty()) {
-        return 0;
-    }
-
-    const int currentUs = static_cast<int>(std::lround(currentExposure));
-    if (peakValue < m_autoExposureLowThreshold) {
-        const int desired = static_cast<int>(std::lround(currentExposure * m_autoExposureDarkRatio));
-        for (int exposureUs : exposures) {
-            if (exposureUs >= desired && exposureUs > currentUs) {
-                return exposureUs;
-            }
+    const int currentUs = static_cast<int>(std::lround(std::max(1.0, currentExposure)));
+    const int requestedTemplateUs = currentUs <= 1000 ? 1000 : currentUs;
+    for (int exposureUs : exposures) {
+        if (exposureUs >= requestedTemplateUs) {
+            return exposureUs;
         }
-        return exposures.back() > currentUs ? exposures.back() : currentUs;
     }
-    if (peakValue > m_autoExposureHighThreshold) {
-        const int desired = static_cast<int>(std::lround(currentExposure * m_autoExposureBrightRatio));
-        for (auto it = exposures.crbegin(); it != exposures.crend(); ++it) {
-            if (*it <= desired && *it < currentUs) {
-                return *it;
-            }
-        }
-        return exposures.front() < currentUs ? exposures.front() : currentUs;
-    }
-    return currentUs;
+    return exposures.back();
 }
 
 bool DIMM::resolveHotPixelTemplatePathsForExposure(int exposureUs,
@@ -5968,6 +6030,8 @@ bool DIMM::applyExposureAndHotPixelTemplate(int exposureUs, QString* reason)
     m_hotPixelCamera1MaskPath = PathUtils::relativizePathToAppDir(camera1Mask);
     m_hotPixelCamera1ExcessPath = PathUtils::relativizePathToAppDir(camera1Excess);
     m_hotPixelTemplateExposureUs = exposureUs;
+    m_cachedHotPixelTemplateExposures.clear();
+    m_cachedHotPixelTemplateScanMs = -1;
     if (m_imageProcessor) {
         m_imageProcessor->configureHotPixelTemplates(PathUtils::resolvePathFromAppDir(m_hotPixelCamera0MaskPath),
                                                      PathUtils::resolvePathFromAppDir(m_hotPixelCamera0ExcessPath),
@@ -5985,3 +6049,4 @@ bool DIMM::applyExposureAndHotPixelTemplate(int exposureUs, QString* reason)
     }
     return true;
 }
+

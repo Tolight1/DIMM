@@ -6,13 +6,7 @@
 
 struct ConfigApplicationCallbacks {
     std::function<void(double exposure, double gain, double continuousFrameRateHz)> applyCamera;
-    std::function<void(bool enabled,
-                       double lowThreshold,
-                       double highThreshold,
-                       double darkRatio,
-                       double brightRatio,
-                       double minExposure,
-                       double maxExposure)> applyAutoExposure;
+    std::function<void(const AutoExposureConfig& config)> applyAutoExposure;
     std::function<void(int mode)> applyTriggerMode;
     std::function<void(int kernelSize, double sigma, int method)> applyProcessing;
     std::function<void(double thresholdPx,

@@ -1,4 +1,6 @@
 ﻿#pragma once
+#include "AppConfig.h"
+
 #include <QDialog>
 #include <QString>
 #include <QtGlobal>
@@ -9,6 +11,7 @@ class QLabel;
 class QLineEdit;
 class QPushButton;
 class QRadioButton;
+class QTabWidget;
 enum class UiStatusLevel {
     Muted,
     Info,
@@ -21,6 +24,7 @@ class SettingsDialog : public QDialog {
     Q_OBJECT
 public:
     explicit SettingsDialog(QWidget* parent = nullptr);
+    void addSettingsPage(QWidget* page, const QString& title);
     void setPulseGeneratorState(bool enabled,
                                 const QString& portName,
                                 int baudRate,
@@ -31,13 +35,7 @@ public:
                                 bool remoteControl);
 
     std::function<void(double exposure, double gain, double continuousFrameRateHz)> onApplyCamera;
-    std::function<void(bool enabled,
-                       double lowThreshold,
-                       double highThreshold,
-                       double darkRatio,
-                       double brightRatio,
-                       double minExposure,
-                       double maxExposure)> onApplyAutoExposure;
+    std::function<void(const AutoExposureConfig& config)> onApplyAutoExposure;
     std::function<void(int kernelSize, double sigma, int method)> onApplyProcessing;
     std::function<void(double thresholdPx,
                        int requiredFrames,
@@ -106,12 +104,31 @@ public:
     QLineEdit* gainEdit = nullptr;
     QLineEdit* continuousFrameRateEdit = nullptr;
     QCheckBox* autoExposureCheck = nullptr;
-    QLineEdit* autoExpLowEdit = nullptr;
-    QLineEdit* autoExpHighEdit = nullptr;
-    QLineEdit* autoExpDarkRatioEdit = nullptr;
-    QLineEdit* autoExpBrightRatioEdit = nullptr;
+    QCheckBox* autoExpUseFittedPeakCheck = nullptr;
+    QLineEdit* autoExpTargetPeakLowEdit = nullptr;
+    QLineEdit* autoExpTargetPeakHighEdit = nullptr;
+    QLineEdit* autoExpNearSaturationEdit = nullptr;
+    QLineEdit* autoExpHardSaturationEdit = nullptr;
+    QLineEdit* autoExpSaturatedPixelCountEdit = nullptr;
+    QLineEdit* autoExpDarkSnrWarningEdit = nullptr;
+    QLineEdit* autoExpDarkSnrCriticalEdit = nullptr;
+    QLineEdit* autoExpMinValidCentroidRatioEdit = nullptr;
+    QLineEdit* autoExpStarLostValidRatioEdit = nullptr;
+    QLineEdit* autoExpBrightFrameRatioEdit = nullptr;
+    QLineEdit* autoExpDarkFrameRatioEdit = nullptr;
+    QLineEdit* autoExpSampleWindowSecEdit = nullptr;
+    QLineEdit* autoExpBrightPersistenceSecEdit = nullptr;
+    QLineEdit* autoExpDarkPersistenceSecEdit = nullptr;
+    QLineEdit* autoExpStarLostPersistenceSecEdit = nullptr;
+    QLineEdit* autoExpTrendConflictPersistenceSecEdit = nullptr;
+    QLineEdit* autoExpSafePersistenceSecEdit = nullptr;
+    QLineEdit* autoExpCooldownSecEdit = nullptr;
     QLineEdit* autoExpMinEdit = nullptr;
     QLineEdit* autoExpMaxEdit = nullptr;
+    QLineEdit* autoExpMaxTemplateStepEdit = nullptr;
+    QLineEdit* autoExpMaxChangeUpEdit = nullptr;
+    QLineEdit* autoExpMaxChangeDownEdit = nullptr;
+    QLineEdit* autoExpCameraAgreementRatioEdit = nullptr;
     QLineEdit* storagePathEdit = nullptr;
     QLineEdit* saveIntervalEdit = nullptr;
     QRadioButton* triggerContinuous = nullptr;
@@ -186,6 +203,7 @@ private:
     bool applyCommittedPulseSettings(bool requireEnabledPort = false);
     bool applySettings();
 
+    QTabWidget* m_tabWidget = nullptr;
     double m_committedPulseFrequencyHz = 200.0;
     quint32 m_committedPulseCount = 2000000U;
     double m_committedPulseDutyPercent = 50.0;

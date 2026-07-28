@@ -26,6 +26,7 @@ struct CentroidResult {
     double peakValue = 0.0;
     double totalFlux = 0.0;
     double background = 0.0;
+    double noiseSigma = 0.0;
     double threshold = 0.0;
     quint64 signalPixelCount = 0;
 };
@@ -90,6 +91,18 @@ signals:
     void atmosphereReady(double r0, double seeing, double theta0, double tau0);
     void frameProcessed(int cameraIndex, bool centroidValid, double elapsedMs);
     void syncSampleReady(double syncResidualUs);
+    void autoExposureSampleReady(int cameraIndex,
+                                 double peakValue,
+                                 double fitPeakValue,
+                                 double background,
+                                 double noiseSigma,
+                                 double threshold,
+                                 quint64 signalPixelCount,
+                                 quint64 saturatedPixelCount,
+                                 bool centroidValid,
+                                 bool measurementUsable,
+                                 quint64 frameId,
+                                 qint64 timestampMs);
 
 public slots:
     void setCentroidMethod(int method);
@@ -115,6 +128,7 @@ public slots:
                           double lambdaNm,
                           double pixelSizeUm);
     void setTargetFrameRateHz(double frameRateHz);
+    void setAutoExposureMetricConfig(bool enabled, double hardSaturationDn, int sampleIntervalMs);
     void setCurrentRoi(int cameraIndex, const RoiRect& roi);
     void setPairRois(RoiRect roi0, RoiRect roi1);
     void advanceAcquisitionGeneration();
@@ -127,8 +141,8 @@ public slots:
 
 private:
     mutable QMutex m_mutex;
-    int m_method = 1;
-    int m_kernelSize = 3;
+    int m_method = 0;
+    int m_kernelSize = 7;
     double m_sigma = 1.0;
     double m_threshold = 0.0;
     int m_centroidWindowRadius = 15;
@@ -146,6 +160,10 @@ private:
     double m_lambda = 500e-9;
     double m_pixelSize = 2.5e-6;
     double m_targetFrameRateHz = 200.0;
+    bool m_autoExposureMetricsEnabled = false;
+    double m_autoExposureHardSaturationDn = 4090.0;
+    int m_autoExposureMetricIntervalMs = 1000;
+    qint64 m_lastAutoExposureSampleMs[2] = {-1, -1};
     RoiRect m_currentRoi[2];
     std::shared_ptr<std::atomic<quint64>> m_acquisitionGeneration;
     bool m_syncCalibrated = false;
@@ -242,6 +260,7 @@ public:
                           double lambdaNm,
                           double pixelSizeUm);
     void setTargetFrameRateHz(double frameRateHz);
+    void setAutoExposureMetricConfig(bool enabled, double hardSaturationDn, int sampleIntervalMs = 1000);
     void setCurrentRoi(int cameraIndex, const RoiRect& roi);
     void setPairRois(const RoiRect rois[2]);
     void advanceAcquisitionGeneration();
@@ -280,6 +299,18 @@ signals:
     void atmosphereReady(double r0, double seeing, double theta0, double tau0);
     void frameProcessed(int cameraIndex, bool centroidValid, double elapsedMs);
     void syncSampleReady(double syncResidualUs);
+    void autoExposureSampleReady(int cameraIndex,
+                                 double peakValue,
+                                 double fitPeakValue,
+                                 double background,
+                                 double noiseSigma,
+                                 double threshold,
+                                 quint64 signalPixelCount,
+                                 quint64 saturatedPixelCount,
+                                 bool centroidValid,
+                                 bool measurementUsable,
+                                 quint64 frameId,
+                                 qint64 timestampMs);
 
 private:
     QThread* m_workerThread = nullptr;
@@ -287,8 +318,8 @@ private:
     RoiRect m_currentRoi[2];
     std::shared_ptr<std::atomic<quint64>> m_acquisitionGeneration =
         std::make_shared<std::atomic<quint64>>(1);
-    int m_method = 1;
-    int m_kernelSize = 3;
+    int m_method = 0;
+    int m_kernelSize = 7;
     double m_sigma = 1.0;
     double m_apertureDiameterMm = 56.0;
     double m_baselineSeparationMm = 250.0;

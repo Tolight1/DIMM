@@ -4,6 +4,7 @@
 #include <QDateTime>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 
 namespace {
@@ -39,6 +40,58 @@ bool setEnumIfWritable(CGXFeatureControlPointer& fc, const char* nodeName, const
     CEnumFeaturePointer feature = fc->GetEnumFeature(nodeName);
     feature->SetValue(value);
     return true;
+}
+
+QString readEnumIfReadable(CGXFeatureControlPointer& fc, const char* nodeName)
+{
+    if (!isFeatureReadable(fc, nodeName)) {
+        return QString();
+    }
+    CEnumFeaturePointer feature = fc->GetEnumFeature(nodeName);
+    const GxIAPICPP::gxstring value = feature->GetValue();
+    return QString::fromLatin1(value.c_str());
+}
+
+bool is16BitMonoPixelFormat(GX_PIXEL_FORMAT_ENTRY pixelFormat)
+{
+    return pixelFormat == GX_PIXEL_FORMAT_MONO10 ||
+           pixelFormat == GX_PIXEL_FORMAT_MONO12 ||
+           pixelFormat == GX_PIXEL_FORMAT_MONO16;
+}
+
+int cameraFrameBitDepth(GX_PIXEL_FORMAT_ENTRY pixelFormat)
+{
+    switch (pixelFormat) {
+    case GX_PIXEL_FORMAT_MONO8:
+    case GX_PIXEL_FORMAT_BAYER_RG8:
+    case GX_PIXEL_FORMAT_BAYER_GB8:
+    case GX_PIXEL_FORMAT_BAYER_GR8:
+    case GX_PIXEL_FORMAT_BAYER_BG8:
+        return 8;
+    case GX_PIXEL_FORMAT_MONO10:
+        return 10;
+    case GX_PIXEL_FORMAT_MONO12:
+        return 12;
+    case GX_PIXEL_FORMAT_MONO16:
+        return 16;
+    default:
+        return 8;
+    }
+}
+
+double cameraFrameMaxPixelValue(GX_PIXEL_FORMAT_ENTRY pixelFormat)
+{
+    switch (cameraFrameBitDepth(pixelFormat)) {
+    case 10:
+        return 1023.0;
+    case 12:
+        return 4095.0;
+    case 16:
+        return 65535.0;
+    case 8:
+    default:
+        return 255.0;
+    }
 }
 
 RoiAxisRange readIntRangeChecked(CGXFeatureControlPointer& fc, const char* nodeName)
@@ -224,6 +277,28 @@ bool CameraManager::openDevice(int index)
         camera.device = IGXFactory::GetInstance().OpenDeviceBySN(sn, GX_ACCESS_EXCLUSIVE);
         camera.remoteFeatureControl = camera.device->GetRemoteFeatureControl();
         camera.stream = camera.device->OpenStream(0);
+
+        bool mono12Set = false;
+        try {
+            mono12Set = setEnumIfWritable(camera.remoteFeatureControl, "PixelFormat", "Mono12");
+        } catch (...) {
+            mono12Set = false;
+        }
+        QString pixelFormatValue;
+        try {
+            pixelFormatValue = readEnumIfReadable(camera.remoteFeatureControl, "PixelFormat");
+        } catch (...) {
+            pixelFormatValue.clear();
+        }
+        if (!mono12Set || (!pixelFormatValue.isEmpty() && pixelFormatValue != QStringLiteral("Mono12"))) {
+            emit cameraError(index,
+                             -1,
+                             QStringLiteral("相机%1 PixelFormat 未确认到 Mono12，当前值: %2")
+                                 .arg(index + 1)
+                                 .arg(pixelFormatValue.isEmpty()
+                                          ? QStringLiteral("unknown")
+                                          : pixelFormatValue));
+        }
 
         // For GigE cameras, negotiate a stable packet size before streaming.
         // Without this, dual-camera acquisition can degrade into one camera
@@ -1242,6 +1317,10 @@ void CameraManager::onFrameCaptured(int cameraIndex, CImageDataPointer& imageDat
             const size_t bufSize = static_cast<size_t>(width * height);
             frame = cv::Mat(static_cast<int>(height), static_cast<int>(width), CV_8UC1);
             std::memcpy(frame.data, imageData->GetBuffer(), bufSize);
+        } else if (is16BitMonoPixelFormat(pixelFormat)) {
+            const size_t bufSize = static_cast<size_t>(width * height * sizeof(uint16_t));
+            frame = cv::Mat(static_cast<int>(height), static_cast<int>(width), CV_16UC1);
+            std::memcpy(frame.data, imageData->GetBuffer(), bufSize);
         } else if (pixelFormat == GX_PIXEL_FORMAT_BAYER_RG8 ||
                    pixelFormat == GX_PIXEL_FORMAT_BAYER_GB8 ||
                    pixelFormat == GX_PIXEL_FORMAT_BAYER_GR8 ||
@@ -1276,6 +1355,9 @@ void CameraManager::onFrameCaptured(int cameraIndex, CImageDataPointer& imageDat
 
         CameraFrame packet;
         packet.image = frame;
+        packet.pixelFormat = pixelFormat;
+        packet.bitDepth = cameraFrameBitDepth(pixelFormat);
+        packet.maxPixelValue = cameraFrameMaxPixelValue(pixelFormat);
         packet.frameId = frameId;
         packet.cameraTimestamp = cameraTimestamp;
         packet.receivedMs = receivedMs;

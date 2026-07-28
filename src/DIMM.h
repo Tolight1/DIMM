@@ -2,6 +2,7 @@
 
 #include "AlignmentTypes.h"
 #include "AlignmentSession.h"
+#include "AutoExposureController.h"
 #include "CameraManager.h"
 #include "CameraTypes.h"
 #include "CanvasWidgets.h"
@@ -26,6 +27,8 @@ class FullFrameCanvas;
 class RoiStarCanvas;
 class ChartWidget;
 class CommManager;
+class EafFocuserManager;
+class FocuserControlWidget;
 class PulseGeneratorManager;
 
 class QLineEdit;
@@ -313,9 +316,14 @@ private:
     void onCommCommand(uint8_t cmd);
     void reportMeasurement();
     void reportDeviceStatus();
-    void applyAutoExposure(int cameraIndex, double peakValue);
+    void handleAutoExposureSample(const AutoExposureFrameSample& sample);
+    void resetAutoExposureState();
+    QString autoExposureStateName(AutoExposureState state) const;
+    QString autoExposureStateShortText(AutoExposureState state) const;
+    QString autoExposureUiStatusText() const;
+    QString csvSafeField(QString value) const;
     QVector<int> scanHotPixelExposureTemplates() const;
-    int selectTemplateExposureForPeak(double currentExposure, double peakValue) const;
+    int selectHotPixelTemplateExposureForCurrentExposure(double currentExposure) const;
     bool resolveHotPixelTemplatePathsForExposure(int exposureUs,
                                                  QString* camera0Mask,
                                                  QString* camera0Excess,
@@ -354,6 +362,8 @@ private:
     QString m_statusColor = QStringLiteral("#e0e0e0");
 
     SettingsDialog* m_settingsDialog = nullptr;
+    EafFocuserManager* m_focuserManager = nullptr;
+    FocuserControlWidget* m_focuserControlWidget = nullptr;
     QLabel* m_lblStatusState = nullptr;
     QLabel* m_lblStatusROI = nullptr;
     QLabel* m_lblStatusFrames = nullptr;
@@ -381,7 +391,7 @@ private:
 
     CaptureRuntimeContext m_liveRuntime;
     CaptureRuntimeContext m_simulationRuntime;
-    double m_configExposureUs = 2000.0;
+    double m_configExposureUs = 1000.0;
     double m_configGainDb = 10.0;
     double m_configContinuousFrameRateHz = 200.0;
     double m_lastContinuousFrameRateReadback[2] = {0.0, 0.0};
@@ -417,17 +427,22 @@ private:
     double m_pulseGeneratorDutyPercent = 50.0;
     bool m_pulseGeneratorRemoteControl = true;
 
-    bool m_autoExposureEnabled = false;
-    double m_autoExposureLowThreshold = 80.0;
-    double m_autoExposureHighThreshold = 220.0;
-    double m_autoExposureDarkRatio = 1.2;
-    double m_autoExposureBrightRatio = 0.8;
-    double m_autoExposureMinUs = 500.0;
-    double m_autoExposureMaxUs = 20000.0;
-    int m_autoExposureIntervalMs = 4 * 60 * 60 * 1000;
-    QVector<double> m_autoExposurePeakSamples[2];
-    qint64 m_lastAutoExposureCheckMs = -1;
-    int m_hotPixelTemplateExposureUs = 2000;
+    AutoExposureConfig m_autoExposureConfig;
+    AutoExposureController m_autoExposureController;
+    AutoExposureTrendSnapshot m_latestAutoExposureTrend;
+    AutoExposureState m_autoExposureState = AutoExposureState::Normal;
+    QString m_autoExposureReason;
+    quint64 m_autoExposureSequenceId = 0;
+    int m_autoExposureTargetExposureUs = 0;
+    qint64 m_lastAutoExposureAdjustMs = -1;
+    quint64 m_autoExposureFramesSinceAdjust = 0;
+    double m_latestAutoExposurePeakDn[2] = {0.0, 0.0};
+    double m_latestAutoExposureSnr[2] = {0.0, 0.0};
+    double m_latestAutoExposureValidRatio[2] = {0.0, 0.0};
+    double m_latestAutoExposureUsableRatio[2] = {0.0, 0.0};
+    mutable QVector<int> m_cachedHotPixelTemplateExposures;
+    mutable qint64 m_cachedHotPixelTemplateScanMs = -1;
+    int m_hotPixelTemplateExposureUs = 1000;
     bool m_alignmentAutoRadius = true;
     bool m_alignmentAutoSolveEnabled = true;
     bool m_alignmentShowMatchedCatalogStars = true;

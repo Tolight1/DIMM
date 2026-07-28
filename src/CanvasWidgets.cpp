@@ -12,6 +12,23 @@
 #include <cmath>
 #include <limits>
 
+namespace {
+cv::Mat makeDisplayGray8(const cv::Mat& image)
+{
+    if (image.empty() || image.channels() != 1) {
+        return cv::Mat();
+    }
+    if (image.type() == CV_8UC1) {
+        return image;
+    }
+
+    cv::Mat display;
+    constexpr double kMono12MaxValue = 4095.0;
+    image.convertTo(display, CV_8U, 255.0 / kMono12MaxValue);
+    return display;
+}
+}
+
 FullFrameCanvas::FullFrameCanvas(QWidget* parent)
     : QWidget(parent)
 {
@@ -186,8 +203,9 @@ void FullFrameCanvas::drawImage(QPainter& painter)
                               static_cast<int>(rgb.step), QImage::Format_RGB888)
                            .copy();
         } else if (m_image.channels() == 1) {
-            m_qimage = QImage(m_image.data, m_image.cols, m_image.rows,
-                              static_cast<int>(m_image.step), QImage::Format_Grayscale8)
+            const cv::Mat display = makeDisplayGray8(m_image);
+            m_qimage = QImage(display.data, display.cols, display.rows,
+                              static_cast<int>(display.step), QImage::Format_Grayscale8)
                            .copy();
         } else {
             m_qimage = QImage();
@@ -570,24 +588,7 @@ void RoiStarCanvas::drawImage(QPainter& painter)
                               static_cast<int>(rgb.step), QImage::Format_RGB888)
                            .copy();
         } else if (m_roiImage.channels() == 1) {
-            cv::Mat gray;
-            if (m_roiImage.type() == CV_64F) {
-                gray = m_roiImage;
-            } else {
-                m_roiImage.convertTo(gray, CV_64F);
-            }
-
-            cv::Mat display;
-            double minVal = 0.0;
-            double maxVal = 0.0;
-            cv::minMaxLoc(gray, &minVal, &maxVal);
-            if (maxVal > minVal) {
-                gray.convertTo(display, CV_8U, 255.0 / (maxVal - minVal),
-                               -255.0 * minVal / (maxVal - minVal));
-            } else {
-                display = cv::Mat(gray.size(), CV_8U, cv::Scalar(128));
-            }
-
+            const cv::Mat display = makeDisplayGray8(m_roiImage);
             m_qimage = QImage(display.data, display.cols, display.rows,
                               static_cast<int>(display.step), QImage::Format_Grayscale8)
                            .copy();
@@ -684,6 +685,8 @@ void RoiStarCanvas::mouseMoveEvent(QMouseEvent* event)
             value = m_roiImage.at<double>(py, px);
         } else if (m_roiImage.type() == CV_8U) {
             value = m_roiImage.at<uchar>(py, px);
+        } else if (m_roiImage.type() == CV_16U) {
+            value = m_roiImage.at<quint16>(py, px);
         }
         setToolTip(QString("(%1, %2) = %3").arg(px).arg(py).arg(value, 0, 'f', 1));
     }

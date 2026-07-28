@@ -11,13 +11,7 @@ void applyPreValidationConfig(const AppConfig& config,
                               config.camera.continuousFrameRateHz);
     }
     if (callbacks.applyAutoExposure) {
-        callbacks.applyAutoExposure(config.autoExposure.enabled,
-                                    config.autoExposure.lowThreshold,
-                                    config.autoExposure.highThreshold,
-                                    config.autoExposure.darkRatio,
-                                    config.autoExposure.brightRatio,
-                                    config.autoExposure.minExposureUs,
-                                    config.autoExposure.maxExposureUs);
+        callbacks.applyAutoExposure(config.autoExposure);
     }
     if (callbacks.applyTriggerMode) {
         callbacks.applyTriggerMode(config.trigger.mode);

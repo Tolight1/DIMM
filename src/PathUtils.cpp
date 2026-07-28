@@ -91,8 +91,9 @@ QString replaceTemplateExposurePath(const QString& path, int exposureUs)
         return QString();
     }
 
+    const int width = valueEnd - valueStart;
     const QString exposureDir = QStringLiteral("exposure_%1us")
-                                    .arg(exposureUs, 7, 10, QLatin1Char('0'));
+                                    .arg(exposureUs, width, 10, QLatin1Char('0'));
     QString replaced = path;
     replaced.replace(start, valueEnd + 2 - start, exposureDir);
     return replaced;

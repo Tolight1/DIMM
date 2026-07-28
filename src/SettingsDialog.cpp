@@ -62,16 +62,8 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     auto* mainLayout = new QVBoxLayout(this);
     mainLayout->setContentsMargins(0, 0, 0, 0);
 
-    auto* tabWidget = new QTabWidget(this);
-    tabWidget->setDocumentMode(true);
-
-    const auto addScrollableTab = [tabWidget](QWidget* page, const QString& title) {
-        auto* scrollArea = new QScrollArea(tabWidget);
-        scrollArea->setWidgetResizable(true);
-        scrollArea->setFrameShape(QFrame::NoFrame);
-        scrollArea->setWidget(page);
-        tabWidget->addTab(scrollArea, title);
-    };
+    m_tabWidget = new QTabWidget(this);
+    m_tabWidget->setDocumentMode(true);
 
     auto* camTab = new QWidget();
     auto* camLayout = new QVBoxLayout(camTab);
@@ -94,7 +86,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     acqLayout->setFormAlignment(Qt::AlignTop);
     acqLayout->setHorizontalSpacing(16);
     acqLayout->setVerticalSpacing(12);
-    exposureEdit = new QLineEdit(QStringLiteral("2000"));
+    exposureEdit = new QLineEdit(QStringLiteral("1000"));
     acqLayout->addRow(QStringLiteral("曝光时间 (μs):"), exposureEdit);
     gainEdit = new QLineEdit(QStringLiteral("10.0"));
     acqLayout->addRow(QStringLiteral("增益 (dB):"), gainEdit);
@@ -110,21 +102,59 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     autoExposureLayout->setVerticalSpacing(10);
     autoExposureCheck = new QCheckBox(QStringLiteral("启用自动曝光"));
     autoExposureLayout->addRow(autoExposureCheck);
-    autoExpLowEdit = new QLineEdit(QStringLiteral("80"));
-    autoExposureLayout->addRow(QStringLiteral("峰值下阈值:"), autoExpLowEdit);
-    autoExpHighEdit = new QLineEdit(QStringLiteral("220"));
-    autoExposureLayout->addRow(QStringLiteral("峰值上阈值:"), autoExpHighEdit);
-    autoExpDarkRatioEdit = new QLineEdit(QStringLiteral("1.2"));
-    autoExposureLayout->addRow(QStringLiteral("过暗调整比例:"), autoExpDarkRatioEdit);
-    autoExpBrightRatioEdit = new QLineEdit(QStringLiteral("0.8"));
-    autoExposureLayout->addRow(QStringLiteral("过亮调整比例:"), autoExpBrightRatioEdit);
+    autoExpUseFittedPeakCheck = new QCheckBox(QStringLiteral("优先使用拟合峰值"));
+    autoExposureLayout->addRow(autoExpUseFittedPeakCheck);
+    autoExpTargetPeakLowEdit = new QLineEdit(QStringLiteral("3200"));
+    autoExposureLayout->addRow(QStringLiteral("目标峰值下界 (DN):"), autoExpTargetPeakLowEdit);
+    autoExpTargetPeakHighEdit = new QLineEdit(QStringLiteral("3600"));
+    autoExposureLayout->addRow(QStringLiteral("目标峰值上界 (DN):"), autoExpTargetPeakHighEdit);
+    autoExpNearSaturationEdit = new QLineEdit(QStringLiteral("3800"));
+    autoExposureLayout->addRow(QStringLiteral("接近饱和阈值 (DN):"), autoExpNearSaturationEdit);
+    autoExpHardSaturationEdit = new QLineEdit(QStringLiteral("4090"));
+    autoExposureLayout->addRow(QStringLiteral("硬饱和阈值 (DN):"), autoExpHardSaturationEdit);
+    autoExpSaturatedPixelCountEdit = new QLineEdit(QStringLiteral("1"));
+    autoExposureLayout->addRow(QStringLiteral("硬饱和像素数:"), autoExpSaturatedPixelCountEdit);
+    autoExpDarkSnrWarningEdit = new QLineEdit(QStringLiteral("8.0"));
+    autoExposureLayout->addRow(QStringLiteral("偏暗 SNR 报警:"), autoExpDarkSnrWarningEdit);
+    autoExpDarkSnrCriticalEdit = new QLineEdit(QStringLiteral("5.0"));
+    autoExposureLayout->addRow(QStringLiteral("严重偏暗 SNR:"), autoExpDarkSnrCriticalEdit);
+    autoExpMinValidCentroidRatioEdit = new QLineEdit(QStringLiteral("0.50"));
+    autoExposureLayout->addRow(QStringLiteral("最小有效质心比例:"), autoExpMinValidCentroidRatioEdit);
+    autoExpStarLostValidRatioEdit = new QLineEdit(QStringLiteral("0.10"));
+    autoExposureLayout->addRow(QStringLiteral("丢星有效质心比例:"), autoExpStarLostValidRatioEdit);
+    autoExpBrightFrameRatioEdit = new QLineEdit(QStringLiteral("0.30"));
+    autoExposureLayout->addRow(QStringLiteral("过亮帧比例阈值:"), autoExpBrightFrameRatioEdit);
+    autoExpDarkFrameRatioEdit = new QLineEdit(QStringLiteral("0.50"));
+    autoExposureLayout->addRow(QStringLiteral("过暗帧比例阈值:"), autoExpDarkFrameRatioEdit);
+    autoExpSampleWindowSecEdit = new QLineEdit(QStringLiteral("60"));
+    autoExposureLayout->addRow(QStringLiteral("统计窗口 (s):"), autoExpSampleWindowSecEdit);
+    autoExpBrightPersistenceSecEdit = new QLineEdit(QStringLiteral("30"));
+    autoExposureLayout->addRow(QStringLiteral("过亮持续时间 (s):"), autoExpBrightPersistenceSecEdit);
+    autoExpDarkPersistenceSecEdit = new QLineEdit(QStringLiteral("60"));
+    autoExposureLayout->addRow(QStringLiteral("过暗持续时间 (s):"), autoExpDarkPersistenceSecEdit);
+    autoExpStarLostPersistenceSecEdit = new QLineEdit(QStringLiteral("120"));
+    autoExposureLayout->addRow(QStringLiteral("丢星持续时间 (s):"), autoExpStarLostPersistenceSecEdit);
+    autoExpTrendConflictPersistenceSecEdit = new QLineEdit(QStringLiteral("30"));
+    autoExposureLayout->addRow(QStringLiteral("趋势冲突持续时间 (s):"), autoExpTrendConflictPersistenceSecEdit);
+    autoExpSafePersistenceSecEdit = new QLineEdit(QStringLiteral("60"));
+    autoExposureLayout->addRow(QStringLiteral("恢复正常持续时间 (s):"), autoExpSafePersistenceSecEdit);
+    autoExpCooldownSecEdit = new QLineEdit(QStringLiteral("180"));
+    autoExposureLayout->addRow(QStringLiteral("调整后冷却 (s):"), autoExpCooldownSecEdit);
     autoExpMinEdit = new QLineEdit(QStringLiteral("500"));
     autoExposureLayout->addRow(QStringLiteral("最小曝光 (μs):"), autoExpMinEdit);
     autoExpMaxEdit = new QLineEdit(QStringLiteral("20000"));
     autoExposureLayout->addRow(QStringLiteral("最大曝光 (μs):"), autoExpMaxEdit);
+    autoExpMaxTemplateStepEdit = new QLineEdit(QStringLiteral("1"));
+    autoExposureLayout->addRow(QStringLiteral("单次最大模板档数:"), autoExpMaxTemplateStepEdit);
+    autoExpMaxChangeUpEdit = new QLineEdit(QStringLiteral("1.30"));
+    autoExposureLayout->addRow(QStringLiteral("单次调亮比例上限:"), autoExpMaxChangeUpEdit);
+    autoExpMaxChangeDownEdit = new QLineEdit(QStringLiteral("0.70"));
+    autoExposureLayout->addRow(QStringLiteral("单次调暗比例下限:"), autoExpMaxChangeDownEdit);
+    autoExpCameraAgreementRatioEdit = new QLineEdit(QStringLiteral("0.50"));
+    autoExposureLayout->addRow(QStringLiteral("双相机峰值差异上限:"), autoExpCameraAgreementRatioEdit);
     camLayout->addWidget(autoExposureGroup);
     camLayout->addStretch();
-    addScrollableTab(camTab, QStringLiteral("相机设置"));
+    addSettingsPage(camTab, QStringLiteral("相机设置"));
 
     auto* triggerTab = new QWidget();
     auto* triggerTabLayout = new QVBoxLayout(triggerTab);
@@ -226,7 +256,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     pulseLayout->addRow(QStringLiteral("即时控制:"), pulseActionRow);
     triggerTabLayout->addWidget(pulseGroup);
     triggerTabLayout->addStretch();
-    addScrollableTab(triggerTab, QStringLiteral("触发设置"));
+    addSettingsPage(triggerTab, QStringLiteral("触发设置"));
 
     auto* procTab = new QWidget();
     auto* procLayout = new QVBoxLayout(procTab);
@@ -236,7 +266,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     auto* centroidLayout = new QVBoxLayout(centroidGroup);
     procGravity = new QRadioButton(QStringLiteral("重心法"));
     procGaussian = new QRadioButton(QStringLiteral("高斯加权精细化"));
-    procGaussian->setChecked(true);
+    procGravity->setChecked(true);
     centroidLayout->addWidget(procGravity);
     centroidLayout->addWidget(procGaussian);
     procLayout->addWidget(centroidGroup);
@@ -244,7 +274,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     auto* preprocessGroup = new QGroupBox(QStringLiteral("ROI质心预处理参数"));
     auto* preprocessLayout = new QGridLayout(preprocessGroup);
     preprocessLayout->addWidget(new QLabel(QStringLiteral("高斯滤波核大小:")), 0, 0);
-    procKernelSize = new QLineEdit(QStringLiteral("3"));
+    procKernelSize = new QLineEdit(QStringLiteral("7"));
     preprocessLayout->addWidget(procKernelSize, 0, 1);
     preprocessLayout->addWidget(new QLabel(QStringLiteral("高斯标准差 σ:")), 1, 0);
     procSigma = new QLineEdit(QStringLiteral("1.0"));
@@ -345,7 +375,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     hotPixelLayout->addRow(QString(), hotPixelHint);
     procLayout->addWidget(hotPixelGroup);
     procLayout->addStretch();
-    addScrollableTab(procTab, QStringLiteral("图像处理"));
+    addSettingsPage(procTab, QStringLiteral("图像处理"));
 
     auto* sysTab = new QWidget();
     auto* sysLayout = new QVBoxLayout(sysTab);
@@ -427,7 +457,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     alignmentLayout->addRow(QString(), alignmentHint);
     sysLayout->addWidget(alignmentGroup);
     sysLayout->addStretch();
-    addScrollableTab(sysTab, QStringLiteral("系统参数"));
+    addSettingsPage(sysTab, QStringLiteral("系统参数"));
 
     auto* storeTab = new QWidget();
     auto* storeLayout = new QVBoxLayout(storeTab);
@@ -467,7 +497,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     resultLayout->addWidget(resultInfo);
     storeLayout->addWidget(resultGroup);
     storeLayout->addStretch();
-    addScrollableTab(storeTab, QStringLiteral("数据存储"));
+    addSettingsPage(storeTab, QStringLiteral("数据存储"));
 
     auto* netTab = new QWidget();
     auto* netLayout = new QVBoxLayout(netTab);
@@ -502,9 +532,9 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     protoLayout->addWidget(protoInfo);
     netLayout->addWidget(protoGroup);
     netLayout->addStretch();
-    addScrollableTab(netTab, QStringLiteral("网络通信"));
+    addSettingsPage(netTab, QStringLiteral("网络通信"));
 
-    mainLayout->addWidget(tabWidget);
+    mainLayout->addWidget(m_tabWidget);
 
     applyStatusLabel = new QLabel(QStringLiteral("待应用"));
     applyStatusLabel->setStyleSheet(statusLabelStyle(UiStatusLevel::Muted));
@@ -693,6 +723,19 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     });
 }
 
+void SettingsDialog::addSettingsPage(QWidget* page, const QString& title)
+{
+    if (!m_tabWidget || !page) {
+        return;
+    }
+
+    auto* scrollArea = new QScrollArea(m_tabWidget);
+    scrollArea->setWidgetResizable(true);
+    scrollArea->setFrameShape(QFrame::NoFrame);
+    scrollArea->setWidget(page);
+    m_tabWidget->addTab(scrollArea, title);
+}
+
 void SettingsDialog::setPulseGeneratorState(bool enabled,
                                             const QString& portName,
                                             int baudRate,
@@ -817,41 +860,115 @@ bool SettingsDialog::applySettings()
         return false;
     }
 
-    const double autoExpLow = autoExpLowEdit->text().toDouble(&ok);
-    if (!ok || autoExpLow < 0.0) {
-        showInvalid(QStringLiteral("自动曝光峰值下阈值必须大于或等于 0。"));
+    AutoExposureConfig autoExposureConfig;
+    autoExposureConfig.enabled = autoExposureCheck && autoExposureCheck->isChecked();
+    autoExposureConfig.useFittedPeak = autoExpUseFittedPeakCheck && autoExpUseFittedPeakCheck->isChecked();
+
+    auto readDoubleField = [&](QLineEdit* edit, const QString& name, double* value) {
+        bool fieldOk = false;
+        const double parsed = edit ? edit->text().toDouble(&fieldOk) : 0.0;
+        if (!fieldOk || !std::isfinite(parsed)) {
+            showInvalid(QStringLiteral("%1 必须是有效数字。").arg(name));
+            return false;
+        }
+        *value = parsed;
+        return true;
+    };
+    auto readIntField = [&](QLineEdit* edit, const QString& name, int* value) {
+        bool fieldOk = false;
+        const int parsed = edit ? edit->text().toInt(&fieldOk) : 0;
+        if (!fieldOk) {
+            showInvalid(QStringLiteral("%1 必须是有效整数。").arg(name));
+            return false;
+        }
+        *value = parsed;
+        return true;
+    };
+
+    if (!readDoubleField(autoExpTargetPeakLowEdit, QStringLiteral("目标峰值下界"), &autoExposureConfig.targetPeakLowDn) ||
+        !readDoubleField(autoExpTargetPeakHighEdit, QStringLiteral("目标峰值上界"), &autoExposureConfig.targetPeakHighDn) ||
+        !readDoubleField(autoExpNearSaturationEdit, QStringLiteral("接近饱和阈值"), &autoExposureConfig.nearSaturationDn) ||
+        !readDoubleField(autoExpHardSaturationEdit, QStringLiteral("硬饱和阈值"), &autoExposureConfig.hardSaturationDn) ||
+        !readIntField(autoExpSaturatedPixelCountEdit, QStringLiteral("硬饱和像素数"), &autoExposureConfig.saturatedPixelCount) ||
+        !readDoubleField(autoExpDarkSnrWarningEdit, QStringLiteral("偏暗 SNR 报警"), &autoExposureConfig.darkSnrWarning) ||
+        !readDoubleField(autoExpDarkSnrCriticalEdit, QStringLiteral("严重偏暗 SNR"), &autoExposureConfig.darkSnrCritical) ||
+        !readDoubleField(autoExpMinValidCentroidRatioEdit, QStringLiteral("最小有效质心比例"), &autoExposureConfig.minValidCentroidRatio) ||
+        !readDoubleField(autoExpStarLostValidRatioEdit, QStringLiteral("丢星有效质心比例"), &autoExposureConfig.starLostValidRatio) ||
+        !readDoubleField(autoExpBrightFrameRatioEdit, QStringLiteral("过亮帧比例阈值"), &autoExposureConfig.brightFrameRatioThreshold) ||
+        !readDoubleField(autoExpDarkFrameRatioEdit, QStringLiteral("过暗帧比例阈值"), &autoExposureConfig.darkFrameRatioThreshold) ||
+        !readIntField(autoExpSampleWindowSecEdit, QStringLiteral("统计窗口"), &autoExposureConfig.sampleWindowSec) ||
+        !readIntField(autoExpBrightPersistenceSecEdit, QStringLiteral("过亮持续时间"), &autoExposureConfig.brightPersistenceSec) ||
+        !readIntField(autoExpDarkPersistenceSecEdit, QStringLiteral("过暗持续时间"), &autoExposureConfig.darkPersistenceSec) ||
+        !readIntField(autoExpStarLostPersistenceSecEdit, QStringLiteral("丢星持续时间"), &autoExposureConfig.starLostPersistenceSec) ||
+        !readIntField(autoExpTrendConflictPersistenceSecEdit, QStringLiteral("趋势冲突持续时间"), &autoExposureConfig.trendConflictPersistenceSec) ||
+        !readIntField(autoExpSafePersistenceSecEdit, QStringLiteral("恢复正常持续时间"), &autoExposureConfig.safePersistenceSec) ||
+        !readIntField(autoExpCooldownSecEdit, QStringLiteral("调整后冷却"), &autoExposureConfig.cooldownSec) ||
+        !readDoubleField(autoExpMinEdit, QStringLiteral("最小曝光"), &autoExposureConfig.minExposureUs) ||
+        !readDoubleField(autoExpMaxEdit, QStringLiteral("最大曝光"), &autoExposureConfig.maxExposureUs) ||
+        !readIntField(autoExpMaxTemplateStepEdit, QStringLiteral("单次最大模板档数"), &autoExposureConfig.maxTemplateStepPerAdjust) ||
+        !readDoubleField(autoExpMaxChangeUpEdit, QStringLiteral("单次调亮比例上限"), &autoExposureConfig.maxExposureChangeRatioUp) ||
+        !readDoubleField(autoExpMaxChangeDownEdit, QStringLiteral("单次调暗比例下限"), &autoExposureConfig.maxExposureChangeRatioDown) ||
+        !readDoubleField(autoExpCameraAgreementRatioEdit, QStringLiteral("双相机峰值差异上限"), &autoExposureConfig.cameraAgreementRatio)) {
         return false;
     }
 
-    const double autoExpHigh = autoExpHighEdit->text().toDouble(&ok);
-    if (!ok || autoExpHigh <= autoExpLow) {
-        showInvalid(QStringLiteral("自动曝光峰值上阈值必须大于下阈值。"));
+    if (!(0.0 <= autoExposureConfig.targetPeakLowDn &&
+          autoExposureConfig.targetPeakLowDn < autoExposureConfig.targetPeakHighDn &&
+          autoExposureConfig.targetPeakHighDn <= autoExposureConfig.nearSaturationDn &&
+          autoExposureConfig.nearSaturationDn <= autoExposureConfig.hardSaturationDn &&
+          autoExposureConfig.hardSaturationDn <= 4095.0)) {
+        showInvalid(QStringLiteral("自动曝光 DN 阈值必须满足 0 <= 目标下界 < 目标上界 <= 接近饱和 <= 硬饱和 <= 4095。"));
         return false;
     }
-
-    const double autoExpDarkRatio = autoExpDarkRatioEdit->text().toDouble(&ok);
-    if (!ok || autoExpDarkRatio <= 1.0) {
-        showInvalid(QStringLiteral("过暗调整比例必须大于 1。"));
+    if (autoExposureConfig.saturatedPixelCount < 1) {
+        showInvalid(QStringLiteral("硬饱和像素数必须大于或等于 1。"));
         return false;
     }
-
-    const double autoExpBrightRatio = autoExpBrightRatioEdit->text().toDouble(&ok);
-    if (!ok || autoExpBrightRatio <= 0.0 || autoExpBrightRatio >= 1.0) {
-        showInvalid(QStringLiteral("过亮调整比例必须在 0 到 1 之间。"));
+    if (!(autoExposureConfig.darkSnrCritical > 0.0 &&
+          autoExposureConfig.darkSnrWarning > autoExposureConfig.darkSnrCritical)) {
+        showInvalid(QStringLiteral("偏暗 SNR 报警必须大于严重偏暗 SNR，且严重偏暗 SNR 必须大于 0。"));
         return false;
     }
-
-    const double autoExpMin = autoExpMinEdit->text().toDouble(&ok);
-    if (!ok || autoExpMin <= 0.0) {
-        showInvalid(QStringLiteral("最小曝光必须大于 0。"));
+    if (!(0.0 <= autoExposureConfig.starLostValidRatio &&
+          autoExposureConfig.starLostValidRatio <= autoExposureConfig.minValidCentroidRatio &&
+          autoExposureConfig.minValidCentroidRatio <= 1.0)) {
+        showInvalid(QStringLiteral("有效质心比例必须满足 0 <= 丢星比例 <= 最小有效比例 <= 1。"));
         return false;
     }
-
-    const double autoExpMax = autoExpMaxEdit->text().toDouble(&ok);
-    if (!ok || autoExpMax < autoExpMin) {
-        showInvalid(QStringLiteral("最大曝光必须大于或等于最小曝光。"));
+    if (autoExposureConfig.brightFrameRatioThreshold < 0.0 ||
+        autoExposureConfig.brightFrameRatioThreshold > 1.0 ||
+        autoExposureConfig.darkFrameRatioThreshold < 0.0 ||
+        autoExposureConfig.darkFrameRatioThreshold > 1.0) {
+        showInvalid(QStringLiteral("过亮/过暗帧比例阈值必须在 0 到 1 之间。"));
         return false;
     }
+    if (autoExposureConfig.sampleWindowSec < 10 ||
+        autoExposureConfig.brightPersistenceSec < 1 ||
+        autoExposureConfig.darkPersistenceSec < 1 ||
+        autoExposureConfig.starLostPersistenceSec < autoExposureConfig.darkPersistenceSec ||
+        autoExposureConfig.trendConflictPersistenceSec < 1 ||
+        autoExposureConfig.safePersistenceSec < 1 ||
+        autoExposureConfig.cooldownSec < 0) {
+        showInvalid(QStringLiteral("自动曝光时间窗口、持续时间和冷却时间不满足约束。"));
+        return false;
+    }
+    if (autoExposureConfig.minExposureUs <= 0.0 ||
+        autoExposureConfig.maxExposureUs < autoExposureConfig.minExposureUs) {
+        showInvalid(QStringLiteral("自动曝光范围必须满足最小曝光 > 0 且最大曝光 >= 最小曝光。"));
+        return false;
+    }
+    if (autoExposureConfig.maxTemplateStepPerAdjust < 1 ||
+        autoExposureConfig.maxExposureChangeRatioUp < 1.0 ||
+        autoExposureConfig.maxExposureChangeRatioDown <= 0.0 ||
+        autoExposureConfig.maxExposureChangeRatioDown > 1.0 ||
+        autoExposureConfig.cameraAgreementRatio <= 0.0) {
+        showInvalid(QStringLiteral("自动曝光调整限制参数不满足约束。"));
+        return false;
+    }
+    autoExposureConfig.lowThreshold = autoExposureConfig.targetPeakLowDn;
+    autoExposureConfig.highThreshold = autoExposureConfig.targetPeakHighDn;
+    autoExposureConfig.darkRatio = autoExposureConfig.maxExposureChangeRatioUp;
+    autoExposureConfig.brightRatio = autoExposureConfig.maxExposureChangeRatioDown;
 
     const int kernelSize = procKernelSize->text().toInt(&ok);
     if (!ok || kernelSize <= 0) {
@@ -892,8 +1009,8 @@ bool SettingsDialog::applySettings()
     const double starThresholdAbsolute = starThresholdAbsoluteEdit->text().toDouble(&ok);
     if (!ok ||
         !(qFuzzyCompare(starThresholdAbsolute, -1.0) ||
-          (starThresholdAbsolute >= 0.0 && starThresholdAbsolute <= 255.0))) {
-        showInvalid(QStringLiteral("全画幅找星绝对阈值必须为 -1 或 0 到 255 之间的数值。"));
+          (starThresholdAbsolute >= 0.0 && starThresholdAbsolute <= 4095.0))) {
+        showInvalid(QStringLiteral("全画幅找星绝对阈值必须为 -1 或 0 到 4095 之间的数值。"));
         return false;
     }
 
@@ -910,8 +1027,8 @@ bool SettingsDialog::applySettings()
     }
 
     const double starMinimumIntensity = starMinimumIntensityEdit->text().toDouble(&ok);
-    if (!ok || starMinimumIntensity < 0.0 || starMinimumIntensity > 255.0) {
-        showInvalid(QStringLiteral("全画幅找星最低亮度必须在 0 到 255 之间。"));
+    if (!ok || starMinimumIntensity < 0.0 || starMinimumIntensity > 4095.0) {
+        showInvalid(QStringLiteral("全画幅找星最低亮度必须在 0 到 4095 之间。"));
         return false;
     }
 
@@ -1111,15 +1228,6 @@ bool SettingsDialog::applySettings()
         exposure,
         gain,
         continuousFrameRate
-    };
-    const AutoExposureConfig autoExposureConfig{
-        autoExposureCheck->isChecked(),
-        autoExpLow,
-        autoExpHigh,
-        autoExpDarkRatio,
-        autoExpBrightRatio,
-        autoExpMin,
-        autoExpMax
     };
     const TriggerConfig triggerConfig{
         triggerContinuous && triggerContinuous->isChecked() ? 0 : 1

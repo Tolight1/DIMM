@@ -5,7 +5,7 @@ struct InitialStarDetectionConfig {
     double sigmaThreshold = 4.0;
     double peakFraction = 0.20;
     double minimumIntensity = 16.0;
-    int minArea = 1;
+    int minArea = 8;
     int maxArea = 1000;
 };
 
