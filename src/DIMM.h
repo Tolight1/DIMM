@@ -218,10 +218,10 @@ private:
     bool handleManualAlignmentFrameTracking(int cameraIndex, const cv::Mat& frame);
     bool handleAutomaticAlignmentFrameTracking(int cameraIndex, const cv::Mat& frame, qint64 nowMs);
     bool prepareAlignmentFramePreview(int cameraIndex, const CameraFrame& packet);
-    void finishAlignmentFramePreview(int cameraIndex, const cv::Mat& frame, qint64 nowMs);
+    void finishAlignmentFramePreview(int cameraIndex, const CameraFrame& packet, qint64 nowMs);
     void showMissingAlignmentFrameForSolve(int cameraIndex);
     void showSubmittedAlignmentSolve(int cameraIndex, bool force);
-    void updateAlignmentOverlay(int cameraIndex, const cv::Mat& frame);
+    void updateAlignmentOverlay(int cameraIndex, const CameraFrame& packet);
     bool trackAlignmentPolarisLocally(int cameraIndex,
                                       const cv::Mat& frame,
                                       QPointF* trackedPosition,
@@ -353,6 +353,8 @@ private:
     QPushButton* m_btnRetryCamera1PolarisSolve = nullptr;
     QPushButton* m_btnRetryCamera2PolarisSolve = nullptr;
     QPushButton* m_btnRetryBothPolarisSolve = nullptr;
+    QVector<PolarisDetectionPipeline::InitialStarCandidate> m_alignmentCachedCandidates[kCameraCount];
+    qint64 m_alignmentLastCandidateDetectionMs[kCameraCount] = {-1, -1};
     CaptureState m_captureState = CaptureState::Idle;
     DetailViewMode m_detailViewMode = DetailViewMode::RoiOnly;
     bool m_commConnected = false;

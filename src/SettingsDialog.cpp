@@ -266,7 +266,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     auto* centroidLayout = new QVBoxLayout(centroidGroup);
     procGravity = new QRadioButton(QStringLiteral("重心法"));
     procGaussian = new QRadioButton(QStringLiteral("高斯加权精细化"));
-    procGravity->setChecked(true);
+    procGaussian->setChecked(true);
     centroidLayout->addWidget(procGravity);
     centroidLayout->addWidget(procGaussian);
     procLayout->addWidget(centroidGroup);

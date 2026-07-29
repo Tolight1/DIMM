@@ -141,7 +141,7 @@ public slots:
 
 private:
     mutable QMutex m_mutex;
-    int m_method = 0;
+    int m_method = 1;
     int m_kernelSize = 7;
     double m_sigma = 1.0;
     double m_threshold = 0.0;
@@ -318,7 +318,7 @@ private:
     RoiRect m_currentRoi[2];
     std::shared_ptr<std::atomic<quint64>> m_acquisitionGeneration =
         std::make_shared<std::atomic<quint64>>(1);
-    int m_method = 0;
+    int m_method = 1;
     int m_kernelSize = 7;
     double m_sigma = 1.0;
     double m_apertureDiameterMm = 56.0;

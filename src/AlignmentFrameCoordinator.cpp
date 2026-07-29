@@ -25,11 +25,11 @@ AlignmentFrameCoordinator::FrameAction AlignmentFrameCoordinator::nextFrameActio
     const AlignmentCameraSolveRuntime& runtime,
     qint64 nowMs)
 {
-    if (!autoSolveEnabled) {
-        return FrameAction::Disabled;
-    }
     if (runtime.state == AlignmentSolveState::ManualOnly) {
         return FrameAction::ManualTrack;
+    }
+    if (!autoSolveEnabled) {
+        return FrameAction::Disabled;
     }
     if (runtime.state == AlignmentSolveState::Tracking) {
         return FrameAction::AutomaticTrack;
