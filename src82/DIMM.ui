@@ -1,0 +1,979 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>DIMM</class>
+ <widget class="QMainWindow" name="DIMM">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1400</width>
+    <height>900</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>C-DIMM 大气相干长度测量系统</string>
+  </property>
+  <!-- Menu Bar -->
+  <widget class="QMenuBar" name="menubar">
+   <property name="geometry">
+    <rect><x>0</x><y>0</y><width>1400</width><height>28</height></rect>
+   </property>
+   <widget class="QMenu" name="menuFile">
+    <property name="title"><string>文件(&amp;F)</string></property>
+    <addaction name="actionSaveConfig"/>
+    <addaction name="actionLoadConfig"/>
+    <addaction name="separator"/>
+    <addaction name="actionExportData"/>
+    <addaction name="actionExportReport"/>
+    <addaction name="separator"/>
+    <addaction name="actionExit"/>
+   </widget>
+   <widget class="QMenu" name="menuCamera">
+    <property name="title"><string>相机(&amp;C)</string></property>
+    <addaction name="actionConnectAll"/>
+    <addaction name="actionDisconnectAll"/>
+    <addaction name="separator"/>
+    <addaction name="actionCameraSettings"/>
+   </widget>
+   <widget class="QMenu" name="menuView">
+    <property name="title"><string>视图(&amp;V)</string></property>
+    <addaction name="actionViewMain"/>
+    <addaction name="actionViewROI"/>
+    <addaction name="actionViewSettings"/>
+    <addaction name="separator"/>
+    <addaction name="actionToggleROIImages"/>
+    <addaction name="actionToggleCharts"/>
+   </widget>
+   <widget class="QMenu" name="menuTools">
+    <property name="title"><string>工具(&amp;T)</string></property>
+    <addaction name="actionROISchedule"/>
+    <addaction name="actionTrajectoryCalc"/>
+   </widget>
+   <widget class="QMenu" name="menuHelp">
+    <property name="title"><string>帮助(&amp;H)</string></property>
+    <addaction name="actionAbout"/>
+   </widget>
+   <addaction name="menuFile"/>
+   <addaction name="menuCamera"/>
+   <addaction name="menuView"/>
+   <addaction name="menuTools"/>
+   <addaction name="menuHelp"/>
+  </widget>
+  <!-- Status Bar -->
+  <widget class="QStatusBar" name="statusbar"/>
+  <!-- Tool Bar -->
+  <widget class="QToolBar" name="toolbar">
+   <property name="windowTitle"><string>工具栏</string></property>
+   <property name="movable"><bool>false</bool></property>
+   <addaction name="btnStart"/>
+   <addaction name="btnStop"/>
+   <addaction name="separator"/>
+   <addaction name="btnFullFrame"/>
+   <addaction name="btnROI"/>
+   <addaction name="btnSettings"/>
+  </widget>
+  <!-- Central Widget -->
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QHBoxLayout" name="mainLayout">
+    <property name="leftMargin"><number>0</number></property>
+    <property name="topMargin"><number>0</number></property>
+    <property name="rightMargin"><number>0</number></property>
+    <property name="bottomMargin"><number>0</number></property>
+    <property name="spacing"><number>0</number></property>
+    <!-- Left Panel -->
+    <item>
+    <widget class="QFrame" name="leftPanel">
+     <property name="fixedWidth"><number>260</number></property>
+     <layout class="QVBoxLayout" name="leftPanelLayout">
+      <property name="spacing"><number>0</number></property>
+      <property name="leftMargin"><number>8</number></property>
+      <property name="topMargin"><number>8</number></property>
+      <property name="rightMargin"><number>8</number></property>
+      <property name="bottomMargin"><number>8</number></property>
+      <!-- Camera Section -->
+      <item>
+      <widget class="QFrame" name="cameraSection">
+       <layout class="QVBoxLayout" name="cameraSectionLayout">
+        <property name="spacing"><number>10</number></property>
+        <item>
+         <widget class="QLabel" name="lblCameraTitle">
+          <property name="text"><string>相机状态</string></property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QFrame" name="environmentStrip">
+          <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+          <layout class="QVBoxLayout" name="environmentStripLayout">
+           <property name="spacing"><number>2</number></property>
+           <property name="leftMargin"><number>10</number></property>
+           <property name="topMargin"><number>6</number></property>
+           <property name="rightMargin"><number>10</number></property>
+           <property name="bottomMargin"><number>6</number></property>
+           <item>
+            <layout class="QHBoxLayout" name="environmentHeader">
+             <property name="spacing"><number>6</number></property>
+             <item>
+              <widget class="QLabel" name="lblEnvironmentName">
+               <property name="text"><string>环境</string></property>
+              </widget>
+             </item>
+             <item>
+              <spacer name="environmentSpacer">
+               <property name="orientation"><enum>Qt::Horizontal</enum></property>
+               <property name="sizeHint" stdset="0">
+                <size><width>40</width><height>12</height></size>
+               </property>
+              </spacer>
+             </item>
+             <item>
+              <widget class="QLabel" name="lblEnvironmentStatus">
+               <property name="text"><string>未连接</string></property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblEnvironmentInfo">
+             <property name="text"><string>-- °C  |  -- %RH  |  -- hPa</string></property>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+        </item>
+        <item>
+         <widget class="QFrame" name="cam1Card">
+          <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+          <layout class="QVBoxLayout" name="cam1CardLayout">
+           <property name="spacing"><number>4</number></property>
+           <item>
+            <layout class="QHBoxLayout" name="cam1Header">
+             <item>
+              <widget class="QLabel" name="lblCam1Name">
+               <property name="text"><string>相机 1</string></property>
+              </widget>
+             </item>
+             <item>
+              <spacer name="cam1Spacer">
+               <property name="orientation"><enum>Qt::Horizontal</enum></property>
+               <property name="sizeHint" stdset="0">
+                <size><width>40</width><height>20</height></size>
+               </property>
+              </spacer>
+             </item>
+             <item>
+              <widget class="QLabel" name="lblCam1Status">
+               <property name="text"><string>● 在线</string></property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblCam1Info">
+             <property name="text"><string>SN: KE0200060001 | 390 fps</string></property>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+        </item>
+        <item>
+         <widget class="QFrame" name="cam2Card">
+          <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+          <layout class="QVBoxLayout" name="cam2CardLayout">
+           <property name="spacing"><number>4</number></property>
+           <item>
+            <layout class="QHBoxLayout" name="cam2Header">
+             <item>
+              <widget class="QLabel" name="lblCam2Name">
+               <property name="text"><string>相机 2</string></property>
+              </widget>
+             </item>
+             <item>
+              <spacer name="cam2Spacer">
+               <property name="orientation"><enum>Qt::Horizontal</enum></property>
+               <property name="sizeHint" stdset="0">
+                <size><width>40</width><height>20</height></size>
+               </property>
+              </spacer>
+             </item>
+             <item>
+              <widget class="QLabel" name="lblCam2Status">
+               <property name="text"><string>● 在线</string></property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblCam2Info">
+             <property name="text"><string>SN: KE0200060002 | 389 fps</string></property>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+      </item>
+      <!-- ROI Section -->
+      <item>
+      <widget class="QFrame" name="roiSection">
+       <layout class="QVBoxLayout" name="roiSectionLayout">
+        <property name="spacing"><number>10</number></property>
+        <item>
+         <widget class="QLabel" name="lblROITitle">
+          <property name="text"><string>当前ROI</string></property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QFrame" name="roiInfoCard">
+          <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+          <layout class="QVBoxLayout" name="roiInfoCardLayout">
+           <item>
+            <layout class="QGridLayout" name="roiGrid">
+             <property name="spacing"><number>6</number></property>
+             <item row="0" column="0">
+              <widget class="QLabel" name="lblROIX">
+               <property name="text"><string>X:</string></property>
+              </widget>
+             </item>
+             <item row="0" column="1">
+              <widget class="QLabel" name="lblROIXValue">
+               <property name="text"><string>1024</string></property>
+              </widget>
+             </item>
+             <item row="0" column="2">
+              <widget class="QLabel" name="lblROIY">
+               <property name="text"><string>Y:</string></property>
+              </widget>
+             </item>
+             <item row="0" column="3">
+              <widget class="QLabel" name="lblROIYValue">
+               <property name="text"><string>768</string></property>
+              </widget>
+             </item>
+             <item row="1" column="0">
+              <widget class="QLabel" name="lblROIW">
+               <property name="text"><string>宽度:</string></property>
+              </widget>
+             </item>
+             <item row="1" column="1">
+              <widget class="QLabel" name="lblROIWValue">
+               <property name="text"><string>64</string></property>
+              </widget>
+             </item>
+             <item row="1" column="2">
+              <widget class="QLabel" name="lblROIH">
+               <property name="text"><string>高度:</string></property>
+              </widget>
+             </item>
+             <item row="1" column="3">
+              <widget class="QLabel" name="lblROIHValue">
+               <property name="text"><string>64</string></property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <layout class="QVBoxLayout" name="roiTimeFrame">
+             <item>
+              <widget class="QLabel" name="lblROITimeLabel">
+               <property name="text"><string>ROI 规则</string></property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLabel" name="lblROITimeCurrent">
+               <property name="text"><string>等待两路有效质心</string></property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLabel" name="lblROITimeNext">
+               <property name="text"><string>ROI 固定尺寸: 64 x 64</string></property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+          </layout>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+      </item>
+      <!-- Params Section -->
+      <item>
+      <widget class="QFrame" name="paramsSection">
+       <layout class="QVBoxLayout" name="paramsSectionLayout">
+        <property name="spacing"><number>10</number></property>
+        <item>
+         <widget class="QLabel" name="lblParamsTitle">
+          <property name="text"><string>大气参数</string></property>
+         </widget>
+        </item>
+        <item>
+         <layout class="QGridLayout" name="paramsGrid">
+          <property name="spacing"><number>8</number></property>
+          <item row="0" column="0">
+           <widget class="QFrame" name="r0Card">
+            <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+            <layout class="QVBoxLayout" name="r0CardLayout">
+             <property name="alignment">
+              <set>Qt::AlignHCenter</set>
+             </property>
+             <item alignment="Qt::AlignHCenter">
+              <widget class="QLabel" name="lblR0Label">
+               <property name="text"><string>r₀</string></property>
+              </widget>
+             </item>
+             <item alignment="Qt::AlignHCenter">
+              <widget class="QLabel" name="lblR0Value">
+               <property name="text"><string>12.3</string></property>
+              </widget>
+             </item>
+             <item alignment="Qt::AlignHCenter">
+              <widget class="QLabel" name="lblR0Unit">
+               <property name="text"><string>cm</string></property>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QFrame" name="seeingCard">
+            <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+            <layout class="QVBoxLayout" name="seeingCardLayout">
+             <property name="alignment">
+              <set>Qt::AlignHCenter</set>
+             </property>
+             <item alignment="Qt::AlignHCenter">
+              <widget class="QLabel" name="lblSeeingLabel">
+               <property name="text"><string>视宁度</string></property>
+              </widget>
+             </item>
+             <item alignment="Qt::AlignHCenter">
+              <widget class="QLabel" name="lblSeeingValue">
+               <property name="text"><string>1.52</string></property>
+              </widget>
+             </item>
+             <item alignment="Qt::AlignHCenter">
+              <widget class="QLabel" name="lblSeeingUnit">
+               <property name="text"><string>角秒</string></property>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QFrame" name="thetaCard">
+            <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+            <layout class="QVBoxLayout" name="thetaCardLayout">
+             <property name="alignment">
+              <set>Qt::AlignHCenter</set>
+             </property>
+             <item alignment="Qt::AlignHCenter">
+              <widget class="QLabel" name="lblThetaLabel">
+               <property name="text"><string>θ₀</string></property>
+              </widget>
+             </item>
+             <item alignment="Qt::AlignHCenter">
+              <widget class="QLabel" name="lblThetaValue">
+               <property name="text"><string>5.8</string></property>
+              </widget>
+             </item>
+             <item alignment="Qt::AlignHCenter">
+              <widget class="QLabel" name="lblThetaUnit">
+               <property name="text"><string>角秒</string></property>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QFrame" name="tauCard">
+            <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+            <layout class="QVBoxLayout" name="tauCardLayout">
+             <property name="alignment">
+              <set>Qt::AlignHCenter</set>
+             </property>
+             <item alignment="Qt::AlignHCenter">
+              <widget class="QLabel" name="lblTauLabel">
+               <property name="text"><string>τ₀</string></property>
+              </widget>
+             </item>
+             <item alignment="Qt::AlignHCenter">
+              <widget class="QLabel" name="lblTauValue">
+               <property name="text"><string>8.2</string></property>
+              </widget>
+             </item>
+             <item alignment="Qt::AlignHCenter">
+              <widget class="QLabel" name="lblTauUnit">
+               <property name="text"><string>ms</string></property>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+         </layout>
+        </item>
+       </layout>
+      </widget>
+      </item>
+      <!-- Stats Section -->
+      <item>
+      <widget class="QFrame" name="statsSection">
+       <layout class="QVBoxLayout" name="statsSectionLayout">
+        <property name="spacing"><number>10</number></property>
+        <item>
+         <widget class="QLabel" name="lblStatsTitle">
+          <property name="text"><string>统计信息</string></property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QFrame" name="statsCard">
+          <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+          <layout class="QVBoxLayout" name="statsCardLayout">
+           <item>
+            <widget class="QLabel" name="lblStatFrames">
+             <property name="text"><string>已采集帧: 0</string></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblStatValid">
+             <property name="text"><string>有效帧: 0</string></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblStatLatency">
+             <property name="text"><string>处理延迟: 0.0 ms</string></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblStatWindow">
+             <property name="text"><string>统计窗口: 200 帧</string></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblStatExposure">
+             <property name="text"><string>曝光: 1000 μs | AE: 关闭</string></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblStatAutoExposure">
+             <property name="text"><string>ROI峰值: --/-- | AE质量: --/--%</string></property>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+      </item>
+      <!-- Vertical Spacer -->
+      <item>
+       <spacer name="leftVerticalSpacer">
+        <property name="orientation"><enum>Qt::Vertical</enum></property>
+        <property name="sizeHint" stdset="0">
+         <size><width>20</width><height>40</height></size>
+        </property>
+       </spacer>
+      </item>
+     </layout>
+    </widget>
+    </item>
+    <!-- Right Area: Splitter -->
+    <item>
+    <widget class="QSplitter" name="mainSplitter">
+     <property name="orientation"><enum>Qt::Vertical</enum></property>
+     <!-- Top Area -->
+     <widget class="QWidget" name="topArea">
+      <layout class="QVBoxLayout" name="topAreaLayout">
+       <property name="spacing"><number>0</number></property>
+       <property name="leftMargin"><number>0</number></property>
+       <property name="topMargin"><number>0</number></property>
+       <property name="rightMargin"><number>0</number></property>
+       <property name="bottomMargin"><number>0</number></property>
+       <item>
+        <widget class="QStackedWidget" name="stackedWidget">
+         <!-- Page 0: Full Frame Preview -->
+         <widget class="QWidget" name="mainPage">
+          <layout class="QVBoxLayout" name="mainPageLayout">
+           <property name="spacing"><number>0</number></property>
+           <property name="leftMargin"><number>0</number></property>
+           <property name="topMargin"><number>0</number></property>
+           <property name="rightMargin"><number>0</number></property>
+           <property name="bottomMargin"><number>0</number></property>
+           <item>
+            <widget class="QFrame" name="fullframeArea">
+             <property name="frameShape"><enum>QFrame::NoFrame</enum></property>
+             <layout class="QVBoxLayout" name="fullframeAreaLayout">
+              <property name="spacing"><number>0</number></property>
+              <property name="leftMargin"><number>0</number></property>
+              <property name="topMargin"><number>0</number></property>
+              <property name="rightMargin"><number>0</number></property>
+              <property name="bottomMargin"><number>0</number></property>
+              <item>
+               <layout class="QHBoxLayout" name="fullframeHeader">
+                <item>
+                 <widget class="QLabel" name="lblFullframeTitle">
+                  <property name="text"><string>全画幅预览</string></property>
+                 </widget>
+                </item>
+                <item>
+                 <spacer name="headerSpacer">
+                  <property name="orientation"><enum>Qt::Horizontal</enum></property>
+                  <property name="sizeHint" stdset="0">
+                   <size><width>40</width><height>20</height></size>
+                  </property>
+                 </spacer>
+                </item>
+                <item>
+                 <widget class="QLabel" name="lblPreviewMode">
+                  <property name="text"><string>低帧率模式 (10fps)</string></property>
+                 </widget>
+                </item>
+               </layout>
+              </item>
+              <item>
+               <widget class="QFrame" name="previewCanvas">
+                <property name="sizePolicy">
+                 <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                  <horstretch>0</horstretch>
+                  <verstretch>1</verstretch>
+                 </sizepolicy>
+                </property>
+                <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+                <layout class="QVBoxLayout" name="previewCanvasLayout">
+                 <item alignment="Qt::AlignCenter">
+                  <widget class="QLabel" name="lblFullframeLabel">
+                   <property name="text"><string>5120 x 5120 全画幅预览 - 相机1</string></property>
+                  </widget>
+                 </item>
+                </layout>
+               </widget>
+              </item>
+             </layout>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+         <!-- Page 1: ROI Schedule -->
+         <widget class="QWidget" name="roiPage">
+          <layout class="QHBoxLayout" name="roiPageLayout">
+           <property name="spacing"><number>12</number></property>
+           <property name="leftMargin"><number>8</number></property>
+           <property name="topMargin"><number>8</number></property>
+           <property name="rightMargin"><number>8</number></property>
+           <property name="bottomMargin"><number>8</number></property>
+           <item>
+            <widget class="QFrame" name="roiMapCanvas">
+             <property name="sizePolicy">
+              <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+               <horstretch>1</horstretch>
+               <verstretch>0</verstretch>
+              </sizepolicy>
+             </property>
+             <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+             <layout class="QVBoxLayout" name="roiMapCanvasLayout">
+              <item alignment="Qt::AlignCenter">
+               <widget class="QLabel" name="lblROIMapLabel">
+                <property name="text"><string>ROI 固定为 64x64；启动后先全画幅定位，获得双光斑后切换双相机独立 ROI，并持续按周期刷新。</string></property>
+               </widget>
+              </item>
+             </layout>
+            </widget>
+           </item>
+           <item>
+            <widget class="QWidget" name="roiTablePanel">
+             <property name="minimumSize">
+              <size><width>380</width><height>0</height></size>
+             </property>
+             <property name="maximumSize">
+              <size><width>500</width><height>16777215</height></size>
+             </property>
+             <property name="sizePolicy">
+              <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
+               <horstretch>0</horstretch>
+               <verstretch>0</verstretch>
+              </sizepolicy>
+             </property>
+             <layout class="QVBoxLayout" name="roiTablePanelLayout">
+              <property name="spacing"><number>6</number></property>
+              <property name="leftMargin"><number>0</number></property>
+              <property name="topMargin"><number>0</number></property>
+              <property name="rightMargin"><number>0</number></property>
+              <property name="bottomMargin"><number>0</number></property>
+              <item>
+               <widget class="QLabel" name="lblROITableTitle">
+                 <property name="text"><string>ROI 更新时间记录</string></property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QTableWidget" name="roiTable">
+                <property name="verticalScrollBarPolicy">
+                 <enum>Qt::ScrollBarAlwaysOn</enum>
+                </property>
+                <property name="horizontalScrollBarPolicy">
+                 <enum>Qt::ScrollBarAlwaysOn</enum>
+                </property>
+                <column>
+                  <property name="text"><string>时段</string></property>
+                 <property name="width"><number>70</number></property>
+                </column>
+                <column>
+                 <property name="text"><string>X</string></property>
+                 <property name="width"><number>60</number></property>
+                </column>
+                <column>
+                 <property name="text"><string>Y</string></property>
+                 <property name="width"><number>60</number></property>
+                </column>
+                <column>
+                  <property name="text"><string>宽度</string></property>
+                 <property name="width"><number>60</number></property>
+                </column>
+                <column>
+                  <property name="text"><string>高度</string></property>
+                 <property name="width"><number>60</number></property>
+                </column>
+               </widget>
+              </item>
+              <item>
+               <layout class="QHBoxLayout" name="roiButtonsLayout">
+                <item>
+                 <widget class="QPushButton" name="btnAddROI">
+                  <property name="text"><string>添加</string></property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QPushButton" name="btnDeleteROI">
+                  <property name="text"><string>删除</string></property>
+                 </widget>
+                </item>
+               </layout>
+              </item>
+              <item>
+               <widget class="QPushButton" name="btnImportTrajectory">
+                <property name="text"><string>导入轨迹文件</string></property>
+               </widget>
+              </item>
+             </layout>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <!-- Bottom Area -->
+     <widget class="QWidget" name="bottomArea">
+      <layout class="QVBoxLayout" name="bottomAreaLayout">
+       <property name="spacing"><number>0</number></property>
+       <property name="leftMargin"><number>0</number></property>
+       <property name="topMargin"><number>0</number></property>
+       <property name="rightMargin"><number>0</number></property>
+       <property name="bottomMargin"><number>0</number></property>
+       <!-- Bottom Toolbar -->
+       <item>
+        <widget class="QFrame" name="bottomToolbar">
+         <property name="frameShape"><enum>QFrame::NoFrame</enum></property>
+         <layout class="QHBoxLayout" name="bottomToolbarLayout">
+          <property name="spacing"><number>10</number></property>
+          <property name="leftMargin"><number>14</number></property>
+          <property name="topMargin"><number>10</number></property>
+          <property name="rightMargin"><number>14</number></property>
+          <property name="bottomMargin"><number>10</number></property>
+          <item>
+           <widget class="QPushButton" name="btnToggleROI">
+            <property name="text"><string>ROI星图</string></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="btnToggleCharts">
+            <property name="text"><string>参数曲线</string></property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="bottomToolbarSpacer">
+            <property name="orientation"><enum>Qt::Horizontal</enum></property>
+            <property name="sizeHint" stdset="0">
+             <size><width>40</width><height>20</height></size>
+            </property>
+           </spacer>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <!-- ROI Images Area -->
+       <item>
+        <widget class="QFrame" name="roiImagesArea">
+         <property name="visible"><bool>false</bool></property>
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
+         <property name="frameShape"><enum>QFrame::NoFrame</enum></property>
+         <layout class="QHBoxLayout" name="roiImagesAreaLayout">
+          <item>
+           <widget class="QWidget" name="cam1ROIPanel">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+              <horstretch>1</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
+            </property>
+            <layout class="QVBoxLayout" name="cam1ROIPanelLayout">
+             <property name="spacing"><number>4</number></property>
+             <item>
+              <widget class="QLabel" name="lblCam1ROITitle">
+               <property name="text"><string>ROI 相机1</string></property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QFrame" name="cam1ROICanvas">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+               <property name="minimumSize">
+                <size><width>120</width><height>120</height></size>
+               </property>
+               <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+               <layout class="QVBoxLayout" name="cam1ROICanvasLayout">
+                <item alignment="Qt::AlignCenter">
+                 <widget class="QLabel" name="lblCam1ROICoord">
+                  <property name="text"><string>(32.1, 31.8)</string></property>
+                 </widget>
+                </item>
+               </layout>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+          <item>
+           <widget class="QWidget" name="cam2ROIPanel">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+              <horstretch>1</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
+            </property>
+            <layout class="QVBoxLayout" name="cam2ROIPanelLayout">
+             <property name="spacing"><number>4</number></property>
+             <item>
+              <widget class="QLabel" name="lblCam2ROITitle">
+               <property name="text"><string>ROI 相机2</string></property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QFrame" name="cam2ROICanvas">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+               <property name="minimumSize">
+                <size><width>120</width><height>120</height></size>
+               </property>
+               <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+               <layout class="QVBoxLayout" name="cam2ROICanvasLayout">
+                <item alignment="Qt::AlignCenter">
+                 <widget class="QLabel" name="lblCam2ROICoord">
+                  <property name="text"><string>(32.3, 31.5)</string></property>
+                 </widget>
+                </item>
+               </layout>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+          <item>
+           <spacer name="roiImagesSpacer">
+            <property name="orientation"><enum>Qt::Horizontal</enum></property>
+            <property name="sizeHint" stdset="0">
+             <size><width>40</width><height>20</height></size>
+            </property>
+           </spacer>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <!-- Charts Area -->
+       <item>
+        <widget class="QFrame" name="chartsArea">
+         <property name="visible"><bool>false</bool></property>
+         <property name="minimumSize">
+          <size><width>0</width><height>280</height></size>
+         </property>
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+           <horstretch>0</horstretch>
+           <verstretch>1</verstretch>
+          </sizepolicy>
+         </property>
+         <property name="frameShape"><enum>QFrame::NoFrame</enum></property>
+         <layout class="QHBoxLayout" name="chartsAreaLayout">
+          <property name="spacing"><number>18</number></property>
+          <property name="leftMargin"><number>20</number></property>
+          <property name="topMargin"><number>14</number></property>
+          <property name="rightMargin"><number>20</number></property>
+          <property name="bottomMargin"><number>16</number></property>
+          <item>
+           <widget class="QWidget" name="r0ChartPanel">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+              <horstretch>1</horstretch>
+              <verstretch>1</verstretch>
+             </sizepolicy>
+            </property>
+            <layout class="QVBoxLayout" name="r0ChartPanelLayout">
+             <property name="spacing"><number>12</number></property>
+             <property name="leftMargin"><number>18</number></property>
+             <property name="topMargin"><number>18</number></property>
+             <property name="rightMargin"><number>18</number></property>
+             <property name="bottomMargin"><number>18</number></property>
+             <item>
+              <widget class="QLabel" name="lblR0ChartTitle">
+                <property name="text"><string>大气相干长度 r₀</string></property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QFrame" name="r0ChartCanvas">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                 <horstretch>0</horstretch>
+                 <verstretch>1</verstretch>
+                </sizepolicy>
+               </property>
+               <property name="minimumSize">
+                <size><width>0</width><height>230</height></size>
+               </property>
+               <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+          <item>
+           <widget class="QWidget" name="seeingChartPanel">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+              <horstretch>1</horstretch>
+              <verstretch>1</verstretch>
+             </sizepolicy>
+            </property>
+            <layout class="QVBoxLayout" name="seeingChartPanelLayout">
+             <property name="spacing"><number>12</number></property>
+             <property name="leftMargin"><number>18</number></property>
+             <property name="topMargin"><number>18</number></property>
+             <property name="rightMargin"><number>18</number></property>
+             <property name="bottomMargin"><number>18</number></property>
+             <item>
+              <widget class="QLabel" name="lblSeeingChartTitle">
+                <property name="text"><string>视宁度</string></property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QFrame" name="seeingChartCanvas">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                 <horstretch>0</horstretch>
+                 <verstretch>1</verstretch>
+                </sizepolicy>
+               </property>
+               <property name="minimumSize">
+                <size><width>0</width><height>230</height></size>
+               </property>
+               <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </widget>
+    </item>
+   </layout>
+  </widget>
+  <!-- Actions -->
+  <action name="actionSaveConfig">
+   <property name="text"><string>保存配置(&amp;S)</string></property>
+   <property name="shortcut"><string>Ctrl+S</string></property>
+  </action>
+  <action name="actionLoadConfig">
+   <property name="text"><string>加载配置(&amp;L)...</string></property>
+   <property name="shortcut"><string>Ctrl+O</string></property>
+  </action>
+  <action name="actionExportData">
+   <property name="text"><string>导出数据(&amp;E)...</string></property>
+  </action>
+  <action name="actionExportReport">
+   <property name="text"><string>导出报告(&amp;R)...</string></property>
+  </action>
+  <action name="actionExit">
+   <property name="text"><string>退出(&amp;X)</string></property>
+   <property name="shortcut"><string>Alt+F4</string></property>
+  </action>
+  <action name="actionConnectAll">
+   <property name="text"><string>连接所有相机(&amp;C)</string></property>
+  </action>
+  <action name="actionDisconnectAll">
+   <property name="text"><string>断开所有相机(&amp;D)</string></property>
+  </action>
+  <action name="actionCameraSettings">
+   <property name="text"><string>相机设置(&amp;S)...</string></property>
+  </action>
+  <action name="actionViewMain">
+   <property name="text"><string>主界面(&amp;M)</string></property>
+  </action>
+  <action name="actionViewROI">
+   <property name="text"><string>ROI 预览(&amp;R)</string></property>
+  </action>
+  <action name="actionViewSettings">
+   <property name="text"><string>设置(&amp;S)...</string></property>
+  </action>
+  <action name="actionToggleROIImages">
+   <property name="text"><string>显示/隐藏 ROI星图</string></property>
+  </action>
+  <action name="actionToggleCharts">
+   <property name="text"><string>显示/隐藏 图表</string></property>
+  </action>
+  <action name="actionROISchedule">
+   <property name="text"><string>ROI 更新说明(&amp;E)...</string></property>
+  </action>
+  <action name="actionTrajectoryCalc">
+   <property name="text"><string>星点轨迹计算(&amp;T)...</string></property>
+  </action>
+  <action name="actionAbout">
+   <property name="text"><string>关于 C-DIMM(&amp;A)...</string></property>
+  </action>
+  <action name="btnStart">
+   <property name="text"><string>开始采集</string></property>
+  </action>
+  <action name="btnStop">
+   <property name="text"><string>停止采集</string></property>
+  </action>
+  <action name="btnFullFrame">
+   <property name="text"><string>全画幅预览</string></property>
+   <property name="checkable"><bool>true</bool></property>
+   <property name="checked"><bool>true</bool></property>
+  </action>
+  <action name="btnROI">
+   <property name="text"><string>ROI 预览</string></property>
+   <property name="checkable"><bool>true</bool></property>
+  </action>
+  <action name="btnSettings">
+   <property name="text"><string>设置</string></property>
+  </action>
+ </widget>
+ <resources/>
+ <connections/>
+ </ui>
