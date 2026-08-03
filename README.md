@@ -70,11 +70,11 @@ flowchart LR
     Pulse[Pulse Generator] --> CameraA
     Pulse --> CameraB
 
-    CM -->|CameraFrame| Router[DIMM Capture Router]
+    CM -->|Coalesced frameReady / CameraFrame| Router[DIMM Capture Router]
     Router -->|Full Frame| Align[Alignment Pipeline]
-    Router -->|ROI Frame| Queue[Latest-frame Coalescing]
+    Router -->|ROI Frame| Submit[frame.clone + Qt QueuedConnection]
 
-    Queue --> Worker[ImageProcessorWorker]
+    Submit --> Worker[ImageProcessorWorker]
     Worker --> HotPixel[Hot-pixel Correction]
     HotPixel --> Centroid[Centroid Estimation]
     Centroid --> Pairing[Dual-camera Pairing]
@@ -99,7 +99,9 @@ flowchart LR
 
 ```text
 相机回调
-  → CameraFrame 封装
+  → CameraManager 保存最新 CameraFrame 并合并重复 frameReady 通知
+  → DIMM 取得当前帧并路由
+  → ImageProcessor 深拷贝图像并按 Qt 队列顺序提交
   → 采集代次和 Frame ID 检查
   → 全画幅定位或 ROI 图像处理
   → 热像素修正
@@ -214,27 +216,53 @@ TrendConflict
 
 自动曝光会限制单次变化比例、最小曝光变化量和调整后的稳定等待时间，避免在云层、热像素、抖动或双相机趋势冲突时频繁振荡。
 
-### 6. 最新帧合并线程模型
+### 6. 帧通知与顺序提交线程模型
 
-`src82` 不再将每一帧无限追加到 Qt 事件队列。
+当前 `src82` 采用两层职责明确的帧传递方式。
 
-每台相机只保留一个最新待处理帧：
+#### CameraManager：第一层实时通知合并
+
+相机 SDK 回调到达后，`CameraManager` 保存该相机当前最新的 `CameraFrame`。如果已有一个 `frameReady` 通知尚未被上层消费，则不会继续重复投递同类通知。
 
 ```text
-Worker 正在处理旧帧
-  → 新帧到达
-  → 覆盖尚未处理的中间帧
-  → Worker 完成后继续处理最新帧
+相机 SDK 回调连续到达
+  → 更新 CameraManager 中的最新 CameraFrame
+  → 同一相机仅保留一个待消费的 frameReady 通知
+  → DIMM 收到通知后取得当前最新帧
 ```
 
-该方式的目标是：
+这一层用于避免相机回调把 GUI/路由事件队列无限填满。它并不保证每个物理相机回调都进入上层处理。
 
-- 限制事件队列和内存增长；
-- 避免高负载时处理很久以前的图像；
-- 降低采集停止、ROI 切换和重定位后的旧帧污染；
-- 保持处理延迟相对稳定。
+#### ImageProcessor：恢复顺序排队提交
 
-这是一种面向实时性的策略，不能保证每个相机帧都进入质心计算。
+DIMM 将一帧交给 `ImageProcessor::processFrame()` 后，`ImageProcessor` 会先进行深拷贝，再通过 `Qt::QueuedConnection` 投递给独立 Worker：
+
+```cpp
+cv::Mat frameCopy = frame.clone();
+
+QMetaObject::invokeMethod(
+    m_worker,
+    "processFrame",
+    Qt::QueuedConnection,
+    Q_ARG(int, cameraIndex),
+    Q_ARG(cv::Mat, frameCopy),
+    Q_ARG(quint64, frameId),
+    Q_ARG(quint64, cameraTimestamp),
+    Q_ARG(quint64, acquisitionGeneration));
+```
+
+因此：
+
+- 不再存在 `PendingFrameSlot`；
+- 不再存在 `processLatestFrameLoop()`；
+- 不在 `ImageProcessor` 内分别覆盖两台相机的待处理帧；
+- 每次被 `ImageProcessor` 接受的调用都会按 Qt 事件队列顺序提交；
+- `frameId`、相机时间戳和 acquisition generation 会随图像一起传递；
+- Worker 仍通过 generation 检查拒绝采集切换前的旧帧。
+
+该模型恢复了 `src731质心算法` 已经过实机长时间验证的提交行为，更有利于保持双相机 FrameID 的到达顺序和配对完整性。
+
+需要注意：如果 Worker 长时间处理不过来，Qt 队列仍可能增长。因此实机验证应同时观察处理延迟、停止响应时间和内存占用趋势。
 
 ### 7. 北极星对准
 
@@ -293,7 +321,7 @@ DIMM/
 │  ├─ DIMM.LiveRoi.cpp       # 实时采集、定位和 ROI 更新
 │  ├─ DIMM.Results.cpp       # 结果保存和上报
 │  ├─ DIMM.Simulation.cpp    # 模拟采集
-│  ├─ ImageProcessor.*       # 图像处理线程、质心和大气参数
+│  ├─ ImageProcessor.*       # 顺序排队提交、质心和大气参数处理
 │  ├─ AutoExposureLogic.h    # 自动曝光峰值分析
 │  ├─ AutoExposureController.h
 │  ├─ CentroidLogic.h        # 局部质心算法
@@ -303,13 +331,13 @@ DIMM/
 │  ├─ ResultWriter.*         # CSV 缓冲写入
 │  ├─ AppConfig.*            # 统一配置模型
 │  └─ ...
-├─ src731质心算法/          # 历史质心/自动曝光基线版本
+├─ src731质心算法/          # 历史算法与已验证帧提交模型参考
 ├─ src待优化/               # 早期重构基线
 └─ ...                       # 其他实验和历史版本
 ```
 
 > [!NOTE]
-> 仓库保留多个历史源码目录是为了比较算法和工程演进。新开发应以 `src82/` 为基线，避免同时修改多个历史目录。
+> 仓库保留多个历史源码目录是为了比较算法和工程演进。新开发应以 `src82/` 为基线，避免同时修改多个历史目录。当前 `src82` 的 `ImageProcessor` 帧提交行为已恢复为 `src731质心算法` 中经过实机验证的 `frame.clone() + Qt::QueuedConnection` 模型。
 
 ---
 
@@ -573,7 +601,7 @@ ImageProcessorWorker::appendDifferentialSample
 - 质心坐标是否为绝对坐标；
 - 双相机样本是否正确配对。
 
-结构重构时应优先保持行为等价，不要在同一个提交中同时修改 ROI 时序、线程队列和质心判据。
+结构重构时应优先保持行为等价，不要在同一个提交中同时修改 ROI 时序、线程队列和质心判据。当前线程基线是：保留 `CameraManager` 第一层通知合并，`ImageProcessor` 对每次接受的帧执行深拷贝并顺序排队提交；未经独立实机验证，不应重新引入两台相机分别覆盖待处理帧的第二层槽位机制。
 
 ### 代码风格
 
@@ -599,7 +627,9 @@ ImageProcessorWorker::appendDifferentialSample
 - 设置能够保存并在重启后恢复；
 - CSV 能正确创建、刷新和关闭；
 - 北极星算法可使用保存图像离线测试；
-- acquisition generation 变化后旧帧不会继续参与计算。
+- acquisition generation 变化后旧帧不会继续参与计算；
+- `ImageProcessor::processFrame()` 保持 `frame.clone() + Qt::QueuedConnection`；
+- `ImageProcessor.h/.cpp` 中不存在 `PendingFrameSlot`、`m_pendingFrames`、`processLatestFrameLoop` 或 `clearPendingFrames`。
 
 ### 相机验证
 
@@ -608,14 +638,17 @@ ImageProcessorWorker::appendDifferentialSample
 - 硬件触发下 Frame ID 和时间戳稳定增长；
 - ROI 更新后两台相机均恢复采集；
 - ROI 图像坐标和全画幅绝对质心坐标一致；
-- 停止采集后没有延迟到达的旧帧更新 UI。
+- 停止采集后没有旧 generation 的帧继续参与测量；
+- 长时间运行时处理延迟和内存占用不持续增长；
+- 停止采集后的响应时间与 `src731质心算法` 基线相当。
 
 ### 测量验证
 
 - 质心有效比例和真实星点质量一致；
 - 热像素不会被误识别为稳定星点；
 - 差分配对数量与采样频率相符；
-- 同步残差和丢弃样本数量可解释；
+- 双相机 FrameID 配对率不低于 `src731质心算法` 的实验基线；
+- 同步残差和未配对样本数量可解释；
 - 自动曝光不会在稳定目标上持续振荡；
 - 自动曝光改变后热像素模板正确切换；
 - 输出参数单位和光学参数配置一致。
@@ -633,7 +666,7 @@ ImageProcessorWorker::appendDifferentialSample
 - 公共图像、路径和文本配置工具提取；
 - 对准流程模块化；
 - ROI 和北极星热像素缓存；
-- 图像处理最新帧合并；
+- `ImageProcessor` 恢复 `src731质心算法` 的深拷贝顺序提交模型；
 - 自动曝光控制器和状态机接入。
 
 当前仍属于科研原型，后续重点包括：
@@ -641,7 +674,7 @@ ImageProcessorWorker::appendDifferentialSample
 - 统一“质心已计算”和“质心可用于测量”的质量语义；
 - 完善配置验证和原子应用；
 - 进一步收拢 `AlignmentSession` 状态所有权；
-- 增加处理覆盖、帧替换和配对丢弃统计；
+- 增加相机回调、上层通知、Worker 处理、队列延迟和配对丢弃统计；
 - 缓存星表三角形索引；
 - 建立可重复的离线图像测试集；
 - 补充根目录构建脚本和自动化测试；
