@@ -1,30 +1,100 @@
 #pragma once
 
-#include <QWidget>
-#include <QPainter>
-#include <QWheelEvent>
 #include <QMouseEvent>
-#include <opencv2/opencv.hpp>
+#include <QPainter>
+#include <QString>
 #include <QVector>
-#include "ImageProcessor.h" // for RoiRect, CentroidResult
+#include <QWheelEvent>
+#include <QWidget>
+#include <limits>
+#include <opencv2/opencv.hpp>
 
-// ============================================================
-// 全画幅预览Canvas
-// ============================================================
+#include "ImageProcessor.h"
 
 class FullFrameCanvas : public QWidget {
     Q_OBJECT
 
 public:
+    struct CatalogMatchOverlay {
+        QPointF detectedPosition;
+        QPointF predictedPosition;
+        QString label;
+        double residualPx = 0.0;
+        bool isPolaris = false;
+    };
+
+    struct AlignmentOverlay {
+        bool enabled = false;
+        QPointF orbitCenter;
+        double orbitRadiusPx = 0.0;
+        bool hasStar = false;
+        QPointF starPosition;
+        bool hasPredictedPolaris = false;
+        QPointF predictedPolarisPosition;
+        bool hasDetectedPolaris = false;
+        QPointF detectedPolarisPosition;
+        double deviationPx = 0.0;
+        double polarisNcpDistancePx = 0.0;
+        double polarisNcpDistanceArcmin = 0.0;
+        int matchedStarCount = 0;
+        double rmsPx = 0.0;
+        double plateScaleArcsecPx = 0.0;
+        double solveTotalMs = 0.0;
+        QString orbitSource;
+        QString solveStateText;
+        QString warningText;
+        bool mirroredKnown = false;
+        bool mirrored = false;
+        QString label;
+        QVector<CatalogMatchOverlay> catalogMatches;
+    };
+
+    struct StarCandidateOverlay {
+        int index = 0;
+        QRectF bbox;
+        QPointF center;
+        bool selected = false;
+    };
+
+    struct CoarseDriftTrackOverlay {
+        QPointF startPx;
+        QPointF endPx;
+        QPointF velocityPxSec;
+        double speedPxSec = 0.0;
+        bool usedForSolve = false;
+    };
+
+    struct CoarseDriftOverlay {
+        bool enabled = false;
+        bool valid = false;
+        QPointF northCelestialPolePx;
+        QPointF frameCenterPx;
+        QPointF adjustmentVectorPx;
+        double offsetPx = 0.0;
+        double offsetDeg = 0.0;
+        double medianSpeedPxSec = 0.0;
+        double centerResidualRmsPx = 0.0;
+        int detectedCandidateCount = 0;
+        int usableTrackCount = 0;
+        QString statusText;
+        QVector<CoarseDriftTrackOverlay> tracks;
+    };
+
     explicit FullFrameCanvas(QWidget* parent = nullptr);
 
     void setImage(const cv::Mat& image);
     void setRoiList(const QVector<RoiRect>& rois);
     void setCurrentRoi(int index);
+    void setAlignmentOverlay(const AlignmentOverlay& overlay);
+    void clearAlignmentOverlay();
+    void setStarCandidateOverlays(const QVector<StarCandidateOverlay>& candidates);
+    void clearStarCandidateOverlays();
+    void setCoarseDriftOverlay(const CoarseDriftOverlay& overlay);
+    void clearCoarseDriftOverlay();
     void clear();
 
 signals:
-    void mousePositionChanged(int x, int y); // 鼠标在图像上的像素坐标
+    void mousePositionChanged(int x, int y);
 
 protected:
     void paintEvent(QPaintEvent*) override;
@@ -36,27 +106,33 @@ protected:
 
 private:
     cv::Mat m_image;
-    QImage m_qimage; // 缓存转换后的QImage，避免每帧重复cvtColor
-    bool m_imageDirty = true; // 标记图像是否需要重新转换
+    QImage m_qimage;
+    bool m_imageDirty = true;
     QVector<RoiRect> m_rois;
     int m_currentRoiIndex = -1;
+    AlignmentOverlay m_alignmentOverlay;
+    QVector<StarCandidateOverlay> m_starCandidateOverlays;
+    CoarseDriftOverlay m_coarseDriftOverlay;
 
     double m_scale = 1.0;
     QPointF m_offset;
     QPoint m_lastMousePos;
     bool m_isDragging = false;
+    bool m_hasViewTransform = false;
+    bool m_followImageFit = true;
 
     QPointF widgetToImage(QPointF widgetPos) const;
     QPointF imageToWidget(QPointF imagePos) const;
+    void fitImageToViewport();
+    void clampOffset();
     void drawImage(QPainter& painter);
     void drawRoiOverlays(QPainter& painter);
+    void drawStarCandidateOverlays(QPainter& painter);
+    void drawAlignmentOverlay(QPainter& painter);
+    void drawCoarseDriftOverlay(QPainter& painter);
     void drawScaleBar(QPainter& painter);
     void drawInfo(QPainter& painter);
 };
-
-// ============================================================
-// ROI星图Canvas
-// ============================================================
 
 class RoiStarCanvas : public QWidget {
     Q_OBJECT
@@ -75,7 +151,7 @@ protected:
 
 private:
     cv::Mat m_roiImage;
-    QImage m_qimage; // 缓存转换后的QImage
+    QImage m_qimage;
     bool m_imageDirty = true;
     double m_centroidX = 0.0;
     double m_centroidY = 0.0;
@@ -87,38 +163,37 @@ private:
     void drawPixelInfo(QPainter& painter, QPoint pos);
 };
 
-// ============================================================
-// 参数曲线Widget（使用QtCharts）
-// ============================================================
-
-// 注意：需要在CMakeLists.txt中添加 Qt6::Charts
-// 如果没有QtCharts，可以用简单的QPainter绘制替代
-
 class ChartWidget : public QWidget {
     Q_OBJECT
 
 public:
-    explicit ChartWidget(QWidget* parent = nullptr);
+    enum class SeriesKind {
+        R0,
+        Seeing
+    };
 
-    void addDataPoint(double r0, double seeing, double centroidX, double centroidY);
+    explicit ChartWidget(QWidget* parent = nullptr);
+    explicit ChartWidget(SeriesKind kind, QWidget* parent = nullptr);
+
+    void setSecondValue(int second, double value);
     void clear();
 
 protected:
     void paintEvent(QPaintEvent*) override;
 
 private:
-    // 数据存储
-    QVector<double> m_r0Data;
-    QVector<double> m_seeingData;
-    QVector<QPointF> m_trajectoryData;
+    SeriesKind m_kind = SeriesKind::R0;
+    QVector<double> m_data;
+    double m_displayMinY = 0.0;
+    double m_displayMaxY = std::numeric_limits<double>::quiet_NaN();
 
-    static constexpr int MAX_POINTS = 300;
-    int m_timeCounter = 0;
+    static constexpr int WINDOW_SECONDS = 60;
 
-    void drawR0Chart(QPainter& painter, QRect rect);
-    void drawSeeingChart(QPainter& painter, QRect rect);
-    void drawTrajectory(QPainter& painter, QRect rect);
-
+    void drawSeriesChart(QPainter& painter, QRect rect);
     void drawAxes(QPainter& painter, QRect rect, const QVector<double>& data,
                   double minY, double maxY, const QString& unit);
+    double baselineMaxY() const;
+    double computeTargetMaxY() const;
+    double smoothDisplayMaxY(double targetMaxY);
+    static double niceCeil(double value);
 };
