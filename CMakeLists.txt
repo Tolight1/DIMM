@@ -30,6 +30,8 @@ list(APPEND srcs
     src/DIMM.AutoExposure.cpp
     src/FullFrameStarDetector.h
     src/FullFrameStarDetector.cpp
+    src/ImageUtils.h
+    src/ImageUtils.cpp
     src/HotPixelTemplateSettings.h
     src/HotPixelTemplateSettings.cpp
     src/SettingsDialog.h
@@ -50,6 +52,8 @@ list(APPEND srcs
     src/AlignmentSession.cpp
     src/AutoAcquisitionScheduler.h
     src/AutoAcquisitionScheduler.cpp
+    src/AlignmentCoarseEstimator.h
+    src/AlignmentCoarseEstimator.cpp
 )
 list(REMOVE_DUPLICATES srcs)
 
