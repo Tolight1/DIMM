@@ -54,6 +54,8 @@ list(APPEND srcs
     src/AutoAcquisitionScheduler.cpp
     src/AlignmentCoarseEstimator.h
     src/AlignmentCoarseEstimator.cpp
+    src/AlignmentCoarseController.h
+    src/AlignmentCoarseController.cpp
 )
 list(REMOVE_DUPLICATES srcs)
 
