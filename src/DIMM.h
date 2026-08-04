@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AlignmentCoarseEstimator.h"
 #include "AlignmentTypes.h"
 #include "AlignmentSession.h"
 #include "AppConfig.h"
@@ -26,6 +27,7 @@
 
 #include <opencv2/opencv.hpp>
 
+class AlignmentCoarseController;
 class FullFrameCanvas;
 class RoiStarCanvas;
 class ChartWidget;
@@ -81,6 +83,7 @@ private slots:
     void onShowRoiPage();
     void onShowSettings();
     void onToggleAlignmentMode();
+    void onToggleCoarseAlignment();
     void onConfirmCamera1PolarisCandidate();
     void onConfirmCamera2PolarisCandidate();
     void onToggleRoiImages();
@@ -331,6 +334,12 @@ private:
                                      PolarisSolveStatus status,
                                      QString message,
                                      quint64 generation);
+    void resetCoarseAlignmentRuntime();
+    void clearCoarseAlignmentOverlays();
+    CoarseAlignmentConfig buildCoarseAlignmentConfig() const;
+    void submitCoarseAlignmentFrame(int cameraIndex, const CameraFrame& packet, qint64 nowMs);
+    void onCoarseAlignmentEstimateReady(CoarseAlignmentEstimate estimate);
+    void updateCoarseAlignmentOverlay(int cameraIndex);
     double fallbackAlignmentOrbitRadiusPx() const;
     double alignmentOrbitRadiusPx() const;
     bool startDualCameraLocalization(QString* reason = nullptr);
@@ -436,6 +445,8 @@ private:
     QAction* m_actionRetryCamera1PolarisSolve = nullptr;
     QAction* m_actionRetryCamera2PolarisSolve = nullptr;
     QAction* m_actionRetryBothPolarisSolve = nullptr;
+    QAction* m_actionToggleCoarseAlignment = nullptr;
+    QPushButton* m_btnToggleCoarseAlignment = nullptr;
     QPushButton* m_btnConfirmCamera1Polaris = nullptr;
     QPushButton* m_btnConfirmCamera2Polaris = nullptr;
     QPushButton* m_btnRetryCamera1PolarisSolve = nullptr;
@@ -578,6 +589,11 @@ private:
     bool m_alignmentAllowSaturatedPolarisConfirmation = false;
     PolarisSolverController* m_polarisSolverController = nullptr;
     AlignmentSession m_alignmentSession;
+    bool m_alignmentCoarseActive = false;
+    qint64 m_alignmentLastCoarseSubmitMs[kCameraCount] = {-1, -1};
+    int m_alignmentCoarseSubmitIntervalMs = 1000;
+    CoarseAlignmentEstimate m_alignmentCoarseEstimates[kCameraCount];
+    AlignmentCoarseController* m_alignmentCoarseController = nullptr;
 
     QTimer* m_1hzTimer = nullptr;
     QTimer* m_hardwareTriggerStartupTimer = nullptr;

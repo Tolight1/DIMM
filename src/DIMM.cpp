@@ -2,6 +2,7 @@
 #include "DimmRuntimeHelpers.h"
 
 #include "AlignmentCameraCoordinator.h"
+#include "AlignmentCoarseController.h"
 #include "AlignmentController.h"
 #include "AlignmentFrameCoordinator.h"
 #include "AlignmentLocalTracker.h"
@@ -109,6 +110,7 @@ void DIMM::registerMetaTypes()
     qRegisterMetaType<EafDeviceState>("EafDeviceState");
     qRegisterMetaType<QVector<EafDeviceDescriptor>>("QVector<EafDeviceDescriptor>");
     qRegisterMetaType<EnvironmentSensorData>("EnvironmentSensorData");
+    qRegisterMetaType<CoarseAlignmentEstimate>("CoarseAlignmentEstimate");
 
 }
 
@@ -161,6 +163,16 @@ void DIMM::setupRuntimeActions()
         ui->menuTools->insertAction(ui->actionROISchedule, m_actionAlignmentMode);
     }
 
+    m_actionToggleCoarseAlignment = new QAction(QStringLiteral("开始粗对准"), this);
+    m_actionToggleCoarseAlignment->setObjectName(QStringLiteral("btnToggleCoarseAlignment"));
+    m_actionToggleCoarseAlignment->setCheckable(true);
+    if (ui->toolbar) {
+        ui->toolbar->insertAction(ui->btnSettings, m_actionToggleCoarseAlignment);
+    }
+    if (ui->menuTools) {
+        ui->menuTools->insertAction(ui->actionROISchedule, m_actionToggleCoarseAlignment);
+    }
+
     m_actionConfirmCamera1Polaris = new QAction(QStringLiteral("确认相机1的北极星"), this);
     m_actionConfirmCamera1Polaris->setObjectName(QStringLiteral("btnConfirmCamera1Polaris"));
     m_actionConfirmCamera2Polaris = new QAction(QStringLiteral("确认相机2的北极星"), this);
@@ -208,6 +220,12 @@ void DIMM::initializeCaptureServices()
             &PolarisSolverController::solveStatusChanged,
             this,
             &DIMM::onPolarisSolveStatusChanged);
+    m_alignmentCoarseController = new AlignmentCoarseController(this);
+    connect(m_alignmentCoarseController,
+            &AlignmentCoarseController::estimateReady,
+            this,
+            &DIMM::onCoarseAlignmentEstimateReady,
+            Qt::QueuedConnection);
     {
         const QString appThresholdPath =
             QDir(QApplication::applicationDirPath()).filePath(QStringLiteral("threshold.txt"));
@@ -704,6 +722,10 @@ void DIMM::setupConnections()
     connect(ui->btnFullFrame, &QAction::triggered, this, &DIMM::onShowMainPage);
     connect(ui->btnSettings, &QAction::triggered, this, &DIMM::onShowSettings);
     connect(m_actionAlignmentMode, &QAction::triggered, this, &DIMM::onToggleAlignmentMode);
+    connect(m_actionToggleCoarseAlignment,
+            &QAction::triggered,
+            this,
+            &DIMM::onToggleCoarseAlignment);
     connect(m_actionConfirmCamera1Polaris,
             &QAction::triggered,
             this,
