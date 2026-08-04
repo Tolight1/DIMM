@@ -8,6 +8,9 @@
 #include <cstring>
 
 namespace {
+constexpr quint64 kFrameIdWrapModulo = 65536;
+constexpr quint64 kFrameIdWrapBackstepThreshold = kFrameIdWrapModulo / 2;
+
 qint64 safeIncrement(qint64 increment)
 {
     return increment > 0 ? increment : 1;
@@ -128,6 +131,26 @@ CameraManager::CameraManager(QObject* parent)
 CameraManager::~CameraManager()
 {
     uninit();
+}
+
+void CameraManager::resetFrameIdTracking(CameraData& camera)
+{
+    camera.hasFrameIdTracking = false;
+    camera.lastRawFrameId = 0;
+    camera.frameIdWrapOffset = 0;
+}
+
+quint64 CameraManager::extendWrappingFrameId(CameraData& camera, quint64 rawFrameId)
+{
+    if (camera.hasFrameIdTracking &&
+        rawFrameId < camera.lastRawFrameId &&
+        camera.lastRawFrameId - rawFrameId > kFrameIdWrapBackstepThreshold) {
+        camera.frameIdWrapOffset += kFrameIdWrapModulo;
+    }
+
+    camera.hasFrameIdTracking = true;
+    camera.lastRawFrameId = rawFrameId;
+    return camera.frameIdWrapOffset + rawFrameId + 1;
 }
 
 bool CameraManager::init()
@@ -521,6 +544,7 @@ bool CameraManager::startAcquisition(int index)
 
         {
             QMutexLocker stateLocker(&camera.stateMutex);
+            resetFrameIdTracking(camera);
             camera.isStreaming = true;
         }
 
@@ -1075,6 +1099,7 @@ bool CameraManager::resumeAfterRoiUpdate(int index, const RoiUpdatePauseState& p
             camera.stream->StartGrab();
         }
         if (pauseState.acquisitionStopped) {
+            resetFrameIdTracking(camera);
             camera.remoteFeatureControl->GetCommandFeature("AcquisitionStart")->Execute();
             camera.isStreaming = true;
         }
@@ -1308,7 +1333,7 @@ void CameraManager::onFrameCaptured(int cameraIndex, CImageDataPointer& imageDat
         const uint64_t width = imageData->GetWidth();
         const uint64_t height = imageData->GetHeight();
         const GX_PIXEL_FORMAT_ENTRY pixelFormat = imageData->GetPixelFormat();
-        const quint64 frameId = static_cast<quint64>(imageData->GetFrameID());
+        const quint64 rawFrameId = static_cast<quint64>(imageData->GetFrameID());
         const quint64 cameraTimestamp = static_cast<quint64>(imageData->GetTimeStamp());
         const qint64 receivedMs = QDateTime::currentMSecsSinceEpoch();
 
@@ -1351,6 +1376,12 @@ void CameraManager::onFrameCaptured(int cameraIndex, CImageDataPointer& imageDat
         if (abortCallback) {
             finishCallback();
             return;
+        }
+
+        quint64 frameId = 0;
+        {
+            QMutexLocker stateLocker(&camera.stateMutex);
+            frameId = extendWrappingFrameId(camera, rawFrameId);
         }
 
         CameraFrame packet;

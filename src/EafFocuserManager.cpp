@@ -6,7 +6,12 @@
 #include <QMetaObject>
 #include <QSettings>
 #include <QDateTime>
+#include <QDebug>
 #include <algorithm>
+
+namespace {
+constexpr unsigned long kEafWorkerShutdownTimeoutMs = 3000;
+}
 
 // ============================================================
 // EafFocuserWorker — lives in the worker thread
@@ -31,6 +36,7 @@ public:
 public slots:
     void doInitialize();
     void doShutdown();
+    void doShutdownAndQuit();
     void doRefreshDevices();
     void doOpenDevice(TelescopeSlot slot, int enumerationIndex, int deviceId, QString serialHex);
     void doCloseDevice(TelescopeSlot slot);
@@ -108,6 +114,12 @@ void EafFocuserWorker::doShutdown()
         m_slots[i].assignedSerialHex.clear();
     }
     m_initialized = false;
+}
+
+void EafFocuserWorker::doShutdownAndQuit()
+{
+    doShutdown();
+    QThread::currentThread()->quit();
 }
 
 void EafFocuserWorker::doRefreshDevices()
@@ -624,7 +636,19 @@ EafFocuserManager::EafFocuserManager(QObject* parent)
 EafFocuserManager::~EafFocuserManager()
 {
     shutdown();
+    if (m_workerShutdownTimedOut) {
+        qWarning() << "EAF worker thread still running; retaining SDK loader until process exit.";
+        if (m_workerThread) {
+            m_workerThread->setParent(nullptr);
+        }
+        m_workerThread = nullptr;
+        m_worker = nullptr;
+        m_sdk = nullptr;
+        return;
+    }
+
     delete m_sdk;
+    m_sdk = nullptr;
 }
 
 void EafFocuserManager::initialize()
@@ -679,12 +703,30 @@ void EafFocuserManager::shutdown()
     if (!m_workerThread) {
         return;
     }
+    if (m_workerShutdownTimedOut) {
+        return;
+    }
 
-    // Shutdown worker (blocking to ensure SDK calls complete before thread stops)
-    QMetaObject::invokeMethod(m_worker, "doShutdown", Qt::BlockingQueuedConnection);
+    if (m_worker && m_workerThread->isRunning()) {
+        const bool posted = QMetaObject::invokeMethod(m_worker, "doShutdownAndQuit", Qt::QueuedConnection);
+        if (!posted) {
+            qWarning() << "Failed to post EAF worker shutdown request.";
+            m_workerThread->quit();
+        }
 
-    m_workerThread->quit();
-    m_workerThread->wait(3000);
+        const bool stopped = m_workerThread->wait(kEafWorkerShutdownTimeoutMs);
+        if (!stopped) {
+            m_workerShutdownTimedOut = true;
+            qWarning() << "EAF worker thread did not stop within"
+                       << kEafWorkerShutdownTimeoutMs << "ms; SDK loader retained.";
+            emit sdkAvailabilityChanged(
+                false,
+                QStringLiteral("EAF worker thread did not stop within 3000 ms; SDK loader retained."));
+            return;
+        }
+    }
+
+    m_workerThread->deleteLater();
     m_workerThread = nullptr;
     m_worker = nullptr;
 }

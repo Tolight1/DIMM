@@ -101,6 +101,46 @@
          </widget>
         </item>
         <item>
+         <widget class="QFrame" name="environmentStrip">
+          <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+          <layout class="QVBoxLayout" name="environmentStripLayout">
+           <property name="spacing"><number>2</number></property>
+           <property name="leftMargin"><number>10</number></property>
+           <property name="topMargin"><number>6</number></property>
+           <property name="rightMargin"><number>10</number></property>
+           <property name="bottomMargin"><number>6</number></property>
+           <item>
+            <layout class="QHBoxLayout" name="environmentHeader">
+             <property name="spacing"><number>6</number></property>
+             <item>
+              <widget class="QLabel" name="lblEnvironmentName">
+               <property name="text"><string>环境</string></property>
+              </widget>
+             </item>
+             <item>
+              <spacer name="environmentSpacer">
+               <property name="orientation"><enum>Qt::Horizontal</enum></property>
+               <property name="sizeHint" stdset="0">
+                <size><width>40</width><height>12</height></size>
+               </property>
+              </spacer>
+             </item>
+             <item>
+              <widget class="QLabel" name="lblEnvironmentStatus">
+               <property name="text"><string>未连接</string></property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblEnvironmentInfo">
+             <property name="text"><string>-- °C  |  -- %RH  |  -- hPa</string></property>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+        </item>
+        <item>
          <widget class="QFrame" name="cam1Card">
           <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
           <layout class="QVBoxLayout" name="cam1CardLayout">
@@ -129,8 +169,7 @@
            </item>
            <item>
             <widget class="QLabel" name="lblCam1Info">
-             <property name="text"><string>序列号: KE0200060001
-帧率: 390 fps | 温度: 25.3°C</string></property>
+             <property name="text"><string>SN: KE0200060001 | 390 fps</string></property>
             </widget>
            </item>
           </layout>
@@ -165,8 +204,7 @@
            </item>
            <item>
             <widget class="QLabel" name="lblCam2Info">
-             <property name="text"><string>序列号: KE0200060002
-帧率: 389 fps | 温度: 24.8°C</string></property>
+             <property name="text"><string>SN: KE0200060002 | 389 fps</string></property>
             </widget>
            </item>
           </layout>

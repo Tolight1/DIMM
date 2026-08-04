@@ -12,6 +12,8 @@
 
 #include <opencv2/opencv.hpp>
 
+#include "AutoExposureLogic.h"
+
 struct RoiRect {
     int x = 0;
     int y = 0;
@@ -59,6 +61,13 @@ struct AtmosphericParams {
     double seeing = 0.0;
     double theta0 = 0.0;
     double tau0 = 0.0;
+    double longitudinalVariancePx2 = 0.0;
+    double transverseVariancePx2 = 0.0;
+    double longitudinalVarianceRad2 = 0.0;
+    double transverseVarianceRad2 = 0.0;
+    double r0LongitudinalCm = 0.0;
+    double r0TransverseCm = 0.0;
+    quint64 sampleCount = 0;
 };
 
 struct DifferentialSample {
@@ -68,6 +77,11 @@ struct DifferentialSample {
     double centroid1Y = 0.0;
     double centroid2X = 0.0;
     double centroid2Y = 0.0;
+    quint64 frameId1 = 0;
+    quint64 frameId2 = 0;
+    quint64 cameraTimestamp1 = 0;
+    quint64 cameraTimestamp2 = 0;
+    double syncResidualUs = 0.0;
     qint64 timestampMs = 0;
 };
 
@@ -87,18 +101,55 @@ signals:
                        double threshold,
                        quint64 signalPixelCount);
     void differentialSampleReady(quint64 pairedSampleCount, quint64 droppedUnpairedCount);
+    void differentialSampleDetailReady(quint64 pairedSampleCount,
+                                       quint64 frameId1,
+                                       quint64 frameId2,
+                                       quint64 cameraTimestamp1,
+                                       quint64 cameraTimestamp2,
+                                       double centroid1X,
+                                       double centroid1Y,
+                                       double centroid2X,
+                                       double centroid2Y,
+                                       double longitudinal,
+                                       double transverse,
+                                       double syncResidualUs,
+                                       qint64 timestampMs);
     void roiImageReady(int cameraIndex, cv::Mat roiImage);
-    void atmosphereReady(double r0, double seeing, double theta0, double tau0);
+    void atmosphereReady(double r0,
+                         double seeing,
+                         double theta0,
+                         double tau0,
+                         double longitudinalVariancePx2,
+                         double transverseVariancePx2,
+                         double longitudinalVarianceRad2,
+                         double transverseVarianceRad2,
+                         double r0LongitudinalCm,
+                         double r0TransverseCm,
+                         quint64 sampleCount);
     void frameProcessed(int cameraIndex, bool centroidValid, double elapsedMs);
     void syncSampleReady(double syncResidualUs);
+    void unpairedSampleDropped(int droppedCameraIndex,
+                               quint64 cam0FrameId,
+                               quint64 cam1FrameId,
+                               qint64 frameIdOffset,
+                               qint64 alignedFrameId0,
+                               qint64 alignedFrameId1,
+                               quint64 cam0Timestamp,
+                               quint64 cam1Timestamp,
+                               quint64 droppedUnpairedSamples);
     void autoExposureSampleReady(int cameraIndex,
                                  double peakValue,
-                                 double fitPeakValue,
                                  double background,
                                  double noiseSigma,
                                  double threshold,
                                  quint64 signalPixelCount,
                                  quint64 saturatedPixelCount,
+                                 int peakQuality,
+                                 double supportedPeakValue,
+                                 quint64 peakSupportPixelCount,
+                                 double rejectedPeakValue,
+                                 int rejectedCandidateCount,
+                                 bool spotHardSaturated,
                                  bool centroidValid,
                                  bool measurementUsable,
                                  quint64 frameId,
@@ -106,8 +157,12 @@ signals:
 
 public slots:
     void setCentroidMethod(int method);
+    void setCentroidMode(int mode);
+    void setPeakKernelCentroidConfig(int method, int radiusPx, double strongHotPixelExcessDn);
     void setGaussianKernelSize(int size);
     void setGaussianSigma(double sigma);
+    void setBackgroundDenoiseKernelSize(int size);
+    void setBackgroundDenoiseSigmaMultiplier(double multiplier);
     void setThreshold(double threshold);
     void setRoiCentroidConfig(double thresholdAbsolute,
                               double sigmaThreshold,
@@ -128,7 +183,16 @@ public slots:
                           double lambdaNm,
                           double pixelSizeUm);
     void setTargetFrameRateHz(double frameRateHz);
-    void setAutoExposureMetricConfig(bool enabled, double hardSaturationDn, int sampleIntervalMs);
+    void setAutoExposureMetricConfig(bool enabled,
+                                     double hardSaturationDn,
+                                     int sampleIntervalMs,
+                                     int peakSupportRadiusPx,
+                                     double peakSupportFraction,
+                                     int minPeakSupportPixelCount,
+                                     double minNeighborPeakRatio,
+                                     int maxPeakCandidateCount,
+                                     double supportedPeakPercentile,
+                                     int saturatedPixelCount);
     void setCurrentRoi(int cameraIndex, const RoiRect& roi);
     void setPairRois(RoiRect roi0, RoiRect roi1);
     void advanceAcquisitionGeneration();
@@ -141,9 +205,12 @@ public slots:
 
 private:
     mutable QMutex m_mutex;
-    int m_method = 1;
-    int m_kernelSize = 7;
-    double m_sigma = 1.0;
+    int m_centroidMode = 0;
+    int m_peakKernelMethod = 1;
+    int m_peakKernelRadiusPx = 3;
+    double m_strongHotPixelExcessDn = 100.0;
+    int m_backgroundDenoiseKernelSize = 5;
+    double m_backgroundDenoiseSigmaMultiplier = 4.0;
     double m_threshold = 0.0;
     int m_centroidWindowRadius = 15;
     double m_centroidSigmaThreshold = 4.0;
@@ -163,6 +230,7 @@ private:
     bool m_autoExposureMetricsEnabled = false;
     double m_autoExposureHardSaturationDn = 4090.0;
     int m_autoExposureMetricIntervalMs = 1000;
+    AutoExposureSpotConfig m_autoExposureSpotConfig;
     qint64 m_lastAutoExposureSampleMs[2] = {-1, -1};
     RoiRect m_currentRoi[2];
     std::shared_ptr<std::atomic<quint64>> m_acquisitionGeneration;
@@ -176,6 +244,7 @@ private:
     quint64 m_droppedUnpairedSamples = 0;
     qint64 m_lastAtmospherePublishMs = 0;
     qint64 m_lastRoiImagePublishMs[2] = {0, 0};
+    quint64 m_diagnosticUnpairedDropLogCount = 0;
     QList<DifferentialSample> m_differentialHistory;
 
     struct HotPixelTemplate {
@@ -209,20 +278,22 @@ private:
     static constexpr int MIN_ROI_SIZE = 16;
     static constexpr qint64 ATMOSPHERE_PUBLISH_INTERVAL_MS = 1000;
     static constexpr qint64 ROI_IMAGE_PUBLISH_INTERVAL_MS = 100;
-    static constexpr double EFFECTIVE_TURBULENCE_HEIGHT_M = 5000.0;
     static constexpr double MARS_GIGE_TIMESTAMP_TICK_US = 0.008;
 
     cv::Mat preprocess(const cv::Mat& image);
     cv::Mat applyHotPixelCorrection(int cameraIndex, const RoiRect& roi, const cv::Mat& roiImage);
-    CentroidResult calculateCentroid(const cv::Mat& roiImage);
+    HotPixelRoiCache hotPixelCacheSnapshot(int cameraIndex, const RoiRect& roi) const;
+    CentroidResult calculateCentroid(int cameraIndex, const RoiRect& roi, const cv::Mat& roiImage);
     CentroidResult centerOfGravity(const cv::Mat& image);
-    CentroidResult gaussianFit(const cv::Mat& image);
+    CentroidResult peakKernelCentroid(int cameraIndex, const RoiRect& roi, const cv::Mat& image);
     bool hasThresholdSignalNearRoiEdge(const cv::Mat& roiImage, double threshold) const;
     CentroidQuality measurementCentroidQuality(const CentroidResult& centroid,
                                                const cv::Mat& roiImage) const;
     bool isMeasurementUsableCentroid(const CentroidResult& centroid, const cv::Mat& roiImage) const;
     AtmosphericParams calculateAtmosphere(const QList<DifferentialSample>& samples);
-    double estimateCorrelationPeakLagMs(const QList<DifferentialSample>& samples) const;
+    double estimateDifferentialAutocorrelationTimeMs(const QList<DifferentialSample>& samples) const;
+    double estimateScalarAutocorrelationCrossingMs(const QList<DifferentialSample>& samples,
+                                                   bool useLongitudinal) const;
     int historyWindowSize() const;
     int minimumAtmosphereSamples() const;
     void resetRoiProcessingHistory();
@@ -237,8 +308,12 @@ public:
     ~ImageProcessor();
 
     void setCentroidMethod(int method);
+    void setCentroidMode(int mode);
+    void setPeakKernelCentroidConfig(int method, int radiusPx, double strongHotPixelExcessDn);
     void setGaussianKernelSize(int size);
     void setGaussianSigma(double sigma);
+    void setBackgroundDenoiseKernelSize(int size);
+    void setBackgroundDenoiseSigmaMultiplier(double multiplier);
     void setThreshold(double threshold);
     void setRoiCentroidConfig(double thresholdAbsolute,
                               double sigmaThreshold,
@@ -260,16 +335,31 @@ public:
                           double lambdaNm,
                           double pixelSizeUm);
     void setTargetFrameRateHz(double frameRateHz);
-    void setAutoExposureMetricConfig(bool enabled, double hardSaturationDn, int sampleIntervalMs = 1000);
+    void setAutoExposureMetricConfig(bool enabled,
+                                     double hardSaturationDn,
+                                     int sampleIntervalMs = 1000,
+                                     int peakSupportRadiusPx = 2,
+                                     double peakSupportFraction = 0.50,
+                                     int minPeakSupportPixelCount = 3,
+                                     double minNeighborPeakRatio = 0.35,
+                                     int maxPeakCandidateCount = 8,
+                                     double supportedPeakPercentile = 0.95,
+                                     int saturatedPixelCount = 1);
     void setCurrentRoi(int cameraIndex, const RoiRect& roi);
     void setPairRois(const RoiRect rois[2]);
     void advanceAcquisitionGeneration();
     quint64 currentAcquisitionGeneration() const;
     void resetProcessingState();
     RoiRect getCurrentRoi(int cameraIndex) const;
-    int centroidMethod() const { return m_method; }
-    int gaussianKernelSize() const { return m_kernelSize; }
-    double gaussianSigma() const { return m_sigma; }
+    int centroidMethod() const { return m_centroidMode; }
+    int centroidMode() const { return m_centroidMode; }
+    int peakKernelMethod() const { return m_peakKernelMethod; }
+    int peakKernelRadiusPx() const { return m_peakKernelRadiusPx; }
+    double strongHotPixelExcessDn() const { return m_strongHotPixelExcessDn; }
+    int gaussianKernelSize() const { return m_backgroundDenoiseKernelSize; }
+    double gaussianSigma() const { return m_backgroundDenoiseSigmaMultiplier; }
+    int backgroundDenoiseKernelSize() const { return m_backgroundDenoiseKernelSize; }
+    double backgroundDenoiseSigmaMultiplier() const { return m_backgroundDenoiseSigmaMultiplier; }
     double apertureDiameterMm() const { return m_apertureDiameterMm; }
     double baselineSeparationMm() const { return m_baselineSeparationMm; }
     double baselineAngleDeg() const { return m_baselineAngleDeg; }
@@ -295,18 +385,55 @@ signals:
                        double threshold,
                        quint64 signalPixelCount);
     void differentialSampleReady(quint64 pairedSampleCount, quint64 droppedUnpairedCount);
+    void differentialSampleDetailReady(quint64 pairedSampleCount,
+                                       quint64 frameId1,
+                                       quint64 frameId2,
+                                       quint64 cameraTimestamp1,
+                                       quint64 cameraTimestamp2,
+                                       double centroid1X,
+                                       double centroid1Y,
+                                       double centroid2X,
+                                       double centroid2Y,
+                                       double longitudinal,
+                                       double transverse,
+                                       double syncResidualUs,
+                                       qint64 timestampMs);
     void roiImageReady(int cameraIndex, cv::Mat roiImage);
-    void atmosphereReady(double r0, double seeing, double theta0, double tau0);
+    void atmosphereReady(double r0,
+                         double seeing,
+                         double theta0,
+                         double tau0,
+                         double longitudinalVariancePx2,
+                         double transverseVariancePx2,
+                         double longitudinalVarianceRad2,
+                         double transverseVarianceRad2,
+                         double r0LongitudinalCm,
+                         double r0TransverseCm,
+                         quint64 sampleCount);
     void frameProcessed(int cameraIndex, bool centroidValid, double elapsedMs);
     void syncSampleReady(double syncResidualUs);
+    void unpairedSampleDropped(int droppedCameraIndex,
+                               quint64 cam0FrameId,
+                               quint64 cam1FrameId,
+                               qint64 frameIdOffset,
+                               qint64 alignedFrameId0,
+                               qint64 alignedFrameId1,
+                               quint64 cam0Timestamp,
+                               quint64 cam1Timestamp,
+                               quint64 droppedUnpairedSamples);
     void autoExposureSampleReady(int cameraIndex,
                                  double peakValue,
-                                 double fitPeakValue,
                                  double background,
                                  double noiseSigma,
                                  double threshold,
                                  quint64 signalPixelCount,
                                  quint64 saturatedPixelCount,
+                                 int peakQuality,
+                                 double supportedPeakValue,
+                                 quint64 peakSupportPixelCount,
+                                 double rejectedPeakValue,
+                                 int rejectedCandidateCount,
+                                 bool spotHardSaturated,
                                  bool centroidValid,
                                  bool measurementUsable,
                                  quint64 frameId,
@@ -318,9 +445,12 @@ private:
     RoiRect m_currentRoi[2];
     std::shared_ptr<std::atomic<quint64>> m_acquisitionGeneration =
         std::make_shared<std::atomic<quint64>>(1);
-    int m_method = 1;
-    int m_kernelSize = 7;
-    double m_sigma = 1.0;
+    int m_centroidMode = 0;
+    int m_peakKernelMethod = 1;
+    int m_peakKernelRadiusPx = 3;
+    double m_strongHotPixelExcessDn = 100.0;
+    int m_backgroundDenoiseKernelSize = 5;
+    double m_backgroundDenoiseSigmaMultiplier = 4.0;
     double m_apertureDiameterMm = 56.0;
     double m_baselineSeparationMm = 250.0;
     double m_baselineAngleDeg = 0.0;

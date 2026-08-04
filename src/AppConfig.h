@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <QTime>
 #include <QtGlobal>
 
 struct CameraConfig {
@@ -11,16 +12,15 @@ struct CameraConfig {
 
 struct AutoExposureConfig {
     bool enabled = false;
-    bool useFittedPeak = false;
 
     double lowThreshold = 80.0;
     double highThreshold = 220.0;
     double darkRatio = 1.2;
     double brightRatio = 0.8;
 
-    double targetPeakLowDn = 3200.0;
+    double targetPeakLowDn = 3000.0;
     double targetPeakHighDn = 3600.0;
-    double nearSaturationDn = 3800.0;
+    double exposureHysteresisDn = 200.0;
     double hardSaturationDn = 4090.0;
     int saturatedPixelCount = 1;
 
@@ -30,27 +30,38 @@ struct AutoExposureConfig {
     double starLostValidRatio = 0.10;
     double brightFrameRatioThreshold = 0.30;
     double darkFrameRatioThreshold = 0.50;
+    bool trendConflictEnabled = true;
+    double stableFrameRatioThreshold = 0.70;
+    int autoExposureSampleIntervalMs = 500;
+    int minDecisionSampleCount = 20;
+    double hardSaturationFrameRatioThreshold = 0.05;
+    int peakSupportRadiusPx = 2;
+    double peakSupportFraction = 0.50;
+    int minPeakSupportPixelCount = 3;
+    double minNeighborPeakRatio = 0.35;
+    int maxPeakCandidateCount = 8;
+    double supportedPeakPercentile = 0.95;
+    int exposureSettleMs = 750;
+    double minExposureDeltaUs = 10.0;
+    double minExposureChangeRatio = 0.02;
 
-    int sampleWindowSec = 60;
-    int brightPersistenceSec = 5;
-    int darkPersistenceSec = 60;
-    int starLostPersistenceSec = 120;
+    int sampleWindowSec = 10;
     int trendConflictPersistenceSec = 30;
-    int safePersistenceSec = 60;
-    int cooldownSec = 180;
 
     double minExposureUs = 500.0;
     double maxExposureUs = 20000.0;
-    int maxTemplateStepPerAdjust = 1;
     double maxExposureChangeRatioUp = 1.30;
     double maxExposureChangeRatioDown = 0.70;
     double cameraAgreementRatio = 0.50;
 };
 
 struct ProcessingConfig {
-    int kernelSize = 3;
-    double sigma = 1.0;
-    int method = 1;
+    int backgroundKernelSize = 5;
+    double backgroundSigmaMultiplier = 4.0;
+    int centroidMode = 0;
+    int peakKernelMethod = 1;
+    int peakKernelRadiusPx = 3;
+    double strongHotPixelExcessDn = 100.0;
 };
 
 struct RoiRecenteringConfig {
@@ -113,10 +124,24 @@ struct PolarisSolverSettingsConfig {
 struct StorageConfig {
     QString path;
     int interval = 1;
+    bool parameterValidationEnabled = false;
+    bool syncDiagnosticLoggingEnabled = false;
 };
 
 struct TriggerConfig {
     int mode = 0;
+};
+
+struct EnvironmentSensorConfig {
+    bool enabled = true;
+    QString portName = QStringLiteral("COM6");
+    int baudRate = 9600;
+    int dataBits = 8;
+    int stopBits = 1;
+    int readTimeoutMs = 500;
+    int writeTimeoutMs = 500;
+    int pollIntervalMs = 1000;
+    int deviceAddress = 1;
 };
 
 struct PulseGeneratorConfig {
@@ -128,6 +153,17 @@ struct PulseGeneratorConfig {
     quint32 pulseCount = 2000000U;
     double dutyPercent = 50.0;
     bool remoteControl = true;
+};
+
+struct AutoAcquisitionConfig {
+    bool enabled = false;
+    double latitudeDeg = 0.0;
+    double longitudeDeg = 0.0;
+    int startOffsetMinutesAfterSunset = 30;
+    int stopOffsetMinutesBeforeSunrise = 30;
+    bool testTimeOverrideEnabled = false;
+    QTime testStartTime = QTime(18, 30);
+    QTime testStopTime = QTime(6, 0);
 };
 
 struct NetworkConfig {
@@ -147,6 +183,8 @@ struct AppConfig {
     PolarisSolverSettingsConfig polarisSolver;
     StorageConfig storage;
     TriggerConfig trigger;
+    EnvironmentSensorConfig environmentSensor;
     PulseGeneratorConfig pulseGenerator;
+    AutoAcquisitionConfig autoAcquisition;
     NetworkConfig network;
 };

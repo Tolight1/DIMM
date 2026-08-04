@@ -22,9 +22,12 @@ void applyValidatedConfig(const AppConfig& config,
                           const ConfigApplicationCallbacks& callbacks)
 {
     if (callbacks.applyProcessing) {
-        callbacks.applyProcessing(config.processing.kernelSize,
-                                  config.processing.sigma,
-                                  config.processing.method);
+        callbacks.applyProcessing(config.processing.backgroundKernelSize,
+                                  config.processing.backgroundSigmaMultiplier,
+                                  config.processing.centroidMode,
+                                  config.processing.peakKernelMethod,
+                                  config.processing.peakKernelRadiusPx,
+                                  config.processing.strongHotPixelExcessDn);
     }
     if (callbacks.applyRoiRecentering) {
         callbacks.applyRoiRecentering(config.roiRecentering.thresholdPx,
@@ -78,7 +81,16 @@ void applyValidatedConfig(const AppConfig& config,
                                      config.polarisSolver.allowSaturatedPolarisConfirmation);
     }
     if (callbacks.applyStorage) {
-        callbacks.applyStorage(config.storage.path, config.storage.interval);
+        callbacks.applyStorage(config.storage.path,
+                               config.storage.interval,
+                               config.storage.parameterValidationEnabled,
+                               config.storage.syncDiagnosticLoggingEnabled);
+    }
+    if (callbacks.applyEnvironmentSensor) {
+        callbacks.applyEnvironmentSensor(config.environmentSensor);
+    }
+    if (callbacks.applyAutoAcquisition) {
+        callbacks.applyAutoAcquisition(config.autoAcquisition);
     }
     if (callbacks.applyNetwork) {
         callbacks.applyNetwork(config.network.ip, config.network.port);

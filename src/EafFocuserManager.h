@@ -115,6 +115,7 @@ private:
     EafSdkLoader* m_sdk = nullptr;
     EafFocuserWorker* m_worker = nullptr;
     QThread* m_workerThread = nullptr;
+    bool m_workerShutdownTimedOut = false;
     bool m_motionAllowed = true;
     QString m_motionDisallowedReason;
     EafDeviceDescriptor m_slotMapping[2];

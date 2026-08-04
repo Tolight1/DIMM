@@ -2,10 +2,13 @@
 
 #include "AlignmentTypes.h"
 #include "AlignmentSession.h"
+#include "AppConfig.h"
+#include "AutoAcquisitionScheduler.h"
 #include "AutoExposureController.h"
 #include "CameraManager.h"
 #include "CameraTypes.h"
 #include "CanvasWidgets.h"
+#include "EnvironmentSensorManager.h"
 #include "ImageProcessor.h"
 #include "PolarisDetectionPipeline.h"
 #include "PolarisSolver.h"
@@ -97,6 +100,22 @@ private slots:
     void onCameraError(int index, int errorCode, QString message);
 
 private:
+    struct PairedCentroidDetail {
+        quint64 pairedSampleCount = 0;
+        quint64 frameId1 = 0;
+        quint64 frameId2 = 0;
+        quint64 cameraTimestamp1 = 0;
+        quint64 cameraTimestamp2 = 0;
+        double centroid1X = 0.0;
+        double centroid1Y = 0.0;
+        double centroid2X = 0.0;
+        double centroid2Y = 0.0;
+        double longitudinal = 0.0;
+        double transverse = 0.0;
+        double syncResidualUs = 0.0;
+        qint64 timestampMs = 0;
+    };
+
     struct CaptureRuntimeContext {
         int frameCount = 0;
         int frameCountPerCamera[2] = {0, 0};
@@ -145,8 +164,44 @@ private:
         qint64 lastInitialCandidatePromptMs[2] = {-1, -1};
         qint64 liveRelocalizationStartedMs = -1;
         cv::Mat liveRelocalizationPreviewFrame[2];
+        QVector<PairedCentroidDetail> pendingPairedCentroidDetails;
     };
 
+    void registerMetaTypes();
+    void setupServiceManagers();
+    void setupStatusBarUi();
+    void setupMainWindowUi();
+    void setupRuntimeActions();
+    void initializeCaptureServices();
+    void setupPreviewCanvases();
+    void setupFullFramePreviewCanvases();
+    void setupRoiPreviewCanvases();
+    void setupChartCanvases();
+    void setupSettingsCallbacks();
+    void setupCameraSettingsCallbacks();
+    void setupAutoExposureSettingsCallbacks();
+    void setupTriggerSettingsCallbacks();
+    void setupEnvironmentSettingsCallbacks();
+    void setupPulseGeneratorSettingsCallbacks();
+    void setupAutoAcquisitionSettingsCallbacks();
+    void setupProcessingSettingsCallbacks();
+    void setupOpticsSettingsCallbacks();
+    void setupAlignmentSettingsCallbacks();
+    void setupStorageSettingsCallbacks();
+    void setupNetworkSettingsCallbacks();
+    void setupCameraConnections();
+    void setupImageProcessorConnections();
+    void setupCentroidProcessorConnection();
+    void setupAutoExposureProcessorConnection();
+    void setupDifferentialSampleProcessorConnections();
+    void setupFrameProcessedProcessorConnection();
+    void setupSyncSampleProcessorConnection();
+    void setupRoiImageProcessorConnection();
+    void setupAtmosphereProcessorConnection();
+    void setupCanvasMouseStatusConnections();
+    void setupRuntimeTimers();
+    void setupCommConnections();
+    void setupReportTimer();
     void setupConnections();
     void updateParams();
     void refreshUi();
@@ -302,15 +357,37 @@ private:
     bool startFullFrameLocalizationPulse(QString* reason = nullptr);
     bool switchToRoiTrackingPulse(QString* reason = nullptr);
     void initResultFile();
+    void initDetailResultFile();
+    void initSyncDiagnosticFile();
     void closeResultFile();
     void saveResultRow(int frame);
+    void saveDetailResultRows(int frame, const QVector<PairedCentroidDetail>& details);
     void flushPendingWrites();
+    void resetSyncDiagnostics();
+    void recordSyncDiagnosticEvent(const QString& event,
+                                   int cameraIndex,
+                                   const CameraFrame& packet,
+                                   const QString& note = QString());
+    void recordSyncUnpairedDropDiagnostic(int droppedCameraIndex,
+                                          quint64 cam0FrameId,
+                                          quint64 cam1FrameId,
+                                          qint64 frameIdOffset,
+                                          qint64 alignedFrameId0,
+                                          qint64 alignedFrameId1,
+                                          quint64 cam0Timestamp,
+                                          quint64 cam1Timestamp,
+                                          quint64 droppedUnpairedSamples);
     bool stopLiveCapture();
     void stopSimulationCapture();
     bool startSimulationCapture();
     cv::Mat buildSimulationFrame(int cameraIndex) const;
     void updateCurrentRoi();
     void on1hzTick();
+    void evaluateAutoAcquisitionSchedule();
+    void setAutoAcquisitionStatus(const QString& text,
+                                  UiStatusLevel level,
+                                  const QString& throttleKey = QString());
+    void noteManualAutoAcquisitionStopIfNeeded();
     void updateCameraInfo();
     void matchRoiTimeSlot();
     void onCommCommand(uint8_t cmd);
@@ -318,18 +395,29 @@ private:
     void reportDeviceStatus();
     void handleAutoExposureSample(const AutoExposureFrameSample& sample);
     void resetAutoExposureState();
+    AppConfig currentAppConfig() const;
+    void applyStartupConfig(const AppConfig& config);
+    void savePersistentSettings();
     QString autoExposureStateName(AutoExposureState state) const;
     QString autoExposureStateShortText(AutoExposureState state) const;
     QString autoExposureUiStatusText() const;
     QString csvSafeField(QString value) const;
     QVector<int> scanHotPixelExposureTemplates() const;
+    QVector<int> scanHotPixelExposureTemplatesForCamera(int cameraIndex) const;
     int selectHotPixelTemplateExposureForCurrentExposure(double currentExposure) const;
+    int selectHotPixelTemplateExposureForCameraExposure(int cameraIndex, double currentExposure) const;
     bool resolveHotPixelTemplatePathsForExposure(int exposureUs,
                                                  QString* camera0Mask,
                                                  QString* camera0Excess,
                                                  QString* camera1Mask,
                                                  QString* camera1Excess) const;
+    bool resolveHotPixelTemplatePathsForCameraExposure(int cameraIndex,
+                                                       int exposureUs,
+                                                       QString* maskPath,
+                                                       QString* excessPath) const;
     bool applyExposureAndHotPixelTemplate(int exposureUs, QString* reason = nullptr);
+    bool applyExposureAndHotPixelTemplate(int cameraIndex, int exposureUs, QString* reason = nullptr);
+    void refreshHotPixelTemplates();
     bool isSettingsApplyAllowed() const;
     bool canStartLiveCapture(QString* reason = nullptr) const;
     bool canConnectOrDisconnectCameras(QString* reason = nullptr) const;
@@ -366,6 +454,9 @@ private:
     SettingsDialog* m_settingsDialog = nullptr;
     EafFocuserManager* m_focuserManager = nullptr;
     FocuserControlWidget* m_focuserControlWidget = nullptr;
+    EnvironmentSensorManager* m_environmentSensor = nullptr;
+    EnvironmentSensorData m_latestEnvironment;
+    EnvironmentSensorConfig m_environmentSensorConfig;
     QLabel* m_lblStatusState = nullptr;
     QLabel* m_lblStatusROI = nullptr;
     QLabel* m_lblStatusFrames = nullptr;
@@ -385,15 +476,28 @@ private:
 
     QString m_dataPath = "D:/C-DIMM/data";
     int m_saveInterval = 1;
+    bool m_parameterValidationEnabled = false;
+    bool m_syncDiagnosticLoggingEnabled = false;
     int m_resultRowsSeen = 0;
     ResultWriter m_resultWriter;
+    ResultWriter m_detailResultWriter;
+    ResultWriter m_syncDiagnosticWriter;
     QString m_resultFilePath;
+    QString m_detailResultFilePath;
+    QString m_syncDiagnosticFilePath;
     CaptureState m_resultFileState = CaptureState::Idle;
     QTimer* m_fileFlushTimer = nullptr;
+    quint64 m_diagnosticLastCapturedFrameId[2] = {0, 0};
+    quint64 m_diagnosticCapturedPacketCount[2] = {0, 0};
+    quint64 m_diagnosticCapturedPacketGapCount[2] = {0, 0};
+    quint64 m_diagnosticLastLiveFrameId[2] = {0, 0};
+    quint64 m_diagnosticLivePacketCount[2] = {0, 0};
+    quint64 m_diagnosticLivePacketGapCount[2] = {0, 0};
 
     CaptureRuntimeContext m_liveRuntime;
     CaptureRuntimeContext m_simulationRuntime;
     double m_configExposureUs = 1000.0;
+    double m_cameraExposureUs[2] = {1000.0, 1000.0};
     double m_configGainDb = 10.0;
     double m_configContinuousFrameRateHz = 200.0;
     double m_lastContinuousFrameRateReadback[2] = {0.0, 0.0};
@@ -421,7 +525,7 @@ private:
     qint64 m_roiRecenteringCooldownMs = 3000;
     double m_roiRecenteringMinimumShiftPx = 8.0;
     bool m_pulseGeneratorEnabled = false;
-    QString m_pulseGeneratorPort = QStringLiteral("COM6");
+    QString m_pulseGeneratorPort = QStringLiteral("COM9");
     int m_pulseGeneratorBaudRate = 19200;
     int m_pulseGeneratorTerminalId = 1;
     double m_pulseGeneratorFrequencyHz = 200.0;
@@ -429,13 +533,25 @@ private:
     double m_pulseGeneratorDutyPercent = 50.0;
     bool m_pulseGeneratorRemoteControl = true;
 
+    AutoAcquisitionConfig m_autoAcquisitionConfig;
+    bool m_autoAcquisitionCommandInProgress = false;
+    bool m_autoAcquisitionStartedCurrentRun = false;
+    QString m_autoAcquisitionActiveWindowId;
+    QString m_autoAcquisitionSuppressedWindowId;
+    qint64 m_lastAutoAcquisitionAttemptMs = -1;
+    QString m_lastAutoAcquisitionStatusKey;
+    qint64 m_lastAutoAcquisitionStatusMs = -1;
+
     AutoExposureConfig m_autoExposureConfig;
     AutoExposureController m_autoExposureController;
     AutoExposureTrendSnapshot m_latestAutoExposureTrend;
     AutoExposureState m_autoExposureState = AutoExposureState::Normal;
+    AutoExposureState m_cameraAutoExposureState[2] = {AutoExposureState::Normal, AutoExposureState::Normal};
     QString m_autoExposureReason;
+    QString m_cameraAutoExposureReason[2];
     quint64 m_autoExposureSequenceId = 0;
     int m_autoExposureTargetExposureUs = 0;
+    int m_cameraAutoExposureTargetExposureUs[2] = {0, 0};
     qint64 m_lastAutoExposureAdjustMs = -1;
     quint64 m_autoExposureFramesSinceAdjust = 0;
     double m_latestAutoExposurePeakDn[2] = {0.0, 0.0};
@@ -444,7 +560,7 @@ private:
     double m_latestAutoExposureUsableRatio[2] = {0.0, 0.0};
     mutable QVector<int> m_cachedHotPixelTemplateExposures;
     mutable qint64 m_cachedHotPixelTemplateScanMs = -1;
-    int m_hotPixelTemplateExposureUs = 1000;
+    int m_hotPixelTemplateExposureUs[2] = {1000, 1000};
     bool m_alignmentAutoRadius = true;
     bool m_alignmentAutoSolveEnabled = true;
     bool m_alignmentShowMatchedCatalogStars = true;

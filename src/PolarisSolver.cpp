@@ -35,7 +35,7 @@ double rawSaturationLevelForDepth(int depth)
     case CV_8U:
         return 255.0;
     case CV_16U:
-        return 65535.0;
+        return 4095.0;
     default:
         return std::numeric_limits<double>::infinity();
     }
@@ -148,11 +148,17 @@ bool loadPolarisHotPixelTemplateBytes(int cameraIndex,
     return true;
 }
 
+bool isSolveCancelled(const std::shared_ptr<std::atomic_bool>& cancelled);
+
 cv::Mat applyPolarisHotPixelCorrection(const cv::Mat& frame,
-                                       const PolarisSolverConfig& config)
+                                       const PolarisSolverConfig& config,
+                                       const std::shared_ptr<std::atomic_bool>& cancelled)
 {
     if (frame.empty()) {
         return frame;
+    }
+    if (isSolveCancelled(cancelled)) {
+        return cv::Mat();
     }
     const int cameraIndex = std::clamp(config.cameraIndex, 0, 1);
     const PolarisHotPixelTemplateConfig& hot = config.hotPixelTemplates[cameraIndex];
@@ -184,6 +190,9 @@ cv::Mat applyPolarisHotPixelCorrection(const cv::Mat& frame,
     const uchar* mask = reinterpret_cast<const uchar*>(maskBytes.constData());
     const quint16* excess = reinterpret_cast<const quint16*>(excessBytes.constData());
     for (int y = 0; y < corrected.rows; ++y) {
+        if ((y & 0x0F) == 0 && isSolveCancelled(cancelled)) {
+            return cv::Mat();
+        }
         for (int x = 0; x < corrected.cols; ++x) {
             const int index = y * corrected.cols + x;
             if (mask[index] == 0) {
@@ -249,7 +258,7 @@ PolarisSolveResult solveFrameWithProgress(const cv::Mat& frame,
     totalTimer.start();
     QElapsedTimer detectionTimer;
     detectionTimer.start();
-    QVector<DetectedStar> detections = detectStarsFromFrame(frame, config);
+    QVector<DetectedStar> detections = detectStarsFromFrame(frame, config, cancelled);
     const double detectionMs = static_cast<double>(detectionTimer.nsecsElapsed()) / 1000000.0;
     if (isSolveCancelled(cancelled)) {
         PolarisSolveResult result;
@@ -277,22 +286,28 @@ PolarisSolveResult solveFrameWithProgress(const cv::Mat& frame,
 }
 
 QVector<DetectedStar> detectStarsFromFrame(const cv::Mat& frame,
-                                           const PolarisSolverConfig& config)
+                                           const PolarisSolverConfig& config,
+                                           const std::shared_ptr<std::atomic_bool>& cancelled)
 {
     QVector<DetectedStar> detections;
-    const cv::Mat correctedFrame = applyPolarisHotPixelCorrection(frame, config);
+    if (isSolveCancelled(cancelled)) {
+        return detections;
+    }
+    const cv::Mat correctedFrame = applyPolarisHotPixelCorrection(frame, config, cancelled);
+    if (isSolveCancelled(cancelled)) {
+        return detections;
+    }
     const cv::Mat grayscale = ImageUtils::grayscaleDetectionFrame(correctedFrame);
-    const cv::Mat mono8 = ImageUtils::normalizeDetectionFrame(grayscale);
-    if (mono8.empty()) {
+    if (grayscale.empty()) {
         return detections;
     }
 
     cv::Scalar mean;
     cv::Scalar stddev;
-    cv::meanStdDev(mono8, mean, stddev);
+    cv::meanStdDev(grayscale, mean, stddev);
     double minValue = 0.0;
     double maxValue = 0.0;
-    cv::minMaxLoc(mono8, &minValue, &maxValue);
+    cv::minMaxLoc(grayscale, &minValue, &maxValue);
 
     const double background = mean[0];
     const double noise = std::max(1.0, stddev[0]);
@@ -300,18 +315,30 @@ QVector<DetectedStar> detectStarsFromFrame(const cv::Mat& frame,
         std::max({config.starMinimumIntensity,
                   background + config.starThresholdSigma * noise,
                   background + (maxValue - background) * config.starPeakFraction});
-    if (maxValue <= dynamicThreshold) {
+    const double threshold = config.starThresholdAbsolute >= 0.0
+                                 ? std::min(config.starThresholdAbsolute, dynamicThreshold)
+                                 : dynamicThreshold;
+    if (maxValue <= threshold) {
         return detections;
     }
 
     cv::Mat binary;
-    cv::threshold(mono8, binary, dynamicThreshold, 255.0, cv::THRESH_BINARY);
+    if (isSolveCancelled(cancelled)) {
+        return detections;
+    }
+    cv::compare(grayscale, cv::Scalar(threshold), binary, cv::CMP_GT);
 
     cv::Mat labels;
     cv::Mat stats;
     cv::Mat centroids;
+    if (isSolveCancelled(cancelled)) {
+        return detections;
+    }
     const int componentCount =
         cv::connectedComponentsWithStats(binary, labels, stats, centroids, 8, CV_32S);
+    if (isSolveCancelled(cancelled)) {
+        return detections;
+    }
 
     std::vector<double> componentFlux(static_cast<size_t>(componentCount), 0.0);
     std::vector<double> componentPeak(static_cast<size_t>(componentCount), 0.0);
@@ -320,14 +347,16 @@ QVector<DetectedStar> detectStarsFromFrame(const cv::Mat& frame,
     std::vector<bool> componentSaturated(static_cast<size_t>(componentCount), false);
     const double rawSaturationValue = rawSaturationLevelForDepth(grayscale.depth());
     for (int y = 0; y < labels.rows; ++y) {
+        if ((y & 0x0F) == 0 && isSolveCancelled(cancelled)) {
+            return detections;
+        }
         const int* labelRow = labels.ptr<int>(y);
-        const uchar* imageRow = mono8.ptr<uchar>(y);
         for (int x = 0; x < labels.cols; ++x) {
             const int label = labelRow[x];
             if (label <= 0 || label >= componentCount) {
                 continue;
             }
-            const double value = static_cast<double>(imageRow[x]);
+            const double value = rawIntensityAt(grayscale, y, x);
             const double signal = std::max(0.0, value - background);
             componentFlux[static_cast<size_t>(label)] += signal;
             componentWeightedX[static_cast<size_t>(label)] += static_cast<double>(x) * signal;
@@ -341,14 +370,17 @@ QVector<DetectedStar> detectStarsFromFrame(const cv::Mat& frame,
     }
 
     for (int label = 1; label < componentCount; ++label) {
+        if ((label & 0x3F) == 1 && isSolveCancelled(cancelled)) {
+            return detections;
+        }
         const int area = stats.at<int>(label, cv::CC_STAT_AREA);
         const int left = stats.at<int>(label, cv::CC_STAT_LEFT);
         const int top = stats.at<int>(label, cv::CC_STAT_TOP);
         const int width = stats.at<int>(label, cv::CC_STAT_WIDTH);
         const int height = stats.at<int>(label, cv::CC_STAT_HEIGHT);
         const bool touchesEdge = left <= 0 || top <= 0 ||
-                                 left + width >= mono8.cols ||
-                                 top + height >= mono8.rows;
+                                 left + width >= grayscale.cols ||
+                                 top + height >= grayscale.rows;
         if (touchesEdge ||
             area < config.minStarAreaPx ||
             area > config.maxStarAreaPx ||
@@ -565,6 +597,9 @@ PolarisSolverController::PolarisSolverController(QObject* parent)
     , m_workerThread(new QThread(this))
     , m_worker(new PolarisSolverWorker())
 {
+    static_assert(PolarisSolverController::kSolverWorkerThreadCount == 1,
+                  "P1 keeps Polaris solves on one serial worker thread.");
+    m_workerThread->setObjectName(QStringLiteral("polarisSolverSingleWorker"));
     m_worker->moveToThread(m_workerThread);
     connect(m_workerThread, &QThread::finished, m_worker, &QObject::deleteLater);
     m_workerThread->start();
@@ -626,7 +661,7 @@ void PolarisSolverController::submitFrame(int cameraIndex,
                              cameraIndex,
                              generation,
                              frameId,
-                             frame.clone(),
+                             frame,
                              config,
                              std::make_shared<std::atomic_bool>(false)};
         emit solveStatusChanged(cameraIndex,
@@ -658,10 +693,10 @@ void PolarisSolverController::startSolveTask(int cameraIndex,
                             QStringLiteral("Detecting stars"),
                             generation);
 
-    cv::Mat frameCopy = frame.clone();
+    cv::Mat frameForWorker = frame;
     QMetaObject::invokeMethod(
         m_worker,
-        [this, cameraIndex, taskId, frameCopy, config, generation, frameId, cancelled]() mutable {
+        [this, cameraIndex, taskId, frameForWorker, config, generation, frameId, cancelled]() mutable {
             const auto progress = [this, cameraIndex, generation](PolarisSolveStatus status,
                                                                   const QString& message) {
                 if (status != PolarisSolveStatus::MatchingCatalog) {
@@ -674,7 +709,7 @@ void PolarisSolverController::startSolveTask(int cameraIndex,
                     },
                     Qt::QueuedConnection);
             };
-            PolarisSolveResult result = solveFrameWithProgress(frameCopy, config, cancelled, progress);
+            PolarisSolveResult result = solveFrameWithProgress(frameForWorker, config, cancelled, progress);
             result.cameraIndex = cameraIndex;
             result.taskId = taskId;
             result.generation = generation;

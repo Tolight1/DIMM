@@ -8,7 +8,12 @@ struct ConfigApplicationCallbacks {
     std::function<void(double exposure, double gain, double continuousFrameRateHz)> applyCamera;
     std::function<void(const AutoExposureConfig& config)> applyAutoExposure;
     std::function<void(int mode)> applyTriggerMode;
-    std::function<void(int kernelSize, double sigma, int method)> applyProcessing;
+    std::function<void(int backgroundKernelSize,
+                       double backgroundSigmaMultiplier,
+                       int centroidMode,
+                       int peakKernelMethod,
+                       int peakKernelRadiusPx,
+                       double strongHotPixelExcessDn)> applyProcessing;
     std::function<void(double thresholdPx,
                        int requiredFrames,
                        qint64 cooldownMs,
@@ -48,7 +53,12 @@ struct ConfigApplicationCallbacks {
                        double minMatchedSpatialSpreadPx,
                        double minPolarisSnr,
                        bool allowSaturatedPolarisConfirmation)> applyPolarisSolver;
-    std::function<void(QString path, int interval)> applyStorage;
+    std::function<void(QString path,
+                       int interval,
+                       bool parameterValidationEnabled,
+                       bool syncDiagnosticLoggingEnabled)> applyStorage;
+    std::function<void(const EnvironmentSensorConfig& config)> applyEnvironmentSensor;
+    std::function<void(const AutoAcquisitionConfig& config)> applyAutoAcquisition;
     std::function<void(QString ip, quint16 port)> applyNetwork;
     std::function<void()> afterApply;
 };

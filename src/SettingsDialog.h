@@ -36,7 +36,12 @@ public:
 
     std::function<void(double exposure, double gain, double continuousFrameRateHz)> onApplyCamera;
     std::function<void(const AutoExposureConfig& config)> onApplyAutoExposure;
-    std::function<void(int kernelSize, double sigma, int method)> onApplyProcessing;
+    std::function<void(int backgroundKernelSize,
+                       double backgroundSigmaMultiplier,
+                       int centroidMode,
+                       int peakKernelMethod,
+                       int peakKernelRadiusPx,
+                       double strongHotPixelExcessDn)> onApplyProcessing;
     std::function<void(double thresholdPx,
                        int requiredFrames,
                        qint64 cooldownMs,
@@ -76,8 +81,13 @@ public:
                        double minMatchedSpatialSpreadPx,
                        double minPolarisSnr,
                        bool allowSaturatedPolarisConfirmation)> onApplyPolarisSolver;
-    std::function<void(QString path, int interval)> onApplyStorage;
+    std::function<void(QString path,
+                       int interval,
+                       bool parameterValidationEnabled,
+                       bool syncDiagnosticLoggingEnabled)> onApplyStorage;
     std::function<void(int mode)> onApplyTriggerMode;
+    std::function<void(const EnvironmentSensorConfig& config)> onApplyEnvironmentSensor;
+    std::function<void(const AutoAcquisitionConfig& config)> onApplyAutoAcquisition;
     std::function<bool(bool enabled,
                        QString portName,
                        int baudRate,
@@ -104,10 +114,12 @@ public:
     QLineEdit* gainEdit = nullptr;
     QLineEdit* continuousFrameRateEdit = nullptr;
     QCheckBox* autoExposureCheck = nullptr;
-    QCheckBox* autoExpUseFittedPeakCheck = nullptr;
+    QCheckBox* autoExpTrendConflictCheck = nullptr;
     QLineEdit* autoExpTargetPeakLowEdit = nullptr;
     QLineEdit* autoExpTargetPeakHighEdit = nullptr;
-    QLineEdit* autoExpNearSaturationEdit = nullptr;
+    QLineEdit* autoExpExposureHysteresisEdit = nullptr;
+    QLineEdit* autoExpDarkAdjustmentTargetEdit = nullptr;
+    QLineEdit* autoExpBrightAdjustmentTargetEdit = nullptr;
     QLineEdit* autoExpHardSaturationEdit = nullptr;
     QLineEdit* autoExpSaturatedPixelCountEdit = nullptr;
     QLineEdit* autoExpDarkSnrWarningEdit = nullptr;
@@ -116,27 +128,43 @@ public:
     QLineEdit* autoExpStarLostValidRatioEdit = nullptr;
     QLineEdit* autoExpBrightFrameRatioEdit = nullptr;
     QLineEdit* autoExpDarkFrameRatioEdit = nullptr;
+    QLineEdit* autoExpStableFrameRatioEdit = nullptr;
+    QLineEdit* autoExpHardSaturationFrameRatioEdit = nullptr;
     QLineEdit* autoExpSampleWindowSecEdit = nullptr;
-    QLineEdit* autoExpBrightPersistenceSecEdit = nullptr;
-    QLineEdit* autoExpDarkPersistenceSecEdit = nullptr;
-    QLineEdit* autoExpStarLostPersistenceSecEdit = nullptr;
+    QLineEdit* autoExpSampleIntervalMsEdit = nullptr;
+    QLineEdit* autoExpMinDecisionSampleCountEdit = nullptr;
     QLineEdit* autoExpTrendConflictPersistenceSecEdit = nullptr;
-    QLineEdit* autoExpSafePersistenceSecEdit = nullptr;
-    QLineEdit* autoExpCooldownSecEdit = nullptr;
     QLineEdit* autoExpMinEdit = nullptr;
     QLineEdit* autoExpMaxEdit = nullptr;
-    QLineEdit* autoExpMaxTemplateStepEdit = nullptr;
     QLineEdit* autoExpMaxChangeUpEdit = nullptr;
     QLineEdit* autoExpMaxChangeDownEdit = nullptr;
     QLineEdit* autoExpCameraAgreementRatioEdit = nullptr;
+    QLineEdit* autoExpPeakSupportRadiusEdit = nullptr;
+    QLineEdit* autoExpPeakSupportFractionEdit = nullptr;
+    QLineEdit* autoExpMinPeakSupportPixelsEdit = nullptr;
+    QLineEdit* autoExpMinNeighborPeakRatioEdit = nullptr;
+    QLineEdit* autoExpMaxPeakCandidateCountEdit = nullptr;
+    QLineEdit* autoExpSupportedPeakPercentileEdit = nullptr;
+    QLineEdit* autoExpExposureSettleMsEdit = nullptr;
+    QLineEdit* autoExpMinExposureDeltaEdit = nullptr;
+    QLineEdit* autoExpMinExposureChangeRatioEdit = nullptr;
     QLineEdit* storagePathEdit = nullptr;
     QLineEdit* saveIntervalEdit = nullptr;
+    QCheckBox* parameterValidationCheck = nullptr;
+    QCheckBox* syncDiagnosticLogCheck = nullptr;
     QRadioButton* triggerContinuous = nullptr;
     QRadioButton* triggerHardware = nullptr;
-    QRadioButton* procGravity = nullptr;
-    QRadioButton* procGaussian = nullptr;
+    QCheckBox* envSensorEnableCheck = nullptr;
+    QLineEdit* envSensorPortEdit = nullptr;
+    QComboBox* envSensorBaudCombo = nullptr;
+    QLineEdit* envSensorAddressEdit = nullptr;
+    QLineEdit* envSensorPollIntervalEdit = nullptr;
+    QComboBox* centroidModeCombo = nullptr;
+    QComboBox* peakKernelMethodCombo = nullptr;
     QLineEdit* procKernelSize = nullptr;
     QLineEdit* procSigma = nullptr;
+    QLineEdit* peakKernelRadiusEdit = nullptr;
+    QLineEdit* strongHotPixelExcessEdit = nullptr;
     QLineEdit* roiRecenterThresholdEdit = nullptr;
     QLineEdit* roiRecenterRequiredFramesEdit = nullptr;
     QLineEdit* roiRecenterCooldownMsEdit = nullptr;
@@ -196,6 +224,16 @@ public:
     QPushButton* pulseApplySourceBtn = nullptr;
     QPushButton* pulseStartBtn = nullptr;
     QPushButton* pulseStopBtn = nullptr;
+    QCheckBox* autoAcquisitionEnableCheck = nullptr;
+    QLineEdit* autoAcquisitionLatitudeEdit = nullptr;
+    QLineEdit* autoAcquisitionLongitudeEdit = nullptr;
+    QLineEdit* autoAcquisitionStartOffsetEdit = nullptr;
+    QLineEdit* autoAcquisitionStopOffsetEdit = nullptr;
+    QCheckBox* autoAcquisitionTestOverrideCheck = nullptr;
+    QLineEdit* autoAcquisitionTestStartEdit = nullptr;
+    QLineEdit* autoAcquisitionTestStopEdit = nullptr;
+    QLabel* autoAcquisitionNextStartLabel = nullptr;
+    QLabel* autoAcquisitionNextStopLabel = nullptr;
 
 private:
     void updateApplyStatus(const QString& text, const QString& color);

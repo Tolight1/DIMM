@@ -49,6 +49,7 @@ struct PolarisSolverConfig {
     double initialMatchTolerancePx = 8.0;
     double refinedMatchTolerancePx = 4.0;
     double observationEpochYear = 2026.5;
+    double starThresholdAbsolute = -1.0;
     double starThresholdSigma = 4.0;
     double starPeakFraction = 0.20;
     double starMinimumIntensity = 16.0;
@@ -145,7 +146,8 @@ struct PolarisSolveResult {
 };
 
 QVector<DetectedStar> detectStarsFromFrame(const cv::Mat& frame,
-                                           const PolarisSolverConfig& config);
+                                           const PolarisSolverConfig& config,
+                                           const std::shared_ptr<std::atomic_bool>& cancelled = {});
 PolarisSolveResult solveFrame(const cv::Mat& frame,
                               const PolarisSolverConfig& config);
 PolarisSolveResult solveFrame(const cv::Mat& frame,
@@ -161,6 +163,8 @@ class PolarisSolverController : public QObject {
     Q_OBJECT
 
 public:
+    static constexpr int kSolverWorkerThreadCount = 1;
+
     explicit PolarisSolverController(QObject* parent = nullptr);
     ~PolarisSolverController();
 
