@@ -2,6 +2,11 @@
 
 #include <QString>
 
+#include <functional>
+
+class QObject;
+class QThread;
+
 class PulseGeneratorManager
 {
 public:
@@ -16,8 +21,8 @@ public:
         bool remoteControl = true;
     };
 
-    PulseGeneratorManager() = default;
-    ~PulseGeneratorManager() = default;
+    PulseGeneratorManager();
+    ~PulseGeneratorManager();
 
     bool applyConfig(const Config& config, QString* errorMessage = nullptr);
     bool configureAndStart(const Config& config, QString* errorMessage = nullptr);
@@ -28,6 +33,12 @@ public:
 private:
     bool validateConfig(const Config& config, QString* errorMessage) const;
     bool configureDevice(const Config& config, bool enableOutput, QString* errorMessage);
+    bool stopDevice(const Config& config, QString* errorMessage);
+    bool runWorkerOperation(const QString& operationName,
+                            const std::function<bool(QString*)>& operation,
+                            QString* errorMessage);
+    void ensureWorkerThread();
+    void shutdownWorkerThread();
     bool writeRegister16(void* handle,
                          unsigned short deviceAddress,
                          unsigned short reg,
@@ -43,4 +54,6 @@ private:
 
     Config m_config;
     bool m_running = false;
+    QThread* m_workerThread = nullptr;
+    QObject* m_workerContext = nullptr;
 };

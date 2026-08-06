@@ -56,6 +56,9 @@ struct RoiUpdatePauseState {
 
 struct CameraFrame {
     cv::Mat image;
+    GX_PIXEL_FORMAT_ENTRY pixelFormat = GX_PIXEL_FORMAT_UNDEFINED;
+    int bitDepth = 0;
+    double maxPixelValue = 0.0;
     quint64 frameId = 0;
     quint64 cameraTimestamp = 0;
     qint64 receivedMs = 0;
@@ -168,6 +171,9 @@ private:
         bool isStreaming = false;
         bool isClosing = false;
         int activeCallbacks = 0;
+        bool hasFrameIdTracking = false;
+        quint64 lastRawFrameId = 0;
+        quint64 frameIdWrapOffset = 0;
         cv::Mat latestFrame;
         CameraFrame latestFramePacket;
         mutable QMutex stateMutex;
@@ -176,6 +182,9 @@ private:
         QWaitCondition callbackDrained;
         CameraInfo info;
     };
+
+    static void resetFrameIdTracking(CameraData& camera);
+    static quint64 extendWrappingFrameId(CameraData& camera, quint64 rawFrameId);
 
     CameraData m_cameras[2];
     mutable QMutex m_apiMutex;

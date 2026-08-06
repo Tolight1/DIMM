@@ -5,11 +5,29 @@
 #include <QPainterPath>
 #include <QResizeEvent>
 #include <QSizePolicy>
+#include <QStringList>
 #include <QWheelEvent>
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+
+namespace {
+cv::Mat makeDisplayGray8(const cv::Mat& image)
+{
+    if (image.empty() || image.channels() != 1) {
+        return cv::Mat();
+    }
+    if (image.type() == CV_8UC1) {
+        return image;
+    }
+
+    cv::Mat display;
+    constexpr double kMono12MaxValue = 4095.0;
+    image.convertTo(display, CV_8U, 255.0 / kMono12MaxValue);
+    return display;
+}
+}
 
 FullFrameCanvas::FullFrameCanvas(QWidget* parent)
     : QWidget(parent)
@@ -47,6 +65,45 @@ void FullFrameCanvas::setCurrentRoi(int index)
     update();
 }
 
+void FullFrameCanvas::setAlignmentOverlay(const AlignmentOverlay& overlay)
+{
+    m_alignmentOverlay = overlay;
+    update();
+}
+
+void FullFrameCanvas::clearAlignmentOverlay()
+{
+    m_alignmentOverlay = AlignmentOverlay();
+    update();
+}
+
+void FullFrameCanvas::setStarCandidateOverlays(const QVector<StarCandidateOverlay>& candidates)
+{
+    m_starCandidateOverlays = candidates;
+    update();
+}
+
+void FullFrameCanvas::clearStarCandidateOverlays()
+{
+    if (m_starCandidateOverlays.isEmpty()) {
+        return;
+    }
+    m_starCandidateOverlays.clear();
+    update();
+}
+
+void FullFrameCanvas::setCoarseDriftOverlay(const CoarseDriftOverlay& overlay)
+{
+    m_coarseDriftOverlay = overlay;
+    update();
+}
+
+void FullFrameCanvas::clearCoarseDriftOverlay()
+{
+    m_coarseDriftOverlay = CoarseDriftOverlay();
+    update();
+}
+
 void FullFrameCanvas::clear()
 {
     m_image = cv::Mat();
@@ -54,6 +111,9 @@ void FullFrameCanvas::clear()
     m_imageDirty = true;
     m_rois.clear();
     m_currentRoiIndex = -1;
+    m_alignmentOverlay = AlignmentOverlay();
+    m_starCandidateOverlays.clear();
+    m_coarseDriftOverlay = CoarseDriftOverlay();
     m_scale = 1.0;
     m_offset = QPointF();
     m_hasViewTransform = false;
@@ -101,7 +161,10 @@ void FullFrameCanvas::paintEvent(QPaintEvent*)
     }
 
     drawImage(painter);
+    drawAlignmentOverlay(painter);
+    drawCoarseDriftOverlay(painter);
     drawRoiOverlays(painter);
+    drawStarCandidateOverlays(painter);
     drawScaleBar(painter);
     drawInfo(painter);
 }
@@ -154,8 +217,9 @@ void FullFrameCanvas::drawImage(QPainter& painter)
                               static_cast<int>(rgb.step), QImage::Format_RGB888)
                            .copy();
         } else if (m_image.channels() == 1) {
-            m_qimage = QImage(m_image.data, m_image.cols, m_image.rows,
-                              static_cast<int>(m_image.step), QImage::Format_Grayscale8)
+            const cv::Mat display = makeDisplayGray8(m_image);
+            m_qimage = QImage(display.data, display.cols, display.rows,
+                              static_cast<int>(display.step), QImage::Format_Grayscale8)
                            .copy();
         } else {
             m_qimage = QImage();
@@ -197,6 +261,302 @@ void FullFrameCanvas::drawRoiOverlays(QPainter& painter)
         painter.setFont(QFont("Consolas", 8));
         painter.drawText(roiRect.topLeft() + QPointF(4, 14), QString("#%1").arg(i));
     }
+}
+
+void FullFrameCanvas::drawStarCandidateOverlays(QPainter& painter)
+{
+    if (m_starCandidateOverlays.isEmpty() || m_image.empty()) {
+        return;
+    }
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setFont(QFont("Consolas", 9, QFont::Bold));
+
+    for (const StarCandidateOverlay& candidate : m_starCandidateOverlays) {
+        const QPointF topLeft = imageToWidget(candidate.bbox.topLeft());
+        const QPointF bottomRight = imageToWidget(candidate.bbox.bottomRight());
+        const QRectF box(topLeft, bottomRight);
+        const QPointF center = imageToWidget(candidate.center);
+
+        const QColor color = candidate.selected ? QColor(255, 82, 82) : QColor(255, 210, 90);
+        painter.setPen(QPen(color, candidate.selected ? 2.0 : 1.3));
+        painter.drawRect(box);
+        painter.drawLine(center + QPointF(-6.0, 0.0), center + QPointF(6.0, 0.0));
+        painter.drawLine(center + QPointF(0.0, -6.0), center + QPointF(0.0, 6.0));
+
+        painter.setPen(QColor(255, 255, 255));
+        painter.drawText(box.topLeft() + QPointF(4.0, 14.0),
+                         QStringLiteral("#%1").arg(candidate.index));
+    }
+
+    painter.restore();
+}
+
+void FullFrameCanvas::drawAlignmentOverlay(QPainter& painter)
+{
+    if (!m_alignmentOverlay.enabled || m_image.empty() || m_scale <= 0.0) {
+        return;
+    }
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    const QPointF center = imageToWidget(m_alignmentOverlay.orbitCenter);
+    const double radius = std::max(0.0, m_alignmentOverlay.orbitRadiusPx * m_scale);
+    const QRectF imageRect(m_offset.x(),
+                           m_offset.y(),
+                           m_qimage.width() * m_scale,
+                           m_qimage.height() * m_scale);
+
+    painter.setFont(QFont("Microsoft YaHei", 8));
+    for (const CatalogMatchOverlay& match : m_alignmentOverlay.catalogMatches) {
+        const QPointF detected = imageToWidget(match.detectedPosition);
+        const QPointF predicted = imageToWidget(match.predictedPosition);
+        const QColor matchColor = match.isPolaris ? QColor(255, 86, 86, 220)
+                                                  : QColor(120, 235, 190, 185);
+
+        painter.setPen(QPen(QColor(255, 255, 255, 80), 1.0, Qt::DashLine));
+        painter.drawLine(detected, predicted);
+        painter.setPen(QPen(matchColor, match.isPolaris ? 2.0 : 1.2));
+        painter.drawEllipse(detected, match.isPolaris ? 5.0 : 3.5, match.isPolaris ? 5.0 : 3.5);
+        painter.drawLine(predicted + QPointF(-4.0, 0.0), predicted + QPointF(4.0, 0.0));
+        painter.drawLine(predicted + QPointF(0.0, -4.0), predicted + QPointF(0.0, 4.0));
+        if (match.isPolaris || match.residualPx > 2.0) {
+            const QString text = match.label.isEmpty()
+                                     ? QStringLiteral("%1 px").arg(match.residualPx, 0, 'f', 1)
+                                     : match.label;
+            painter.drawText(detected + QPointF(6.0, -6.0), text);
+        }
+    }
+
+    const QPen crossPen(QColor(34, 121, 255, 190), 1.2);
+    painter.setPen(crossPen);
+    painter.drawLine(QPointF(imageRect.left(), center.y()), QPointF(imageRect.right(), center.y()));
+    painter.drawLine(QPointF(center.x(), imageRect.top()), QPointF(center.x(), imageRect.bottom()));
+
+    if (radius > 1.0) {
+        painter.setPen(QPen(QColor(40, 92, 255, 220), 2.0));
+        painter.drawEllipse(center, radius, radius);
+    }
+
+    painter.setFont(QFont("Microsoft YaHei", 9));
+    if (m_alignmentOverlay.hasPredictedPolaris || m_alignmentOverlay.hasDetectedPolaris) {
+        const QPointF polarisForLine =
+            imageToWidget(m_alignmentOverlay.hasDetectedPolaris
+                              ? m_alignmentOverlay.detectedPolarisPosition
+                              : m_alignmentOverlay.predictedPolarisPosition);
+        painter.setPen(QPen(QColor(255, 235, 120, 180), 1.4, Qt::DashLine));
+        painter.drawLine(center, polarisForLine);
+    }
+
+    if (m_alignmentOverlay.hasPredictedPolaris) {
+        const QPointF predicted = imageToWidget(m_alignmentOverlay.predictedPolarisPosition);
+        painter.setPen(QPen(QColor(255, 160, 70), 2.0, Qt::DashLine));
+        painter.drawEllipse(predicted, 8.0, 8.0);
+        painter.drawLine(predicted + QPointF(-11.0, 0.0), predicted + QPointF(11.0, 0.0));
+        painter.drawLine(predicted + QPointF(0.0, -11.0), predicted + QPointF(0.0, 11.0));
+    }
+
+    if (m_alignmentOverlay.hasDetectedPolaris) {
+        const QPointF detected = imageToWidget(m_alignmentOverlay.detectedPolarisPosition);
+        painter.setPen(QPen(QColor(255, 86, 86), 2.4, Qt::SolidLine));
+        painter.drawEllipse(detected, 7.0, 7.0);
+        painter.drawLine(detected + QPointF(-10.0, 0.0), detected + QPointF(10.0, 0.0));
+        painter.drawLine(detected + QPointF(0.0, -10.0), detected + QPointF(0.0, 10.0));
+    }
+
+    if (m_alignmentOverlay.hasPredictedPolaris && m_alignmentOverlay.hasDetectedPolaris) {
+        const QPointF predicted = imageToWidget(m_alignmentOverlay.predictedPolarisPosition);
+        const QPointF detected = imageToWidget(m_alignmentOverlay.detectedPolarisPosition);
+        painter.setPen(QPen(QColor(255, 255, 255, 150), 1.2, Qt::DotLine));
+        painter.drawLine(predicted, detected);
+    }
+
+    if (m_alignmentOverlay.hasStar) {
+        const QPointF star = imageToWidget(m_alignmentOverlay.starPosition);
+        if (!m_alignmentOverlay.hasPredictedPolaris && !m_alignmentOverlay.hasDetectedPolaris) {
+            painter.setPen(QPen(QColor(255, 86, 86), 2.0));
+            painter.drawEllipse(star, 7.0, 7.0);
+            painter.drawLine(star + QPointF(-10.0, 0.0), star + QPointF(10.0, 0.0));
+            painter.drawLine(star + QPointF(0.0, -10.0), star + QPointF(0.0, 10.0));
+        }
+
+        const QString label = m_alignmentOverlay.label.isEmpty()
+                                  ? QStringLiteral("偏离轨道: %1 px")
+                                        .arg(m_alignmentOverlay.deviationPx, 0, 'f', 1)
+                                  : m_alignmentOverlay.label;
+        painter.setPen(QColor(255, 210, 90));
+        painter.drawText(star + QPointF(10.0, -10.0), label);
+    } else {
+        painter.setPen(QColor(255, 190, 70));
+        painter.drawText(imageRect.adjusted(12.0, 28.0, -12.0, -12.0).topLeft(),
+                         QStringLiteral("未检测到北极星"));
+    }
+
+    if (m_alignmentOverlay.matchedStarCount > 0) {
+        painter.setPen(QColor(210, 235, 255));
+        painter.drawText(imageRect.adjusted(12.0, 12.0, -12.0, -12.0).topLeft(),
+                         QStringLiteral("匹配 %1 星 | RMS %2 px | %3\"/px")
+                             .arg(m_alignmentOverlay.matchedStarCount)
+                             .arg(m_alignmentOverlay.rmsPx, 0, 'f', 2)
+                             .arg(m_alignmentOverlay.plateScaleArcsecPx, 0, 'f', 3));
+    }
+
+    QStringList detailLines;
+    if (!m_alignmentOverlay.solveStateText.isEmpty()) {
+        detailLines << m_alignmentOverlay.solveStateText;
+    }
+    if (m_alignmentOverlay.polarisNcpDistancePx > 0.0) {
+        detailLines << QStringLiteral("NCP-Polaris %1 px / %2'")
+                           .arg(m_alignmentOverlay.polarisNcpDistancePx, 0, 'f', 1)
+                           .arg(m_alignmentOverlay.polarisNcpDistanceArcmin, 0, 'f', 2);
+    }
+    if (!m_alignmentOverlay.orbitSource.isEmpty()) {
+        detailLines << QStringLiteral("轨道: %1").arg(m_alignmentOverlay.orbitSource);
+    }
+    if (m_alignmentOverlay.solveTotalMs > 0.0) {
+        detailLines << QStringLiteral("耗时 %1 ms")
+                           .arg(m_alignmentOverlay.solveTotalMs, 0, 'f', 1);
+    }
+    if (m_alignmentOverlay.mirroredKnown) {
+        detailLines << QStringLiteral("镜像: %1")
+                           .arg(m_alignmentOverlay.mirrored ? QStringLiteral("是")
+                                                            : QStringLiteral("否"));
+    }
+    if (!m_alignmentOverlay.warningText.isEmpty()) {
+        detailLines << m_alignmentOverlay.warningText;
+    }
+    if (!detailLines.isEmpty()) {
+        painter.setFont(QFont("Microsoft YaHei", 8));
+        painter.setPen(m_alignmentOverlay.warningText.isEmpty()
+                           ? QColor(210, 235, 255)
+                           : QColor(255, 190, 70));
+        painter.drawText(imageRect.adjusted(12.0, 46.0, -12.0, -12.0).topLeft(),
+                         detailLines.join(QLatin1String(" | ")));
+    }
+
+    painter.restore();
+}
+
+void FullFrameCanvas::drawCoarseDriftOverlay(QPainter& painter)
+{
+    if (!m_coarseDriftOverlay.enabled || m_image.empty() || m_scale <= 0.0) {
+        return;
+    }
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    const QRectF imageRect(m_offset.x(),
+                           m_offset.y(),
+                           m_qimage.width() * m_scale,
+                           m_qimage.height() * m_scale);
+
+    for (const CoarseDriftTrackOverlay& track : m_coarseDriftOverlay.tracks) {
+        const QPointF start = imageToWidget(track.startPx);
+        const QPointF end = imageToWidget(track.endPx);
+        painter.setPen(track.usedForSolve
+                           ? QPen(QColor(120, 235, 190, 210), 1.6)
+                           : QPen(QColor(150, 150, 150, 120), 1.0));
+        painter.drawLine(start, end);
+        painter.drawEllipse(end, track.usedForSolve ? 3.5 : 2.0, track.usedForSolve ? 3.5 : 2.0);
+        if (!track.usedForSolve && track.velocityFitValid) {
+            painter.setFont(QFont("Consolas", 7));
+            painter.drawText(end + QPointF(4.0, -4.0),
+                             QStringLiteral("%1点 %2s")
+                                 .arg(track.pointCount)
+                                 .arg(track.durationSec, 0, 'f', 0));
+        }
+    }
+
+    if (m_coarseDriftOverlay.valid) {
+        const QPointF center = imageToWidget(m_coarseDriftOverlay.northCelestialPolePx);
+        const QPointF frameCenter = imageToWidget(m_coarseDriftOverlay.frameCenterPx);
+        painter.setPen(QPen(QColor(120, 255, 160), 2.0));
+        painter.drawEllipse(center, 8.0, 8.0);
+        painter.drawLine(center + QPointF(-14.0, 0.0), center + QPointF(14.0, 0.0));
+        painter.drawLine(center + QPointF(0.0, -14.0), center + QPointF(0.0, 14.0));
+
+        painter.setPen(QPen(QColor(255, 220, 90), 2.0, Qt::DashLine));
+        QPointF arrowEnd = center;
+        if (!imageRect.contains(center)) {
+            // adjustmentVectorPx points from the frame center to the estimated NCP
+            // in image pixels; clamp the arrow endpoint to the image rect edge when
+            // the estimated NCP lies offscreen.
+            const double length =
+                std::sqrt(m_coarseDriftOverlay.adjustmentVectorPx.x() *
+                              m_coarseDriftOverlay.adjustmentVectorPx.x() +
+                          m_coarseDriftOverlay.adjustmentVectorPx.y() *
+                              m_coarseDriftOverlay.adjustmentVectorPx.y());
+            if (length > 1e-6) {
+                const QPointF unit(m_coarseDriftOverlay.adjustmentVectorPx.x() / length,
+                                   m_coarseDriftOverlay.adjustmentVectorPx.y() / length);
+                double t = std::numeric_limits<double>::max();
+                if (std::abs(unit.x()) > 1e-9) {
+                    t = std::min(t, (unit.x() > 0.0 ? imageRect.right() - frameCenter.x()
+                                                    : imageRect.left() - frameCenter.x()) /
+                                        unit.x());
+                }
+                if (std::abs(unit.y()) > 1e-9) {
+                    t = std::min(t, (unit.y() > 0.0 ? imageRect.bottom() - frameCenter.y()
+                                                    : imageRect.top() - frameCenter.y()) /
+                                        unit.y());
+                }
+                arrowEnd = frameCenter + unit * std::max(0.0, t);
+            }
+        }
+        painter.drawLine(frameCenter, arrowEnd);
+    }
+
+    QStringList lines;
+
+    if (!m_coarseDriftOverlay.statusText.isEmpty()) {
+        lines << m_coarseDriftOverlay.statusText;
+    }
+
+    lines << QStringLiteral(
+                 "候选 %1 | 活动轨迹 %2 | 已拟合 %3 | 可用轨迹 %4/%5")
+                 .arg(m_coarseDriftOverlay.detectedCandidateCount)
+                 .arg(m_coarseDriftOverlay.activeTrackCount)
+                 .arg(m_coarseDriftOverlay.fittedTrackCount)
+                 .arg(m_coarseDriftOverlay.usableTrackCount)
+                 .arg(m_coarseDriftOverlay.requiredTrackCount);
+
+    lines << QStringLiteral(
+                 "拟合速度 %1 px/s | 求解速度 %2 px/s | 圆心RMS %3 px")
+                 .arg(m_coarseDriftOverlay.medianFittedSpeedPxSec,
+                      0,
+                      'f',
+                      4)
+                 .arg(m_coarseDriftOverlay.medianSpeedPxSec,
+                      0,
+                      'f',
+                      4)
+                 .arg(m_coarseDriftOverlay.centerResidualRmsPx,
+                      0,
+                      'f',
+                      1);
+
+    if (!m_coarseDriftOverlay.diagnosticText.isEmpty()) {
+        lines << m_coarseDriftOverlay.diagnosticText;
+    }
+
+    painter.setFont(QFont("Microsoft YaHei", 9));
+    painter.setPen(m_coarseDriftOverlay.valid
+                       ? QColor(170, 255, 190)
+                       : QColor(255, 210, 90));
+
+    const QRectF textRect =
+        imageRect.adjusted(12.0, 70.0, -12.0, -12.0);
+
+    painter.drawText(textRect,
+                     Qt::AlignLeft |
+                         Qt::AlignTop |
+                         Qt::TextWordWrap,
+                     lines.join(QLatin1Char('\n')));
+
+    painter.restore();
 }
 
 void FullFrameCanvas::drawScaleBar(QPainter& painter)
@@ -362,24 +722,7 @@ void RoiStarCanvas::drawImage(QPainter& painter)
                               static_cast<int>(rgb.step), QImage::Format_RGB888)
                            .copy();
         } else if (m_roiImage.channels() == 1) {
-            cv::Mat gray;
-            if (m_roiImage.type() == CV_64F) {
-                gray = m_roiImage;
-            } else {
-                m_roiImage.convertTo(gray, CV_64F);
-            }
-
-            cv::Mat display;
-            double minVal = 0.0;
-            double maxVal = 0.0;
-            cv::minMaxLoc(gray, &minVal, &maxVal);
-            if (maxVal > minVal) {
-                gray.convertTo(display, CV_8U, 255.0 / (maxVal - minVal),
-                               -255.0 * minVal / (maxVal - minVal));
-            } else {
-                display = cv::Mat(gray.size(), CV_8U, cv::Scalar(128));
-            }
-
+            const cv::Mat display = makeDisplayGray8(m_roiImage);
             m_qimage = QImage(display.data, display.cols, display.rows,
                               static_cast<int>(display.step), QImage::Format_Grayscale8)
                            .copy();
@@ -476,6 +819,8 @@ void RoiStarCanvas::mouseMoveEvent(QMouseEvent* event)
             value = m_roiImage.at<double>(py, px);
         } else if (m_roiImage.type() == CV_8U) {
             value = m_roiImage.at<uchar>(py, px);
+        } else if (m_roiImage.type() == CV_16U) {
+            value = m_roiImage.at<quint16>(py, px);
         }
         setToolTip(QString("(%1, %2) = %3").arg(px).arg(py).arg(value, 0, 'f', 1));
     }

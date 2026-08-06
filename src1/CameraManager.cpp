@@ -4,9 +4,13 @@
 #include <QDateTime>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 
 namespace {
+constexpr quint64 kFrameIdWrapModulo = 65536;
+constexpr quint64 kFrameIdWrapBackstepThreshold = kFrameIdWrapModulo / 2;
+
 qint64 safeIncrement(qint64 increment)
 {
     return increment > 0 ? increment : 1;
@@ -39,6 +43,58 @@ bool setEnumIfWritable(CGXFeatureControlPointer& fc, const char* nodeName, const
     CEnumFeaturePointer feature = fc->GetEnumFeature(nodeName);
     feature->SetValue(value);
     return true;
+}
+
+QString readEnumIfReadable(CGXFeatureControlPointer& fc, const char* nodeName)
+{
+    if (!isFeatureReadable(fc, nodeName)) {
+        return QString();
+    }
+    CEnumFeaturePointer feature = fc->GetEnumFeature(nodeName);
+    const GxIAPICPP::gxstring value = feature->GetValue();
+    return QString::fromLatin1(value.c_str());
+}
+
+bool is16BitMonoPixelFormat(GX_PIXEL_FORMAT_ENTRY pixelFormat)
+{
+    return pixelFormat == GX_PIXEL_FORMAT_MONO10 ||
+           pixelFormat == GX_PIXEL_FORMAT_MONO12 ||
+           pixelFormat == GX_PIXEL_FORMAT_MONO16;
+}
+
+int cameraFrameBitDepth(GX_PIXEL_FORMAT_ENTRY pixelFormat)
+{
+    switch (pixelFormat) {
+    case GX_PIXEL_FORMAT_MONO8:
+    case GX_PIXEL_FORMAT_BAYER_RG8:
+    case GX_PIXEL_FORMAT_BAYER_GB8:
+    case GX_PIXEL_FORMAT_BAYER_GR8:
+    case GX_PIXEL_FORMAT_BAYER_BG8:
+        return 8;
+    case GX_PIXEL_FORMAT_MONO10:
+        return 10;
+    case GX_PIXEL_FORMAT_MONO12:
+        return 12;
+    case GX_PIXEL_FORMAT_MONO16:
+        return 16;
+    default:
+        return 8;
+    }
+}
+
+double cameraFrameMaxPixelValue(GX_PIXEL_FORMAT_ENTRY pixelFormat)
+{
+    switch (cameraFrameBitDepth(pixelFormat)) {
+    case 10:
+        return 1023.0;
+    case 12:
+        return 4095.0;
+    case 16:
+        return 65535.0;
+    case 8:
+    default:
+        return 255.0;
+    }
 }
 
 RoiAxisRange readIntRangeChecked(CGXFeatureControlPointer& fc, const char* nodeName)
@@ -75,6 +131,26 @@ CameraManager::CameraManager(QObject* parent)
 CameraManager::~CameraManager()
 {
     uninit();
+}
+
+void CameraManager::resetFrameIdTracking(CameraData& camera)
+{
+    camera.hasFrameIdTracking = false;
+    camera.lastRawFrameId = 0;
+    camera.frameIdWrapOffset = 0;
+}
+
+quint64 CameraManager::extendWrappingFrameId(CameraData& camera, quint64 rawFrameId)
+{
+    if (camera.hasFrameIdTracking &&
+        rawFrameId < camera.lastRawFrameId &&
+        camera.lastRawFrameId - rawFrameId > kFrameIdWrapBackstepThreshold) {
+        camera.frameIdWrapOffset += kFrameIdWrapModulo;
+    }
+
+    camera.hasFrameIdTracking = true;
+    camera.lastRawFrameId = rawFrameId;
+    return camera.frameIdWrapOffset + rawFrameId + 1;
 }
 
 bool CameraManager::init()
@@ -224,6 +300,28 @@ bool CameraManager::openDevice(int index)
         camera.device = IGXFactory::GetInstance().OpenDeviceBySN(sn, GX_ACCESS_EXCLUSIVE);
         camera.remoteFeatureControl = camera.device->GetRemoteFeatureControl();
         camera.stream = camera.device->OpenStream(0);
+
+        bool mono12Set = false;
+        try {
+            mono12Set = setEnumIfWritable(camera.remoteFeatureControl, "PixelFormat", "Mono12");
+        } catch (...) {
+            mono12Set = false;
+        }
+        QString pixelFormatValue;
+        try {
+            pixelFormatValue = readEnumIfReadable(camera.remoteFeatureControl, "PixelFormat");
+        } catch (...) {
+            pixelFormatValue.clear();
+        }
+        if (!mono12Set || (!pixelFormatValue.isEmpty() && pixelFormatValue != QStringLiteral("Mono12"))) {
+            emit cameraError(index,
+                             -1,
+                             QStringLiteral("相机%1 PixelFormat 未确认到 Mono12，当前值: %2")
+                                 .arg(index + 1)
+                                 .arg(pixelFormatValue.isEmpty()
+                                          ? QStringLiteral("unknown")
+                                          : pixelFormatValue));
+        }
 
         // For GigE cameras, negotiate a stable packet size before streaming.
         // Without this, dual-camera acquisition can degrade into one camera
@@ -446,6 +544,7 @@ bool CameraManager::startAcquisition(int index)
 
         {
             QMutexLocker stateLocker(&camera.stateMutex);
+            resetFrameIdTracking(camera);
             camera.isStreaming = true;
         }
 
@@ -957,20 +1056,15 @@ bool CameraManager::pauseForRoiUpdate(int index, RoiUpdatePauseState* pauseState
             return false;
         }
 
-        const bool roiWritableNow =
-            isFeatureWritable(camera.remoteFeatureControl, "OffsetX") &&
-            isFeatureWritable(camera.remoteFeatureControl, "OffsetY") &&
-            isFeatureWritable(camera.remoteFeatureControl, "Width") &&
-            isFeatureWritable(camera.remoteFeatureControl, "Height");
-        if (roiWritableNow) {
-            return true;
-        }
-
         if (camera.isStreaming) {
             camera.remoteFeatureControl->GetCommandFeature("AcquisitionStop")->Execute();
             camera.isStreaming = false;
             if (pauseState) {
                 pauseState->acquisitionStopped = true;
+            }
+            camera.stream->StopGrab();
+            if (pauseState) {
+                pauseState->streamStopped = true;
             }
         }
 
@@ -978,10 +1072,7 @@ bool CameraManager::pauseForRoiUpdate(int index, RoiUpdatePauseState* pauseState
             !isFeatureWritable(camera.remoteFeatureControl, "OffsetY") ||
             !isFeatureWritable(camera.remoteFeatureControl, "Width") ||
             !isFeatureWritable(camera.remoteFeatureControl, "Height")) {
-            camera.stream->StopGrab();
-            if (pauseState) {
-                pauseState->streamStopped = true;
-            }
+            return false;
         }
         return true;
     } catch (CGalaxyException& e) {
@@ -1008,6 +1099,7 @@ bool CameraManager::resumeAfterRoiUpdate(int index, const RoiUpdatePauseState& p
             camera.stream->StartGrab();
         }
         if (pauseState.acquisitionStopped) {
+            resetFrameIdTracking(camera);
             camera.remoteFeatureControl->GetCommandFeature("AcquisitionStart")->Execute();
             camera.isStreaming = true;
         }
@@ -1241,7 +1333,7 @@ void CameraManager::onFrameCaptured(int cameraIndex, CImageDataPointer& imageDat
         const uint64_t width = imageData->GetWidth();
         const uint64_t height = imageData->GetHeight();
         const GX_PIXEL_FORMAT_ENTRY pixelFormat = imageData->GetPixelFormat();
-        const quint64 frameId = static_cast<quint64>(imageData->GetFrameID());
+        const quint64 rawFrameId = static_cast<quint64>(imageData->GetFrameID());
         const quint64 cameraTimestamp = static_cast<quint64>(imageData->GetTimeStamp());
         const qint64 receivedMs = QDateTime::currentMSecsSinceEpoch();
 
@@ -1249,6 +1341,10 @@ void CameraManager::onFrameCaptured(int cameraIndex, CImageDataPointer& imageDat
         if (pixelFormat == GX_PIXEL_FORMAT_MONO8) {
             const size_t bufSize = static_cast<size_t>(width * height);
             frame = cv::Mat(static_cast<int>(height), static_cast<int>(width), CV_8UC1);
+            std::memcpy(frame.data, imageData->GetBuffer(), bufSize);
+        } else if (is16BitMonoPixelFormat(pixelFormat)) {
+            const size_t bufSize = static_cast<size_t>(width * height * sizeof(uint16_t));
+            frame = cv::Mat(static_cast<int>(height), static_cast<int>(width), CV_16UC1);
             std::memcpy(frame.data, imageData->GetBuffer(), bufSize);
         } else if (pixelFormat == GX_PIXEL_FORMAT_BAYER_RG8 ||
                    pixelFormat == GX_PIXEL_FORMAT_BAYER_GB8 ||
@@ -1282,8 +1378,17 @@ void CameraManager::onFrameCaptured(int cameraIndex, CImageDataPointer& imageDat
             return;
         }
 
+        quint64 frameId = 0;
+        {
+            QMutexLocker stateLocker(&camera.stateMutex);
+            frameId = extendWrappingFrameId(camera, rawFrameId);
+        }
+
         CameraFrame packet;
         packet.image = frame;
+        packet.pixelFormat = pixelFormat;
+        packet.bitDepth = cameraFrameBitDepth(pixelFormat);
+        packet.maxPixelValue = cameraFrameMaxPixelValue(pixelFormat);
         packet.frameId = frameId;
         packet.cameraTimestamp = cameraTimestamp;
         packet.receivedMs = receivedMs;

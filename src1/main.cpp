@@ -10,6 +10,8 @@
 int main(int argc, char* argv[])
 {
     QApplication app(argc, argv);
+    QCoreApplication::setOrganizationName(QStringLiteral("DIMM"));
+    QCoreApplication::setApplicationName(QStringLiteral("DIMM"));
 
     qRegisterMetaType<cv::Mat>("cv::Mat");
     qRegisterMetaType<CameraFrame>("CameraFrame");
@@ -451,6 +453,7 @@ int main(int argc, char* argv[])
 
         #cam1Card,
         #cam2Card,
+        #environmentStrip,
         #roiInfoCard,
         #statsCard,
         #r0Card,
@@ -474,7 +477,8 @@ int main(int argc, char* argv[])
         }
 
         #lblCam1Name,
-        #lblCam2Name {
+        #lblCam2Name,
+        #lblEnvironmentName {
             color: #f4f8fd;
             font-size: 12px;
             font-weight: 700;
@@ -482,6 +486,7 @@ int main(int argc, char* argv[])
 
         #lblCam1Info,
         #lblCam2Info,
+        #lblEnvironmentInfo,
         #lblStatFrames,
         #lblStatValid,
         #lblStatLatency,
@@ -577,7 +582,7 @@ int main(int argc, char* argv[])
         }
 
         #lblFullframeLabel {
-            color: #4a5f73;
+            color: #475b6f;
             font-size: 18px;
         }
     )";
