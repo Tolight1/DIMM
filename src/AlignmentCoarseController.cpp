@@ -10,8 +10,6 @@
 
 using PolarisDetectionPipeline::InitialStarCandidate;
 
-namespace {
-
 class AlignmentCoarseWorker : public QObject {
     Q_OBJECT
 
@@ -134,8 +132,6 @@ void AlignmentCoarseWorker::cancelAll(quint64 generation)
         m_trackers[i].reset();
     }
 }
-
-} // namespace
 
 AlignmentCoarseController::AlignmentCoarseController(QObject* parent)
     : QObject(parent)

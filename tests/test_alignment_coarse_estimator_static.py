@@ -52,5 +52,11 @@ class AlignmentCoarseEstimatorStaticTest(unittest.TestCase):
             self.assertIn(token, header)
             self.assertIn(token, cpp)
 
+    def test_estimator_uses_same_type_for_track_count_max(self):
+        cpp = read("src/AlignmentCoarseEstimator.cpp")
+
+        self.assertIn("std::max<qsizetype>(1, tracks.size())", cpp)
+        self.assertNotIn("std::max(1, tracks.size())", cpp)
+
 if __name__ == "__main__":
     unittest.main()

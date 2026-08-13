@@ -11,19 +11,18 @@ struct ConfigApplicationCallbacks {
     std::function<void(int backgroundKernelSize,
                        double backgroundSigmaMultiplier,
                        int centroidMode,
-                       int peakKernelMethod,
                        int peakKernelRadiusPx,
-                       double strongHotPixelExcessDn)> applyProcessing;
+                       double strongHotPixelExcessDn,
+                       int r0HistoryWindowFrames)> applyProcessing;
     std::function<void(double thresholdPx,
                        int requiredFrames,
                        qint64 cooldownMs,
                        double minimumShiftPx)> applyRoiRecentering;
-    std::function<void(double thresholdAbsolute,
-                       double sigmaThreshold,
+    std::function<void(double sigmaThreshold,
                        double peakFraction,
-                       double minimumIntensity,
                        int minArea,
-                       int maxArea)> applyFullFrameStarDetection;
+                       int maxArea,
+                       int connectivity)> applyFullFrameStarDetection;
     std::function<void(bool enabled,
                        QString camera0MaskPath,
                        QString camera0ExcessPath,
@@ -64,6 +63,8 @@ struct ConfigApplicationCallbacks {
 };
 
 namespace ConfigApplicationController {
+ConfigApplicationCallbacks callbacksForChanges(const ConfigApplicationCallbacks& callbacks,
+                                                const ConfigChangeSet& changes);
 void applyPreValidationConfig(const AppConfig& config,
                               const ConfigApplicationCallbacks& callbacks);
 void applyValidatedConfig(const AppConfig& config,

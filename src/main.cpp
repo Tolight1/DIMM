@@ -2,176 +2,588 @@
 
 #include <QApplication>
 #include <QMetaType>
+
 #include <opencv2/opencv.hpp>
+
 #pragma comment(lib, "user32.lib")
 
 int main(int argc, char* argv[])
 {
     QApplication app(argc, argv);
+    QCoreApplication::setOrganizationName(QStringLiteral("DIMM"));
+    QCoreApplication::setApplicationName(QStringLiteral("DIMM"));
 
-    // 注册元类型，使跨线程信号传递正常工作
     qRegisterMetaType<cv::Mat>("cv::Mat");
+    qRegisterMetaType<CameraFrame>("CameraFrame");
     qRegisterMetaType<RoiRect>("RoiRect");
     qRegisterMetaType<CentroidResult>("CentroidResult");
 
-    // 全局暗色主题样式表
     QString globalStyle = R"(
-        * { font-family: "Microsoft YaHei", "Segoe UI", Arial; }
-        QWidget { background-color: #1a1a2e; color: #e0e0e0; }
-        QMainWindow { background-color: #1a1a2e; }
-        QLabel { color: #e0e0e0; }
-        QFrame { color: #e0e0e0; }
-
-        /* 菜单栏 */
-        QMenuBar { background-color: #2d2d44; border-bottom: 1px solid #3a3a5a; color: #ccc; }
-        QMenuBar::item { padding: 4px 12px; color: #ccc; }
-        QMenuBar::item:selected { background-color: #3a3a5a; color: #fff; }
-        QMenu { background-color: #2d2d44; border: 1px solid #3a3a5a; }
-        QMenu::item { padding: 6px 16px; color: #ccc; }
-        QMenu::item:selected { background-color: #4a4a6a; color: #fff; }
-        QMenu::separator { height: 1px; background: #3a3a5a; }
-
-        /* 工具栏 */
-        QToolBar { background-color: #252540; border-bottom: 1px solid #3a3a5a; }
-        QToolButton { padding: 5px 14px; color: #ccc; background: #3a3a5a; border: 1px solid #4a4a6a; border-radius: 4px; }
-        QToolButton:hover { background: #4a4a6a; color: #fff; }
-
-        /* 按钮 */
-        QPushButton { padding: 5px 14px; color: #ccc; background: #3a3a5a; border: 1px solid #4a4a6a; border-radius: 4px; }
-        QPushButton:hover { background: #4a4a6a; color: #fff; }
-
-        /* 状态栏 */
-        QStatusBar { background-color: #252540; border-top: 1px solid #3a3a5a; color: #888; }
-        QStatusBar QLabel { color: #888; }
-
-        /* 分割器 */
-        QSplitter::handle { background-color: #3a3a5a; height: 3px; }
-        QSplitter::handle:hover { background-color: #4fc3f7; }
-
-        /* 表格 */
-        QTableWidget { background-color: #111; border: 1px solid #3a3a5a; color: #ccc; gridline-color: #2a2a4a; selection-background-color: rgba(79, 195, 247, 0.3); }
-        QTableWidget::item { color: #ccc; padding: 4px 8px; }
-        QTableWidget::item:selected { background-color: rgba(79, 195, 247, 0.3); }
-        QHeaderView::section { background-color: #2a2a4a; color: #4fc3f7; border: 1px solid #3a3a5a; padding: 6px; }
-
-        /* 滚动条 */
-        QScrollBar:vertical { background: #1a1a2e; width: 10px; }
-        QScrollBar::handle:vertical { background: #3a3a5a; border-radius: 5px; min-height: 30px; }
-        QScrollBar::handle:vertical:hover { background: #4fc3f7; }
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
-        QScrollBar:horizontal { background: #1a1a2e; height: 10px; }
-        QScrollBar::handle:horizontal { background: #3a3a5a; border-radius: 5px; min-width: 30px; }
-        QScrollBar::handle:horizontal:hover { background: #4fc3f7; }
-        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
-        QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }
-
-        /* 对话框 */
-        QDialog { background-color: #1a1a2e; color: #e0e0e0; }
-        QGroupBox { border: 1px solid #3a3a5a; border-radius: 6px; margin-top: 10px; padding-top: 15px; color: #4fc3f7; font-weight: bold; }
-        QGroupBox::title { subcontrol-origin: margin; left: 10px; }
-        QLineEdit { background: #111; border: 1px solid #3a3a5a; padding: 6px; color: #fff; border-radius: 4px; }
-        QDoubleSpinBox { background: #111; border: 1px solid #3a3a5a; padding: 6px; color: #fff; border-radius: 4px; }
-        QSpinBox { background: #111; border: 1px solid #3a3a5a; padding: 6px; color: #fff; border-radius: 4px; }
-
-        /* 单选/复选 */
-        QRadioButton { color: #ccc; spacing: 6px; }
-        QRadioButton::indicator { width: 16px; height: 16px; border-radius: 8px; border: 2px solid #555; }
-        QRadioButton::indicator:unchecked { background: transparent; }
-        QRadioButton::indicator:checked { border-color: #4fc3f7; background: #4fc3f7; }
-        QCheckBox { color: #ccc; spacing: 6px; }
-        QCheckBox::indicator { width: 16px; height: 16px; border-radius: 3px; border: 2px solid #555; }
-        QCheckBox::indicator:unchecked { background: transparent; }
-        QCheckBox::indicator:checked { border-color: #4fc3f7; background: #4fc3f7; }
-
-        /* Tab */
-        QTabBar::tab { padding: 10px 20px; color: #888; background: #1e1e30; border-bottom: 2px solid transparent; }
-        QTabBar::tab:selected { color: #4fc3f7; border-bottom-color: #4fc3f7; background: #252540; font-weight: bold; }
-        QTabWidget::pane { border: none; background: #1a1a2e; }
-
-        /* 左侧面板 */
-        #leftPanel { background-color: #1e1e30; border-right: 1px solid #3a3a5a; }
-        #cameraSection, #roiSection, #paramsSection, #statsSection {
-            background-color: #1a1a2e; border-bottom: 1px solid #2a2a4a; padding: 6px;
-        }
-        #cam1Card, #cam2Card {
-            background-color: #252540; border-radius: 6px; padding: 8px;
-            border: 1px solid #3a3a5a;
-        }
-        #roiInfoCard, #statsCard {
-            background-color: #252540; border-radius: 6px; padding: 8px;
-            border: 1px solid #3a3a5a;
-        }
-        #r0Card, #seeingCard, #thetaCard, #tauCard {
-            background-color: #252540; border-radius: 6px; padding: 4px;
-            border: 1px solid #3a3a5a;
+        * {
+            font-family: "Microsoft YaHei", "Segoe UI", Arial;
+            color: #e6eef8;
+            outline: none;
         }
 
-        /* 左侧面板标题 */
-        #lblCameraTitle, #lblROITitle, #lblParamsTitle, #lblStatsTitle {
-            color: #4fc3f7; font-size: 11px; font-weight: bold;
+        QWidget {
+            background-color: #08111f;
+            color: #e6eef8;
+            selection-background-color: rgba(86, 212, 255, 0.24);
+            selection-color: #f7fbff;
         }
 
-        /* 相机卡片 */
-        #lblCam1Name, #lblCam2Name { color: #fff; font-size: 12px; font-weight: bold; }
-        #lblCam1Status, #lblCam2Status { color: #8bc34a; font-size: 10px; }
-        #lblCam1Info, #lblCam2Info { color: #aaa; font-size: 11px; }
-
-        /* ROI信息 */
-        #lblROIX, #lblROIY, #lblROIW, #lblROIH { color: #888; }
-        #lblROIXValue, #lblROIYValue, #lblROIWValue, #lblROIHValue { color: #fff; }
-        #lblROITimeLabel { color: #888; }
-        #lblROITimeCurrent { color: #ff9800; font-size: 13px; font-weight: bold; }
-        #lblROITimeNext { color: #888; font-size: 10px; }
-
-        /* 大气参数卡片 */
-        #lblR0Label, #lblSeeingLabel, #lblThetaLabel, #lblTauLabel { color: #888; font-size: 10px; }
-        #lblR0Unit, #lblSeeingUnit, #lblThetaUnit, #lblTauUnit { color: #888; font-size: 10px; }
-        #lblR0Value { color: #4fc3f7; font-size: 22px; font-weight: bold; }
-        #lblSeeingValue { color: #8bc34a; font-size: 22px; font-weight: bold; }
-        #lblThetaValue { color: #ff9800; font-size: 22px; font-weight: bold; }
-        #lblTauValue { color: #e91e63; font-size: 22px; font-weight: bold; }
-
-        /* 统计信息 */
-        #lblStatFrames, #lblStatValid, #lblStatLatency, #lblStatWindow { color: #aaa; font-size: 11px; }
-
-        /* Canvas区域 */
-        #previewCanvas, #r0ChartCanvas, #seeingChartCanvas,
-        #cam1ROICanvas, #cam2ROICanvas, #roiMapCanvas { background-color: #111; border-radius: 4px; }
-
-        /* 底部工具栏 */
-        #bottomToolbar { background-color: #1e1e30; border-top: 1px solid #2a2a4a; }
-
-        /* 标题 */
-        #lblFullframeTitle { color: #4fc3f7; font-size: 12px; font-weight: bold; }
-        #lblR0ChartTitle { color: #4fc3f7; }
-        #lblSeeingChartTitle { color: #8bc34a; }
-        #lblCam1ROITitle { color: #4fc3f7; font-weight: bold; }
-        #lblCam2ROITitle { color: #8bc34a; font-weight: bold; }
-
-        /* 全画幅标签 */
-        #lblFullframeLabel { color: #333; font-size: 18px; }
-        #lblCam1ROICoord { color: #4fc3f7; }
-        #lblCam2ROICoord { color: #8bc34a; }
-
-        /* 图表区域 */
-        #r0ChartCanvas, #seeingChartCanvas {
-            background-color: #111; border-radius: 4px; min-height: 80px;
+        QMainWindow, QDialog {
+            background-color: #08111f;
         }
-        #r0ChartPanel, #seeingChartPanel {
-            background-color: #1a1a2e;
+
+        QLabel {
+            background: transparent;
+            color: #d8e4f2;
         }
-        #chartsArea { background-color: #1a1a2e; border-top: 1px solid #3a3a5a; }
 
-        /* 全画幅区域 */
-        #fullframeArea { background-color: #1a1a2e; border: none; margin: 0; padding: 0; }
-        #previewCanvas { background-color: #111; border-radius: 4px; }
+        QFrame {
+            color: #d8e4f2;
+        }
 
-        /* ROI星图区域 */
-        #roiImagesArea { background-color: #1a1a2e; border-top: 1px solid #3a3a5a; }
-        #cam1ROIPanel, #cam2ROIPanel { background-color: #1a1a2e; }
-        #cam1ROICanvas, #cam2ROICanvas {
-            background-color: #111; border-radius: 4px; min-width: 120px; min-height: 120px;
+        QToolTip {
+            background-color: #122239;
+            color: #eef7ff;
+            border: 1px solid #2f5674;
+            border-radius: 6px;
+            padding: 6px 8px;
+        }
+
+        QMenuBar {
+            background-color: #101c30;
+            border-bottom: 1px solid #20344d;
+            color: #d5e3f3;
+            padding: 2px 6px;
+        }
+
+        QMenuBar::item {
+            padding: 6px 12px;
+            border-radius: 6px;
+            background: transparent;
+        }
+
+        QMenuBar::item:selected {
+            background-color: rgba(86, 212, 255, 0.14);
+            color: #ffffff;
+        }
+
+        QMenuBar::item:pressed {
+            background-color: rgba(86, 212, 255, 0.22);
+        }
+
+        QMenu {
+            background-color: #101d31;
+            border: 1px solid #223954;
+            border-radius: 10px;
+            padding: 8px;
+        }
+
+        QMenu::item {
+            padding: 7px 16px;
+            border-radius: 6px;
+            color: #d6e5f4;
+        }
+
+        QMenu::item:selected {
+            background-color: rgba(86, 212, 255, 0.16);
+            color: #ffffff;
+        }
+
+        QMenu::separator {
+            height: 1px;
+            margin: 6px 8px;
+            background: #22354c;
+        }
+
+        QToolBar {
+            background-color: #0d1829;
+            border-bottom: 1px solid #1f324a;
+            spacing: 8px;
+            padding: 6px 8px;
+        }
+
+        QPushButton,
+        QToolButton,
+        QComboBox,
+        QLineEdit,
+        QSpinBox,
+        QDoubleSpinBox {
+            min-height: 18px;
+            border-radius: 9px;
+            padding: 7px 12px;
+            border: 1px solid #29425f;
+        }
+
+        QPushButton,
+        QToolButton {
+            background-color: #16253b;
+            color: #dfeaf7;
+        }
+
+        QPushButton:hover,
+        QToolButton:hover {
+            background-color: #1b2f49;
+            border-color: #3d6788;
+            color: #ffffff;
+        }
+
+        QPushButton:pressed,
+        QToolButton:pressed,
+        QPushButton:checked,
+        QToolButton:checked {
+            background-color: #20496b;
+            border-color: #58d3ff;
+            color: #f9fdff;
+        }
+
+        QPushButton:disabled,
+        QToolButton:disabled,
+        QLineEdit:disabled,
+        QSpinBox:disabled,
+        QDoubleSpinBox:disabled,
+        QComboBox:disabled,
+        QRadioButton:disabled,
+        QCheckBox:disabled {
+            background-color: #0d1727;
+            color: #66788d;
+            border-color: #1b2a3d;
+        }
+
+        QDialogButtonBox QPushButton {
+            min-width: 92px;
+            padding: 8px 16px;
+        }
+
+        QPushButton[role="primary"] {
+            background-color: #1e4c72;
+            border: 1px solid #56d4ff;
+            color: #f5fbff;
+        }
+
+        QPushButton[role="primary"]:hover {
+            background-color: #255a86;
+            border-color: #7de1ff;
+        }
+
+        QPushButton[role="primary"]:pressed {
+            background-color: #173d5b;
+            border-color: #4fcfff;
+        }
+
+        QPushButton[role="secondary"] {
+            background-color: #111d2f;
+            border: 1px solid #2a415c;
+            color: #b8c8d8;
+        }
+
+        QPushButton[role="secondary"]:hover {
+            background-color: #16253b;
+            border-color: #3b5e80;
+            color: #e9f2fb;
+        }
+
+        QLineEdit,
+        QSpinBox,
+        QDoubleSpinBox,
+        QComboBox {
+            background-color: #09111d;
+            color: #f3f8ff;
+            selection-background-color: rgba(86, 212, 255, 0.28);
+        }
+
+        QLineEdit:hover,
+        QSpinBox:hover,
+        QDoubleSpinBox:hover,
+        QComboBox:hover {
+            border-color: #3a607e;
+            background-color: #0c1625;
+        }
+
+        QLineEdit:focus,
+        QSpinBox:focus,
+        QDoubleSpinBox:focus,
+        QComboBox:focus {
+            border: 1px solid #56d4ff;
+            background-color: #0d1b2d;
+            color: #ffffff;
+        }
+
+        QComboBox {
+            padding-right: 34px;
+        }
+
+        QComboBox::drop-down {
+            width: 28px;
+            border: none;
+            background: transparent;
+        }
+
+        QComboBox::down-arrow {
+            width: 0px;
+            height: 0px;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-top: 7px solid #9bc7dd;
+            margin-right: 8px;
+        }
+
+        QComboBox QAbstractItemView {
+            background-color: #0f1d31;
+            color: #e7f1fb;
+            border: 1px solid #28435f;
+            border-radius: 8px;
+            padding: 4px;
+            selection-background-color: rgba(86, 212, 255, 0.22);
+            selection-color: #ffffff;
+            outline: none;
+        }
+
+        QAbstractItemView::item {
+            min-height: 24px;
+            padding: 4px 10px;
+            border-radius: 6px;
+        }
+
+        QAbstractItemView::item:hover {
+            background-color: rgba(86, 212, 255, 0.10);
+        }
+
+        QRadioButton,
+        QCheckBox {
+            spacing: 8px;
+            color: #d3e0ef;
+            background: transparent;
+        }
+
+        QRadioButton::indicator,
+        QCheckBox::indicator {
+            background-color: #0b1423;
+            border: 2px solid #466179;
+        }
+
+        QRadioButton::indicator {
+            width: 18px;
+            height: 18px;
+            border-radius: 9px;
+        }
+
+        QCheckBox::indicator {
+            width: 18px;
+            height: 18px;
+            border-radius: 5px;
+        }
+
+        QRadioButton::indicator:hover,
+        QCheckBox::indicator:hover {
+            border-color: #62d6ff;
+        }
+
+        QRadioButton::indicator:checked,
+        QCheckBox::indicator:checked {
+            background-color: #56d4ff;
+            border-color: #56d4ff;
+        }
+
+        QRadioButton::indicator:checked {
+            border: 5px solid #56d4ff;
+            background-color: #08111f;
+        }
+
+        QCheckBox::indicator:checked {
+            image: none;
+        }
+
+        QGroupBox {
+            margin-top: 18px;
+            padding: 18px 16px 14px 16px;
+            border: 1px solid #22384f;
+            border-radius: 14px;
+            background-color: #101b2d;
+            color: #56d4ff;
+            font-weight: 600;
+        }
+
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 14px;
+            padding: 0 8px;
+            background-color: #101b2d;
+        }
+
+        QTabWidget::pane {
+            border: none;
+            background: #09111f;
+        }
+
+        QTabBar::tab {
+            background-color: #101c2f;
+            color: #8ea5bb;
+            padding: 11px 20px;
+            margin-right: 6px;
+            border-top-left-radius: 10px;
+            border-top-right-radius: 10px;
+            border: 1px solid transparent;
+            border-bottom: 2px solid transparent;
+        }
+
+        QTabBar::tab:hover {
+            color: #dff3ff;
+            background-color: #132339;
+        }
+
+        QTabBar::tab:selected {
+            color: #59d5ff;
+            background-color: #152740;
+            border-color: #21374d;
+            border-bottom: 2px solid #56d4ff;
+            font-weight: 700;
+        }
+
+        QStatusBar {
+            background-color: #0e1a2b;
+            border-top: 1px solid #1f3249;
+        }
+
+        QStatusBar QLabel {
+            color: #88a0b6;
+            padding: 0 6px;
+            background: transparent;
+        }
+
+        QSplitter::handle {
+            background-color: #16253a;
+        }
+
+        QSplitter::handle:hover {
+            background-color: #244462;
+        }
+
+        QTableWidget {
+            background-color: #0b1422;
+            alternate-background-color: #0e1727;
+            border: 1px solid #23384f;
+            border-radius: 10px;
+            color: #dce7f3;
+            gridline-color: #1d3045;
+            outline: none;
+        }
+
+        QTableWidget::item {
+            padding: 6px 8px;
+            border: none;
+        }
+
+        QTableWidget::item:selected {
+            background-color: rgba(86, 212, 255, 0.20);
+            color: #ffffff;
+        }
+
+        QHeaderView::section {
+            background-color: #132238;
+            color: #62d9ff;
+            padding: 8px 10px;
+            border: none;
+            border-right: 1px solid #1f344c;
+            border-bottom: 1px solid #1f344c;
+            font-weight: 600;
+        }
+
+        QScrollArea {
+            border: none;
+            background: transparent;
+        }
+
+        QScrollBar:vertical {
+            background: transparent;
+            width: 12px;
+            margin: 6px 2px 6px 2px;
+        }
+
+        QScrollBar:horizontal {
+            background: transparent;
+            height: 12px;
+            margin: 2px 6px 2px 6px;
+        }
+
+        QScrollBar::handle:vertical,
+        QScrollBar::handle:horizontal {
+            background: #22384e;
+            border-radius: 5px;
+            min-height: 28px;
+            min-width: 28px;
+        }
+
+        QScrollBar::handle:vertical:hover,
+        QScrollBar::handle:horizontal:hover {
+            background: #376b90;
+        }
+
+        QScrollBar::handle:vertical:pressed,
+        QScrollBar::handle:horizontal:pressed {
+            background: #56d4ff;
+        }
+
+        QScrollBar::add-line,
+        QScrollBar::sub-line,
+        QScrollBar::add-page,
+        QScrollBar::sub-page {
+            background: transparent;
+            border: none;
+            width: 0px;
+            height: 0px;
+        }
+
+        #leftPanel {
+            background-color: #0d182a;
+            border-right: 1px solid #1e3349;
+        }
+
+        #cameraSection,
+        #roiSection,
+        #paramsSection,
+        #statsSection {
+            background-color: #0d182a;
+            border-bottom: 1px solid #1a2b3f;
+            padding: 8px 6px;
+        }
+
+        #cam1Card,
+        #cam2Card,
+        #environmentStrip,
+        #roiInfoCard,
+        #statsCard,
+        #r0Card,
+        #seeingCard,
+        #thetaCard,
+        #tauCard {
+            background-color: #152338;
+            border-radius: 12px;
+            border: 1px solid #243b55;
+        }
+
+        #lblCameraTitle,
+        #lblROITitle,
+        #lblParamsTitle,
+        #lblStatsTitle,
+        #lblFullframeTitle,
+        #lblCam1ROITitle,
+        #lblCam2ROITitle {
+            color: #5cd7ff;
+            font-weight: 700;
+        }
+
+        #lblCam1Name,
+        #lblCam2Name,
+        #lblEnvironmentName {
+            color: #f4f8fd;
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        #lblCam1Info,
+        #lblCam2Info,
+        #lblEnvironmentInfo,
+        #lblStatFrames,
+        #lblStatValid,
+        #lblStatLatency,
+        #lblStatWindow,
+        #lblROIX,
+        #lblROIY,
+        #lblROIW,
+        #lblROIH,
+        #lblROITimeLabel,
+        #lblROITimeNext,
+        #lblR0Label,
+        #lblSeeingLabel,
+        #lblThetaLabel,
+        #lblTauLabel,
+        #lblR0Unit,
+        #lblSeeingUnit,
+        #lblThetaUnit,
+        #lblTauUnit {
+            color: #8ea5bb;
+        }
+
+        #lblROIXValue,
+        #lblROIYValue,
+        #lblROIWValue,
+        #lblROIHValue,
+        #lblCam1ROICoord,
+        #lblCam2ROICoord {
+            color: #eff7ff;
+            font-weight: 600;
+        }
+
+        #lblROITimeCurrent {
+            color: #ffbe55;
+            font-size: 13px;
+            font-weight: 700;
+        }
+
+        #lblR0Value {
+            color: #56d4ff;
+            font-size: 22px;
+            font-weight: 700;
+        }
+
+        #lblSeeingValue {
+            color: #95dd6b;
+            font-size: 22px;
+            font-weight: 700;
+        }
+
+        #lblThetaValue {
+            color: #ffb347;
+            font-size: 22px;
+            font-weight: 700;
+        }
+
+        #lblTauValue {
+            color: #ff6aa7;
+            font-size: 22px;
+            font-weight: 700;
+        }
+
+        #previewCanvas,
+        #r0ChartCanvas,
+        #seeingChartCanvas,
+        #cam1ROICanvas,
+        #cam2ROICanvas,
+        #roiMapCanvas {
+            background-color: #050b14;
+            border: 1px solid #1c2f44;
+            border-radius: 12px;
+        }
+
+        #r0ChartPanel,
+        #seeingChartPanel {
+            background-color: #111e31;
+            border: 1px solid #22384f;
+            border-radius: 16px;
+        }
+
+        #fullframeArea,
+        #roiImagesArea,
+        #chartsArea,
+        #bottomToolbar,
+        #cam1ROIPanel,
+        #cam2ROIPanel {
+            background-color: #09111f;
+        }
+
+        #chartsArea,
+        #roiImagesArea,
+        #bottomToolbar {
+            border-top: 1px solid #1c2f45;
+        }
+
+        #lblFullframeLabel {
+            color: #475b6f;
+            font-size: 18px;
         }
     )";
     app.setStyleSheet(globalStyle);

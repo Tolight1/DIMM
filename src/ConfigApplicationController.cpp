@@ -2,6 +2,58 @@
 
 namespace ConfigApplicationController {
 
+ConfigApplicationCallbacks callbacksForChanges(const ConfigApplicationCallbacks& callbacks,
+                                                const ConfigChangeSet& changes)
+{
+    ConfigApplicationCallbacks filtered = callbacks;
+    if (!changes.camera) {
+        filtered.applyCamera = nullptr;
+    }
+    if (!changes.autoExposure) {
+        filtered.applyAutoExposure = nullptr;
+    }
+    if (!changes.trigger) {
+        filtered.applyTriggerMode = nullptr;
+    }
+    if (!changes.processing) {
+        filtered.applyProcessing = nullptr;
+    }
+    if (!changes.roiRecentering) {
+        filtered.applyRoiRecentering = nullptr;
+    }
+    if (!changes.fullFrameStarDetection) {
+        filtered.applyFullFrameStarDetection = nullptr;
+    }
+    if (!changes.hotPixel) {
+        filtered.applyHotPixelTemplates = nullptr;
+    }
+    if (!changes.optics) {
+        filtered.applyOptics = nullptr;
+    }
+    if (!changes.alignment) {
+        filtered.applyAlignment = nullptr;
+    }
+    if (!changes.polarisSolver) {
+        filtered.applyPolarisSolver = nullptr;
+    }
+    if (!changes.storage) {
+        filtered.applyStorage = nullptr;
+    }
+    if (!changes.environmentSensor) {
+        filtered.applyEnvironmentSensor = nullptr;
+    }
+    if (!changes.autoAcquisition) {
+        filtered.applyAutoAcquisition = nullptr;
+    }
+    if (!changes.network) {
+        filtered.applyNetwork = nullptr;
+    }
+    if (!changes.any()) {
+        filtered.afterApply = nullptr;
+    }
+    return filtered;
+}
+
 void applyPreValidationConfig(const AppConfig& config,
                               const ConfigApplicationCallbacks& callbacks)
 {
@@ -25,9 +77,9 @@ void applyValidatedConfig(const AppConfig& config,
         callbacks.applyProcessing(config.processing.backgroundKernelSize,
                                   config.processing.backgroundSigmaMultiplier,
                                   config.processing.centroidMode,
-                                  config.processing.peakKernelMethod,
                                   config.processing.peakKernelRadiusPx,
-                                  config.processing.strongHotPixelExcessDn);
+                                  config.processing.strongHotPixelExcessDn,
+                                  config.processing.r0HistoryWindowFrames);
     }
     if (callbacks.applyRoiRecentering) {
         callbacks.applyRoiRecentering(config.roiRecentering.thresholdPx,
@@ -36,12 +88,11 @@ void applyValidatedConfig(const AppConfig& config,
                                       config.roiRecentering.minimumShiftPx);
     }
     if (callbacks.applyFullFrameStarDetection) {
-        callbacks.applyFullFrameStarDetection(config.starDetection.thresholdAbsolute,
-                                              config.starDetection.sigmaThreshold,
+        callbacks.applyFullFrameStarDetection(config.starDetection.sigmaThreshold,
                                               config.starDetection.peakFraction,
-                                              config.starDetection.minimumIntensity,
                                               config.starDetection.minArea,
-                                              config.starDetection.maxArea);
+                                              config.starDetection.maxArea,
+                                              config.starDetection.connectivity);
     }
     if (callbacks.applyHotPixelTemplates) {
         callbacks.applyHotPixelTemplates(config.hotPixel.enabled,

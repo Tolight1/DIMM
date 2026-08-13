@@ -33,6 +33,11 @@ public:
         QPointF predictedPolarisPosition;
         bool hasDetectedPolaris = false;
         QPointF detectedPolarisPosition;
+        bool hasConfirmedPolaris = false;
+        QPointF confirmedPolarisPosition;
+        bool hasSimulatedCurrentPolaris = false;
+        QPointF simulatedCurrentPolarisPosition;
+        QString simulatedCurrentPolarisLabel;
         double deviationPx = 0.0;
         double polarisNcpDistancePx = 0.0;
         double polarisNcpDistanceArcmin = 0.0;
@@ -56,12 +61,27 @@ public:
         bool selected = false;
     };
 
+    struct RoiTrajectoryOverlay {
+        bool enabled = false;
+        QVector<QPointF> points;
+        bool hasFittedCircle = false;
+        QPointF fittedCenter;
+        double fittedRadiusPx = 0.0;
+        double fittedRmsPx = 0.0;
+    };
+
     struct CoarseDriftTrackOverlay {
+        int pointCount = 0;
         QPointF startPx;
         QPointF endPx;
         QPointF velocityPxSec;
         double speedPxSec = 0.0;
+        double durationSec = 0.0;
+        double displacementPx = 0.0;
+        double fitRmsPx = 0.0;
+        bool velocityFitValid = false;
         bool usedForSolve = false;
+        QString rejectionReason;
     };
 
     struct CoarseDriftOverlay {
@@ -73,10 +93,15 @@ public:
         double offsetPx = 0.0;
         double offsetDeg = 0.0;
         double medianSpeedPxSec = 0.0;
+        double medianFittedSpeedPxSec = 0.0;
         double centerResidualRmsPx = 0.0;
         int detectedCandidateCount = 0;
+        int activeTrackCount = 0;
+        int fittedTrackCount = 0;
         int usableTrackCount = 0;
+        int requiredTrackCount = 0;
         QString statusText;
+        QString diagnosticText;
         QVector<CoarseDriftTrackOverlay> tracks;
     };
 
@@ -87,6 +112,8 @@ public:
     void setCurrentRoi(int index);
     void setAlignmentOverlay(const AlignmentOverlay& overlay);
     void clearAlignmentOverlay();
+    void setRoiTrajectoryOverlay(const RoiTrajectoryOverlay& overlay);
+    void clearRoiTrajectoryOverlay();
     void setStarCandidateOverlays(const QVector<StarCandidateOverlay>& candidates);
     void clearStarCandidateOverlays();
     void setCoarseDriftOverlay(const CoarseDriftOverlay& overlay);
@@ -111,6 +138,7 @@ private:
     QVector<RoiRect> m_rois;
     int m_currentRoiIndex = -1;
     AlignmentOverlay m_alignmentOverlay;
+    RoiTrajectoryOverlay m_roiTrajectoryOverlay;
     QVector<StarCandidateOverlay> m_starCandidateOverlays;
     CoarseDriftOverlay m_coarseDriftOverlay;
 
@@ -127,6 +155,7 @@ private:
     void clampOffset();
     void drawImage(QPainter& painter);
     void drawRoiOverlays(QPainter& painter);
+    void drawRoiTrajectoryOverlay(QPainter& painter);
     void drawStarCandidateOverlays(QPainter& painter);
     void drawAlignmentOverlay(QPainter& painter);
     void drawCoarseDriftOverlay(QPainter& painter);

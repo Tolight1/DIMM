@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-8"?>
+﻿<?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
  <class>DIMM</class>
  <widget class="QMainWindow" name="DIMM">
@@ -97,7 +97,47 @@
         <property name="spacing"><number>10</number></property>
         <item>
          <widget class="QLabel" name="lblCameraTitle">
-          <property name="text"><string>📷 相机状态</string></property>
+          <property name="text"><string>相机状态</string></property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QFrame" name="environmentStrip">
+          <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+          <layout class="QVBoxLayout" name="environmentStripLayout">
+           <property name="spacing"><number>2</number></property>
+           <property name="leftMargin"><number>10</number></property>
+           <property name="topMargin"><number>6</number></property>
+           <property name="rightMargin"><number>10</number></property>
+           <property name="bottomMargin"><number>6</number></property>
+           <item>
+            <layout class="QHBoxLayout" name="environmentHeader">
+             <property name="spacing"><number>6</number></property>
+             <item>
+              <widget class="QLabel" name="lblEnvironmentName">
+               <property name="text"><string>环境</string></property>
+              </widget>
+             </item>
+             <item>
+              <spacer name="environmentSpacer">
+               <property name="orientation"><enum>Qt::Horizontal</enum></property>
+               <property name="sizeHint" stdset="0">
+                <size><width>40</width><height>12</height></size>
+               </property>
+              </spacer>
+             </item>
+             <item>
+              <widget class="QLabel" name="lblEnvironmentStatus">
+               <property name="text"><string>未连接</string></property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblEnvironmentInfo">
+             <property name="text"><string>-- °C  |  -- %RH  |  -- hPa</string></property>
+            </widget>
+           </item>
+          </layout>
          </widget>
         </item>
         <item>
@@ -129,8 +169,7 @@
            </item>
            <item>
             <widget class="QLabel" name="lblCam1Info">
-             <property name="text"><string>序列号: KE0200060001
-帧率: 390 fps | 温度: 25.3°C</string></property>
+             <property name="text"><string>SN: KE0200060001 | 390 fps</string></property>
             </widget>
            </item>
           </layout>
@@ -165,8 +204,7 @@
            </item>
            <item>
             <widget class="QLabel" name="lblCam2Info">
-             <property name="text"><string>序列号: KE0200060002
-帧率: 389 fps | 温度: 24.8°C</string></property>
+             <property name="text"><string>SN: KE0200060002 | 389 fps</string></property>
             </widget>
            </item>
           </layout>
@@ -182,7 +220,7 @@
         <property name="spacing"><number>10</number></property>
         <item>
          <widget class="QLabel" name="lblROITitle">
-          <property name="text"><string>📐 当前ROI</string></property>
+          <property name="text"><string>当前ROI</string></property>
          </widget>
         </item>
         <item>
@@ -238,17 +276,17 @@
             <layout class="QVBoxLayout" name="roiTimeFrame">
              <item>
               <widget class="QLabel" name="lblROITimeLabel">
-               <property name="text"><string>当前时段</string></property>
+               <property name="text"><string>ROI 规则</string></property>
               </widget>
              </item>
              <item>
               <widget class="QLabel" name="lblROITimeCurrent">
-               <property name="text"><string>20:30 - 21:00</string></property>
+               <property name="text"><string>等待两路有效质心</string></property>
               </widget>
              </item>
              <item>
               <widget class="QLabel" name="lblROITimeNext">
-               <property name="text"><string>下一个ROI: 21:00</string></property>
+               <property name="text"><string>ROI 固定尺寸: 64 x 64</string></property>
               </widget>
              </item>
             </layout>
@@ -266,7 +304,7 @@
         <property name="spacing"><number>10</number></property>
         <item>
          <widget class="QLabel" name="lblParamsTitle">
-          <property name="text"><string>🌤 大气参数</string></property>
+          <property name="text"><string>大气参数</string></property>
          </widget>
         </item>
         <item>
@@ -384,7 +422,7 @@
         <property name="spacing"><number>10</number></property>
         <item>
          <widget class="QLabel" name="lblStatsTitle">
-          <property name="text"><string>📊 统计信息</string></property>
+          <property name="text"><string>统计信息</string></property>
          </widget>
         </item>
         <item>
@@ -409,6 +447,16 @@
            <item>
             <widget class="QLabel" name="lblStatWindow">
              <property name="text"><string>统计窗口: 200 帧</string></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblStatExposure">
+             <property name="text"><string>曝光: 1000 μs | AE: 关闭</string></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblStatAutoExposure">
+             <property name="text"><string>ROI峰值: --/-- | AE质量: --/--%</string></property>
             </widget>
            </item>
           </layout>
@@ -468,24 +516,6 @@
                  </widget>
                 </item>
                 <item>
-                 <widget class="QPushButton" name="btnCam1">
-                  <property name="text"><string>相机1</string></property>
-                  <property name="checkable"><bool>true</bool></property>
-                  <property name="checked"><bool>true</bool></property>
-                 </widget>
-                </item>
-                <item>
-                 <widget class="QPushButton" name="btnCam2">
-                  <property name="text"><string>相机2</string></property>
-                  <property name="checkable"><bool>true</bool></property>
-                 </widget>
-                </item>
-                <item>
-                 <widget class="QLabel" name="lblCameraIndicator">
-                  <property name="text"><string>当前: 相机1</string></property>
-                 </widget>
-                </item>
-                <item>
                  <spacer name="headerSpacer">
                   <property name="orientation"><enum>Qt::Horizontal</enum></property>
                   <property name="sizeHint" stdset="0">
@@ -512,7 +542,7 @@
                 <layout class="QVBoxLayout" name="previewCanvasLayout">
                  <item alignment="Qt::AlignCenter">
                   <widget class="QLabel" name="lblFullframeLabel">
-                   <property name="text"><string>2048 × 2048 全画幅 - 相机1</string></property>
+                   <property name="text"><string>5120 x 5120 全画幅预览 - 相机1</string></property>
                   </widget>
                  </item>
                 </layout>
@@ -543,7 +573,7 @@
              <layout class="QVBoxLayout" name="roiMapCanvasLayout">
               <item alignment="Qt::AlignCenter">
                <widget class="QLabel" name="lblROIMapLabel">
-                <property name="text"><string>星点轨迹预览 - 拖拽ROI框调整位置</string></property>
+                <property name="text"><string>ROI 固定为 64x64；启动后先全画幅定位，获得双光斑后切换双相机独立 ROI，并持续按周期刷新。</string></property>
                </widget>
               </item>
              </layout>
@@ -571,7 +601,7 @@
               <property name="bottomMargin"><number>0</number></property>
               <item>
                <widget class="QLabel" name="lblROITableTitle">
-                <property name="text"><string>ROI 时间计划表</string></property>
+                 <property name="text"><string>ROI 更新时间记录</string></property>
                </widget>
               </item>
               <item>
@@ -583,7 +613,7 @@
                  <enum>Qt::ScrollBarAlwaysOn</enum>
                 </property>
                 <column>
-                 <property name="text"><string>时段</string></property>
+                  <property name="text"><string>时段</string></property>
                  <property name="width"><number>70</number></property>
                 </column>
                 <column>
@@ -595,11 +625,11 @@
                  <property name="width"><number>60</number></property>
                 </column>
                 <column>
-                 <property name="text"><string>宽度</string></property>
+                  <property name="text"><string>宽度</string></property>
                  <property name="width"><number>60</number></property>
                 </column>
                 <column>
-                 <property name="text"><string>高度</string></property>
+                  <property name="text"><string>高度</string></property>
                  <property name="width"><number>60</number></property>
                 </column>
                </widget>
@@ -608,19 +638,19 @@
                <layout class="QHBoxLayout" name="roiButtonsLayout">
                 <item>
                  <widget class="QPushButton" name="btnAddROI">
-                  <property name="text"><string>➕ 添加</string></property>
+                  <property name="text"><string>添加</string></property>
                  </widget>
                 </item>
                 <item>
                  <widget class="QPushButton" name="btnDeleteROI">
-                  <property name="text"><string>➖ 删除</string></property>
+                  <property name="text"><string>删除</string></property>
                  </widget>
                 </item>
                </layout>
               </item>
               <item>
                <widget class="QPushButton" name="btnImportTrajectory">
-                <property name="text"><string>📁 导入轨迹文件</string></property>
+                <property name="text"><string>导入轨迹文件</string></property>
                </widget>
               </item>
              </layout>
@@ -645,14 +675,19 @@
         <widget class="QFrame" name="bottomToolbar">
          <property name="frameShape"><enum>QFrame::NoFrame</enum></property>
          <layout class="QHBoxLayout" name="bottomToolbarLayout">
+          <property name="spacing"><number>10</number></property>
+          <property name="leftMargin"><number>14</number></property>
+          <property name="topMargin"><number>10</number></property>
+          <property name="rightMargin"><number>14</number></property>
+          <property name="bottomMargin"><number>10</number></property>
           <item>
            <widget class="QPushButton" name="btnToggleROI">
-            <property name="text"><string>📊 ROI星图</string></property>
+            <property name="text"><string>ROI星图</string></property>
            </widget>
           </item>
           <item>
            <widget class="QPushButton" name="btnToggleCharts">
-            <property name="text"><string>📈 参数曲线</string></property>
+            <property name="text"><string>参数曲线</string></property>
            </widget>
           </item>
           <item>
@@ -772,39 +807,50 @@
         <widget class="QFrame" name="chartsArea">
          <property name="visible"><bool>false</bool></property>
          <property name="minimumSize">
-          <size><width>0</width><height>180</height></size>
+          <size><width>0</width><height>280</height></size>
          </property>
          <property name="sizePolicy">
           <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
            <horstretch>0</horstretch>
-           <verstretch>0</verstretch>
+           <verstretch>1</verstretch>
           </sizepolicy>
          </property>
          <property name="frameShape"><enum>QFrame::NoFrame</enum></property>
          <layout class="QHBoxLayout" name="chartsAreaLayout">
-          <property name="spacing"><number>12</number></property>
-          <property name="leftMargin"><number>8</number></property>
-          <property name="topMargin"><number>8</number></property>
-          <property name="rightMargin"><number>8</number></property>
-          <property name="bottomMargin"><number>8</number></property>
+          <property name="spacing"><number>18</number></property>
+          <property name="leftMargin"><number>20</number></property>
+          <property name="topMargin"><number>14</number></property>
+          <property name="rightMargin"><number>20</number></property>
+          <property name="bottomMargin"><number>16</number></property>
           <item>
            <widget class="QWidget" name="r0ChartPanel">
             <property name="sizePolicy">
-             <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+             <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
               <horstretch>1</horstretch>
-              <verstretch>0</verstretch>
+              <verstretch>1</verstretch>
              </sizepolicy>
             </property>
             <layout class="QVBoxLayout" name="r0ChartPanelLayout">
+             <property name="spacing"><number>12</number></property>
+             <property name="leftMargin"><number>18</number></property>
+             <property name="topMargin"><number>18</number></property>
+             <property name="rightMargin"><number>18</number></property>
+             <property name="bottomMargin"><number>18</number></property>
              <item>
               <widget class="QLabel" name="lblR0ChartTitle">
-               <property name="text"><string>大气相干长度 r₀</string></property>
+                <property name="text"><string>大气相干长度 r₀</string></property>
               </widget>
              </item>
              <item>
               <widget class="QFrame" name="r0ChartCanvas">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                 <horstretch>0</horstretch>
+                 <verstretch>1</verstretch>
+                </sizepolicy>
+               </property>
                <property name="minimumSize">
-                <size><width>0</width><height>80</height></size>
+                <size><width>0</width><height>230</height></size>
                </property>
                <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
               </widget>
@@ -815,21 +861,32 @@
           <item>
            <widget class="QWidget" name="seeingChartPanel">
             <property name="sizePolicy">
-             <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+             <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
               <horstretch>1</horstretch>
-              <verstretch>0</verstretch>
+              <verstretch>1</verstretch>
              </sizepolicy>
             </property>
             <layout class="QVBoxLayout" name="seeingChartPanelLayout">
+             <property name="spacing"><number>12</number></property>
+             <property name="leftMargin"><number>18</number></property>
+             <property name="topMargin"><number>18</number></property>
+             <property name="rightMargin"><number>18</number></property>
+             <property name="bottomMargin"><number>18</number></property>
              <item>
               <widget class="QLabel" name="lblSeeingChartTitle">
-               <property name="text"><string>视宁度</string></property>
+                <property name="text"><string>视宁度</string></property>
               </widget>
              </item>
              <item>
               <widget class="QFrame" name="seeingChartCanvas">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                 <horstretch>0</horstretch>
+                 <verstretch>1</verstretch>
+                </sizepolicy>
+               </property>
                <property name="minimumSize">
-                <size><width>0</width><height>80</height></size>
+                <size><width>0</width><height>230</height></size>
                </property>
                <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
               </widget>
@@ -878,7 +935,7 @@
    <property name="text"><string>主界面(&amp;M)</string></property>
   </action>
   <action name="actionViewROI">
-   <property name="text"><string>ROI计划表(&amp;R)</string></property>
+   <property name="text"><string>ROI 预览(&amp;R)</string></property>
   </action>
   <action name="actionViewSettings">
    <property name="text"><string>设置(&amp;S)...</string></property>
@@ -890,7 +947,7 @@
    <property name="text"><string>显示/隐藏 图表</string></property>
   </action>
   <action name="actionROISchedule">
-   <property name="text"><string>ROI计划表编辑(&amp;E)...</string></property>
+   <property name="text"><string>ROI 更新说明(&amp;E)...</string></property>
   </action>
   <action name="actionTrajectoryCalc">
    <property name="text"><string>星点轨迹计算(&amp;T)...</string></property>
@@ -899,24 +956,24 @@
    <property name="text"><string>关于 C-DIMM(&amp;A)...</string></property>
   </action>
   <action name="btnStart">
-   <property name="text"><string>▶ 开始采集</string></property>
+   <property name="text"><string>开始采集</string></property>
   </action>
   <action name="btnStop">
-   <property name="text"><string>⏹ 停止</string></property>
+   <property name="text"><string>停止采集</string></property>
   </action>
   <action name="btnFullFrame">
-   <property name="text"><string>📷 全画幅预览</string></property>
+   <property name="text"><string>全画幅预览</string></property>
    <property name="checkable"><bool>true</bool></property>
    <property name="checked"><bool>true</bool></property>
   </action>
   <action name="btnROI">
-   <property name="text"><string>📋 ROI计划表</string></property>
+   <property name="text"><string>ROI 预览</string></property>
    <property name="checkable"><bool>true</bool></property>
   </action>
   <action name="btnSettings">
-   <property name="text"><string>⚙ 设置</string></property>
+   <property name="text"><string>设置</string></property>
   </action>
  </widget>
  <resources/>
  <connections/>
-</ui>
+ </ui>

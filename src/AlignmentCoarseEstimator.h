@@ -18,6 +18,7 @@ struct CoarseAlignmentConfig {
     double minTrackDurationSec = 15.0;
     double minTrackDisplacementPx = 2.0;
     double maxTrackFitRmsPx = 3.5;
+    double minTrackSpeedPxSec = 0.005;
     double maxCenterResidualRmsPx = 80.0;
     double plateScaleArcsecPx = 1.917;
     double siderealArcsecSec = 15.041;
@@ -26,13 +27,17 @@ struct CoarseAlignmentConfig {
 
 struct CoarseAlignmentTrackOverlay {
     int id = 0;
+    int pointCount = 0;
     QPointF startPx;
     QPointF endPx;
     QPointF velocityPxSec;
     double speedPxSec = 0.0;
     double durationSec = 0.0;
+    double displacementPx = 0.0;
     double fitRmsPx = 0.0;
+    bool velocityFitValid = false;
     bool usedForSolve = false;
+    QString rejectionReason;
 };
 
 struct CoarseAlignmentEstimate {
@@ -50,14 +55,18 @@ struct CoarseAlignmentEstimate {
     double offsetPx = 0.0;
     double offsetDeg = 0.0;
     double medianSpeedPxSec = 0.0;
+    double medianFittedSpeedPxSec = 0.0;
     double medianPolarDistanceDegFromSpeed = 0.0;
     double centerResidualRmsPx = 0.0;
     int detectedCandidateCount = 0;
     int acceptedCandidateCount = 0;
     int activeTrackCount = 0;
+    int fittedTrackCount = 0;
     int usableTrackCount = 0;
+    int requiredTrackCount = 0;
     double processingMs = 0.0;
     QString statusText;
+    QString diagnosticText;
     QVector<CoarseAlignmentTrackOverlay> tracks;
 };
 
@@ -78,7 +87,9 @@ public:
         double displacementPx = 0.0;
         double fitRmsPx = 0.0;
         qint64 lastTimestampMs = 0;
+        bool velocityFitValid = false;
         bool usedForSolve = false;
+        QString rejectionReason;
     };
 
     void reset();

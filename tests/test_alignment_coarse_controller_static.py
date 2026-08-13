@@ -32,5 +32,14 @@ class AlignmentCoarseControllerStaticTest(unittest.TestCase):
         self.assertNotIn("normalizeMono8Frame", cpp)
         self.assertNotIn("PolarisSolver", cpp)
 
+    def test_worker_type_matches_header_forward_declaration(self):
+        header = read("src/AlignmentCoarseController.h")
+        cpp = read("src/AlignmentCoarseController.cpp")
+
+        self.assertIn("class AlignmentCoarseWorker;", header)
+        self.assertIn("AlignmentCoarseWorker* m_worker", header)
+        self.assertIn("class AlignmentCoarseWorker : public QObject", cpp)
+        self.assertNotIn("namespace {\n\nclass AlignmentCoarseWorker", cpp)
+
 if __name__ == "__main__":
     unittest.main()

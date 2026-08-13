@@ -32,6 +32,7 @@ class AutoAcquisitionDimmStaticTest(unittest.TestCase):
 
         for fragment in [
             '#include "AutoAcquisitionScheduler.h"',
+            "#include <QCheckBox>",
             "setupAutoAcquisitionSettingsCallbacks();",
             "void DIMM::setupAutoAcquisitionSettingsCallbacks()",
             "m_settingsDialog->onApplyAutoAcquisition",
@@ -74,6 +75,11 @@ class AutoAcquisitionDimmStaticTest(unittest.TestCase):
         ]:
             self.assertIn(fragment, scheduler_body)
 
+        self.assertLess(
+            scheduler_body.find("if (m_captureState == CaptureState::Live)"),
+            scheduler_body.find("m_autoAcquisitionSuppressedWindowId == window.windowId"),
+        )
+
     def test_manual_stop_suppresses_same_auto_window(self):
         cpp = read("src/DIMM.cpp")
 
@@ -85,7 +91,7 @@ class AutoAcquisitionDimmStaticTest(unittest.TestCase):
         for fragment in [
             "m_autoAcquisitionCommandInProgress",
             "m_autoAcquisitionStartedCurrentRun",
-            "m_autoAcquisitionSuppressedWindowId = m_autoAcquisitionActiveWindowId",
+            "m_autoAcquisitionSuppressedWindowId = suppressedWindowId",
             "m_autoAcquisitionStartedCurrentRun = false",
         ]:
             self.assertIn(fragment, manual_body)
@@ -110,6 +116,36 @@ class AutoAcquisitionDimmStaticTest(unittest.TestCase):
         self.assertIn("m_lastAutoAcquisitionStatusKey == throttleKey", status_body)
         self.assertIn("m_lastAutoAcquisitionStatusMs", status_body)
         self.assertIn("setStatusMessage(text, level)", status_body)
+
+    def test_hardware_trigger_timeout_is_tolerated_when_frames_arrive(self):
+        comm = read("src/DIMM.CommCamera.cpp")
+        live_body = comm.split("void DIMM::handleLiveFramePacket", 1)[1].split(
+            "void DIMM::scheduleHardwareTriggerStartupCheck",
+            1,
+        )[0]
+        self.assertLess(
+            live_body.find("++runtime.frameCountPerCamera[cameraIndex]"),
+            live_body.find("confirmHardwareTriggerStartupIfReady();"),
+        )
+
+        check_body = comm.split("void DIMM::checkHardwareTriggerStartup()", 1)[1].split(
+            "void DIMM::onCommCommand",
+            1,
+        )[0]
+        self.assertLess(
+            check_body.find("confirmHardwareTriggerStartupIfReady();"),
+            check_body.find("handleHardwareTriggerStartupFailure(detail);"),
+        )
+
+        live_roi = read("src/DIMM.LiveRoi.cpp")
+        commit_body = live_roi.split("bool DIMM::commitPairedInitialRoisIfReady()", 1)[1].split(
+            "bool DIMM::startHardwarePulseStage",
+            1,
+        )[0]
+        self.assertIn("isPulseBoardResponseTimeout(reason)", commit_body)
+        self.assertIn("m_pulseBoardResponseTimedOut = true;", commit_body)
+        self.assertIn("setPulseBoardResponseTimeoutStatus", commit_body)
+        self.assertNotIn("!pulseResponseTimeout", commit_body)
 
 
 if __name__ == "__main__":

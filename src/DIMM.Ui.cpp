@@ -114,8 +114,10 @@ void DIMM::setupFullFramePreviewCanvases()
     auto* cam1PanelLayout = new QVBoxLayout(cam1Panel);
     cam1PanelLayout->setContentsMargins(0, 0, 0, 0);
     cam1PanelLayout->setSpacing(6);
-    m_lblFullFrameCam1 = new QLabel(QStringLiteral("全画幅预览- 相机1"), cam1Panel);
+    m_lblFullFrameCam1 = new QLabel(QStringLiteral("全画幅预览: 相机1"), cam1Panel);
     m_lblFullFrameCam1->setAlignment(Qt::AlignCenter);
+    m_lblFullFrameThresholdCam1 = new QLabel(QStringLiteral("Otsu --"), cam1Panel);
+    m_lblFullFrameThresholdCam1->setAlignment(Qt::AlignCenter);
     m_lblAlignmentSolveCam1 = new QLabel(QStringLiteral("自动识别: 未启用"), cam1Panel);
     m_lblAlignmentSolveCam1->setAlignment(Qt::AlignCenter);
     m_lblAlignmentSolveCam1->setStyleSheet(QStringLiteral("color: %1").arg(uiStatusColor(UiStatusLevel::Muted)));
@@ -132,6 +134,7 @@ void DIMM::setupFullFramePreviewCanvases()
     cam1AlignmentControlsLayout->addWidget(m_btnConfirmCamera1Polaris);
     m_fullFrameCanvas1 = new FullFrameCanvas(cam1Panel);
     cam1PanelLayout->addWidget(m_lblFullFrameCam1);
+    cam1PanelLayout->addWidget(m_lblFullFrameThresholdCam1);
     cam1PanelLayout->addWidget(m_lblAlignmentSolveCam1);
     cam1PanelLayout->addWidget(cam1AlignmentControls);
     cam1PanelLayout->addWidget(m_fullFrameCanvas1, 1);
@@ -141,8 +144,10 @@ void DIMM::setupFullFramePreviewCanvases()
     auto* cam2PanelLayout = new QVBoxLayout(cam2Panel);
     cam2PanelLayout->setContentsMargins(0, 0, 0, 0);
     cam2PanelLayout->setSpacing(6);
-    m_lblFullFrameCam2 = new QLabel(QStringLiteral("全画幅预览- 相机2"), cam2Panel);
+    m_lblFullFrameCam2 = new QLabel(QStringLiteral("全画幅预览: 相机2"), cam2Panel);
     m_lblFullFrameCam2->setAlignment(Qt::AlignCenter);
+    m_lblFullFrameThresholdCam2 = new QLabel(QStringLiteral("Otsu --"), cam2Panel);
+    m_lblFullFrameThresholdCam2->setAlignment(Qt::AlignCenter);
     m_lblAlignmentSolveCam2 = new QLabel(QStringLiteral("自动识别: 未启用"), cam2Panel);
     m_lblAlignmentSolveCam2->setAlignment(Qt::AlignCenter);
     m_lblAlignmentSolveCam2->setStyleSheet(QStringLiteral("color: %1").arg(uiStatusColor(UiStatusLevel::Muted)));
@@ -159,6 +164,7 @@ void DIMM::setupFullFramePreviewCanvases()
     cam2AlignmentControlsLayout->addWidget(m_btnConfirmCamera2Polaris);
     m_fullFrameCanvas2 = new FullFrameCanvas(cam2Panel);
     cam2PanelLayout->addWidget(m_lblFullFrameCam2);
+    cam2PanelLayout->addWidget(m_lblFullFrameThresholdCam2);
     cam2PanelLayout->addWidget(m_lblAlignmentSolveCam2);
     cam2PanelLayout->addWidget(cam2AlignmentControls);
     cam2PanelLayout->addWidget(m_fullFrameCanvas2, 1);
@@ -217,7 +223,10 @@ void DIMM::setupRoiPreviewCanvases()
     newCam1Layout->setSpacing(4);
     ui->lblCam1ROICoord = new QLabel(QStringLiteral("(0.0, 0.0)"), ui->cam1ROICanvas);
     ui->lblCam1ROICoord->setAlignment(Qt::AlignCenter);
+    m_lblRoiThresholdCam1 = new QLabel(QStringLiteral("Otsu --"), ui->cam1ROICanvas);
+    m_lblRoiThresholdCam1->setAlignment(Qt::AlignCenter);
     newCam1Layout->addWidget(ui->lblCam1ROICoord);
+    newCam1Layout->addWidget(m_lblRoiThresholdCam1);
     newCam1Layout->addWidget(m_cam1RoiCanvas);
 
     m_cam2RoiCanvas = new RoiStarCanvas(ui->cam2ROICanvas);
@@ -236,7 +245,10 @@ void DIMM::setupRoiPreviewCanvases()
     newCam2Layout->setSpacing(4);
     ui->lblCam2ROICoord = new QLabel(QStringLiteral("(0.0, 0.0)"), ui->cam2ROICanvas);
     ui->lblCam2ROICoord->setAlignment(Qt::AlignCenter);
+    m_lblRoiThresholdCam2 = new QLabel(QStringLiteral("Otsu --"), ui->cam2ROICanvas);
+    m_lblRoiThresholdCam2->setAlignment(Qt::AlignCenter);
     newCam2Layout->addWidget(ui->lblCam2ROICoord);
+    newCam2Layout->addWidget(m_lblRoiThresholdCam2);
     newCam2Layout->addWidget(m_cam2RoiCanvas);
 
 }
@@ -311,14 +323,14 @@ void DIMM::refreshStatusUi()
     }
 
     if (m_lblStatusFrames) {
-        m_lblStatusFrames->setText(QStringLiteral("帧数: %1 帧").arg(activeRuntime().frameCount));
+        m_lblStatusFrames->setText(QStringLiteral("帧数: %1 ").arg(activeRuntime().frameCount));
     }
 
     if (m_settingsDialog && m_settingsDialog->netStatusLabel) {
         QString netText;
         if (isSimulationCaptureActive()) {
             netText = m_commConnected
-                          ? QStringLiteral("状态: 已连接/ 模拟模式不对外上报")
+                          ? QStringLiteral("状态: 已连接，模拟模式不对外上传")
                           : QStringLiteral("状态: 模拟模式本地运行");
         } else if (m_commConnected) {
             netText = QStringLiteral("状态: 已连接");
@@ -372,10 +384,10 @@ void DIMM::refreshMeasurementUi()
     auto& runtime = activeRuntime();
     ui->lblPreviewMode->setText(currentPreviewModeText());
     if (m_lblStatusFrames) {
-        m_lblStatusFrames->setText(QStringLiteral("帧数: %1 帧").arg(runtime.frameCount));
+        m_lblStatusFrames->setText(QStringLiteral("帧数: %1 ").arg(runtime.frameCount));
     }
     ui->lblStatFrames->setText(
-        QStringLiteral("原始/入处理 %1 / %2")
+        QStringLiteral("原始/入处理: %1 / %2")
             .arg(QString::number(runtime.frameCount),
                  QString::number(runtime.processedFrameCount)));
     ui->lblStatValid->setText(
@@ -383,7 +395,7 @@ void DIMM::refreshMeasurementUi()
             .arg(QString::number(runtime.validCentroidCount),
                  QString::number(runtime.pairedSampleCount)));
     ui->lblStatLatency->setText(
-        QStringLiteral("未配对丢帧延迟: %1 / %2 ms")
+        QStringLiteral("未配对丢帧延迟 %1 / %2 ms")
             .arg(QString::number(runtime.droppedUnpairedSampleCount),
                  QString::number(runtime.averageProcessingLatencyMs, 'f', 2)));
     ui->lblStatWindow->setText(
@@ -413,10 +425,29 @@ void DIMM::refreshMeasurementUi()
         return;
     }
 
-    ui->lblR0Value->setText(QString::number(runtime.latestAtmosphere.r0, 'f', 1));
-    ui->lblSeeingValue->setText(QString::number(runtime.latestAtmosphere.seeing, 'f', 2));
-    ui->lblThetaValue->setText(QString::number(runtime.latestAtmosphere.theta0, 'f', 2));
-    ui->lblTauValue->setText(QString::number(runtime.latestAtmosphere.tau0, 'f', 2));
+    const AtmosphericParams& latestAtmosphere = runtime.latestAtmosphere;
+    QString r0Text = QString::number(latestAtmosphere.r0, 'f', 1);
+    if (latestAtmosphere.riskFlag) {
+        r0Text += QStringLiteral(" 风险");
+        ui->lblStatWindow->setText(
+            QStringLiteral("r0 风险窗口: %1 / %2 帧，%3")
+                .arg(QString::number(latestAtmosphere.sampleCount),
+                     QString::number(latestAtmosphere.targetSampleCount),
+                     latestAtmosphere.riskReason));
+    }
+    ui->lblR0Value->setText(r0Text);
+    ui->lblSeeingValue->setText(QString::number(latestAtmosphere.seeing, 'f', 2));
+    ui->lblThetaValue->setText(QString::number(latestAtmosphere.theta0, 'f', 2));
+    if (!latestAtmosphere.tau0Valid) {
+        ui->lblTauValue->setText(QStringLiteral("--"));
+    } else if (latestAtmosphere.tau0UnderResolved) {
+        ui->lblTauValue->setText(
+            QStringLiteral("< %1")
+                .arg(latestAtmosphere.tau0ResolutionMs, 0, 'f', 2));
+    } else {
+        ui->lblTauValue->setText(
+            QString::number(latestAtmosphere.tau0, 'f', 2));
+    }
 }
 
 void DIMM::refreshPanelUi()
@@ -459,7 +490,8 @@ void DIMM::refreshActionStates()
         m_actionAlignmentMode->setChecked(alignmentActive);
         m_actionAlignmentMode->setText(alignmentActive ? QStringLiteral("退出对准")
                                                        : QStringLiteral("对准模式"));
-        m_actionAlignmentMode->setEnabled(!busy && m_captureState != CaptureState::Live &&
+        m_actionAlignmentMode->setEnabled(!busy &&
+                                          m_captureState != CaptureState::Live &&
                                           m_captureState != CaptureState::Simulation);
     }
     if (m_actionConfirmCamera1Polaris) {
@@ -469,11 +501,11 @@ void DIMM::refreshActionStates()
         if (m_liveRuntime.hasConfirmedPolarisPosition[0]) {
             const QPointF pos = m_liveRuntime.confirmedPolarisPosition[0];
             m_actionConfirmCamera1Polaris->setText(
-                QStringLiteral("相机1北极星 已确认(%1, %2)")
+                QStringLiteral("相机1北极星已确认 (%1, %2)")
                     .arg(pos.x(), 0, 'f', 1)
                     .arg(pos.y(), 0, 'f', 1));
         } else {
-            m_actionConfirmCamera1Polaris->setText(QStringLiteral("相机1北极星 未确认"));
+            m_actionConfirmCamera1Polaris->setText(QStringLiteral("相机1北极星未确认"));
         }
     }
     if (m_actionConfirmCamera2Polaris) {
@@ -483,11 +515,11 @@ void DIMM::refreshActionStates()
         if (m_liveRuntime.hasConfirmedPolarisPosition[1]) {
             const QPointF pos = m_liveRuntime.confirmedPolarisPosition[1];
             m_actionConfirmCamera2Polaris->setText(
-                QStringLiteral("相机2北极星 已确认(%1, %2)")
+                QStringLiteral("相机2北极星已确认 (%1, %2)")
                     .arg(pos.x(), 0, 'f', 1)
                     .arg(pos.y(), 0, 'f', 1));
         } else {
-            m_actionConfirmCamera2Polaris->setText(QStringLiteral("相机2北极星 未确认"));
+            m_actionConfirmCamera2Polaris->setText(QStringLiteral("相机2北极星未确认"));
         }
     }
     if (m_actionRetryCamera1PolarisSolve) {
@@ -598,25 +630,25 @@ void DIMM::syncCameraSelectionUi()
     ui->lblPreviewMode->setText(currentPreviewModeText());
 
     if (m_lblFullFrameCam1) {
-        m_lblFullFrameCam1->setText(QStringLiteral("全画幅预览- 相机1"));
+        m_lblFullFrameCam1->setText(QStringLiteral("全画幅预览: 相机1"));
     }
     if (m_lblFullFrameCam2) {
-        m_lblFullFrameCam2->setText(QStringLiteral("全画幅预览- 相机2"));
+        m_lblFullFrameCam2->setText(QStringLiteral("全画幅预览: 相机2"));
     }
 }
 
 QString DIMM::currentPreviewModeText() const
 {
     if (m_captureState == CaptureState::Alignment) {
-        return QStringLiteral("对准模式 (双相机/ 低频全画幅/ 不计算不保存)");
+        return QStringLiteral("对准模式 (双相机 / 低频全画幅 / 不计算不保存)");
     }
 
     if (m_captureState == CaptureState::Simulation) {
-        return QStringLiteral("模拟模式 (双相机/ 30s 预览 / 1Hz 计算)");
+        return QStringLiteral("模拟模式 (双相机 / 30s 预览 / 1Hz 计算)");
     }
 
     if (m_captureState != CaptureState::Live) {
-        return QStringLiteral("实时模式 (双相机/ 30s 预览 / 实时采集)");
+        return QStringLiteral("实时模式 (双相机 / 30s 预览 / 实时采集)");
     }
 
     const auto& runtime = activeRuntime();
@@ -625,23 +657,23 @@ QString DIMM::currentPreviewModeText() const
             return QStringLiteral("实时模式 (双相机全画幅定位 / 等待首帧)");
         }
         return m_configTriggerMode == 0
-                   ? QStringLiteral("实时模式 (双相机/ 30s 预览 / 连续采集 / 等待首帧)")
-                   : QStringLiteral("实时模式 (双相机/ 30s 预览 / 硬件触发 / 等待外部触发)");
+                   ? QStringLiteral("实时模式 (双相机 / 30s 预览 / 连续采集 / 等待首帧)")
+                   : QStringLiteral("实时模式 (双相机 / 30s 预览 / 硬件触发 / 等待外部触发)");
     }
 
     if (m_configTriggerMode != 0) {
         const bool cam1Ready = runtime.frameCountPerCamera[0] > 0;
         const bool cam2Ready = runtime.frameCountPerCamera[1] > 0;
         if (cam1Ready && !cam2Ready) {
-            return QStringLiteral("实时模式 (硬件触发 / 相机1已到达/ 相机2等待触发)");
+            return QStringLiteral("实时模式 (硬件触发 / 相机1已到达 / 相机2等待触发)");
         }
         if (!cam1Ready && cam2Ready) {
-            return QStringLiteral("实时模式 (硬件触发 / 相机2已到达/ 相机1等待触发)");
+            return QStringLiteral("实时模式 (硬件触发 / 相机2已到达 / 相机1等待触发)");
         }
     }
 
     if (m_liveStartupPhase == LiveStartupPhase::LocatePair) {
-        return QStringLiteral("实时模式 (双相机全画幅定位中/ 等待独立 ROI 确认)");
+        return QStringLiteral("实时模式 (双相机全画幅定位中 / 等待独立 ROI 确认)");
     }
 
     const bool previewRefreshed =
@@ -649,7 +681,7 @@ QString DIMM::currentPreviewModeText() const
     if (previewRefreshed) {
         return QStringLiteral("实时模式 (双相机 / 30s 预览 / 已收到图像 / 预览30s刷新)");
     }
-    return QStringLiteral("实时模式 (双相机/ 30s 预览 / 已收到图像");
+    return QStringLiteral("实时模式 (双相机 / 30s 预览 / 已收到图像)");
 }
 
 void DIMM::setStatusMessage(const QString& text, const QString& color)
@@ -664,6 +696,33 @@ void DIMM::setStatusMessage(const QString& text, UiStatusLevel level)
     setStatusMessage(text, uiStatusColor(level));
 }
 
+void DIMM::setFullFrameThresholdDisplay(int cameraIndex,
+                                        double otsuThreshold,
+                                        double actualThreshold)
+{
+    QLabel* label = cameraIndex == 0 ? m_lblFullFrameThresholdCam1
+                                     : m_lblFullFrameThresholdCam2;
+    if (!label) {
+        return;
+    }
+    label->setText(QStringLiteral("Otsu %1 / 使用 %2")
+                      .arg(otsuThreshold, 0, 'f', 1)
+                      .arg(actualThreshold, 0, 'f', 1));
+}
+
+void DIMM::setRoiThresholdDisplay(int cameraIndex,
+                                  double otsuThreshold,
+                                  double actualThreshold)
+{
+    QLabel* label = cameraIndex == 0 ? m_lblRoiThresholdCam1
+                                     : m_lblRoiThresholdCam2;
+    if (!label) {
+        return;
+    }
+    label->setText(QStringLiteral("Otsu %1 / 使用 %2")
+                      .arg(otsuThreshold, 0, 'f', 1)
+                      .arg(actualThreshold, 0, 'f', 1));
+}
 void DIMM::setAlignmentSolveLabel(int cameraIndex, const QString& text, UiStatusLevel level)
 {
     if (!isValidCameraIndex(cameraIndex)) {

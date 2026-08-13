@@ -10,6 +10,7 @@ class AlignmentCoarseUiStaticTest(unittest.TestCase):
     def test_dimm_owns_coarse_runtime_and_controller(self):
         header = read("src/DIMM.h")
         dimm_cpp = read("src/DIMM.cpp")
+        alignment_cpp = read("src/DIMM.Alignment.cpp")
 
         self.assertIn('#include "AlignmentCoarseEstimator.h"', header)
         self.assertIn("class AlignmentCoarseController", header)
@@ -22,6 +23,7 @@ class AlignmentCoarseUiStaticTest(unittest.TestCase):
         self.assertIn('qRegisterMetaType<CoarseAlignmentEstimate>("CoarseAlignmentEstimate")', dimm_cpp)
         self.assertIn("new AlignmentCoarseController(this)", dimm_cpp)
         self.assertIn("AlignmentCoarseController::estimateReady", dimm_cpp)
+        self.assertIn('#include "AlignmentCoarseController.h"', alignment_cpp)
 
     def test_ui_adds_coarse_button_and_action(self):
         dimm_cpp = read("src/DIMM.cpp")

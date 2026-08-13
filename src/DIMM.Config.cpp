@@ -17,6 +17,7 @@
 #include <cmath>
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
@@ -72,7 +73,7 @@ void DIMM::setupAutoExposureSettingsCallbacks()
     m_settingsDialog->onApplyAutoExposure =
         [this](const AutoExposureConfig& config) {
             m_autoExposureConfig = config;
-            resetAutoExposureState();
+            resetAutoExposureState(false);
             if (m_imageProcessor) {
                 m_imageProcessor->setAutoExposureMetricConfig(config.enabled,
                                                               config.hardSaturationDn,
@@ -85,7 +86,7 @@ void DIMM::setupAutoExposureSettingsCallbacks()
                                                               config.supportedPeakPercentile,
                                                               config.saturatedPixelCount);
             }
-            setStatusMessage(config.enabled ? QStringLiteral("自动曝光已启用 状态机保护模式")
+            setStatusMessage(config.enabled ? QStringLiteral("自动曝光已启用，状态机保护模式")
                                             : QStringLiteral("自动曝光已关闭"),
                              config.enabled ? UiStatusLevel::Success : UiStatusLevel::Warning);
         };
@@ -210,6 +211,65 @@ void DIMM::setupPulseGeneratorSettingsCallbacks()
                          enabled ? UiStatusLevel::Success : UiStatusLevel::Warning);
         return true;
         };
+    m_settingsDialog->onSetPulseControlSource =
+        [this](QString portName,
+               int baudRate,
+               int terminalId,
+               bool remoteControl,
+               QString* errorMessage) -> bool {
+        m_pulseGeneratorPort = portName;
+        m_pulseGeneratorBaudRate = baudRate;
+        m_pulseGeneratorTerminalId = terminalId;
+
+        if (!m_pulseGenerator) {
+            m_pulseGeneratorRemoteControl = remoteControl;
+            return true;
+        }
+
+        if (m_configTriggerMode == 0) {
+            m_pulseGeneratorRemoteControl = remoteControl;
+            const QString savedMessage = QStringLiteral("当前为连续采集模式，触发器控制源已保存，切换到硬件触发时再下发");
+            setStatusMessage(savedMessage, UiStatusLevel::Info);
+            if (errorMessage) {
+                *errorMessage = savedMessage;
+            }
+            return true;
+        }
+
+        if (isLiveCaptureActive()) {
+            const QString pendingMessage = QStringLiteral("实时采集中，触发器控制源已保存，将在停止采集后再下发");
+            setStatusMessage(pendingMessage, UiStatusLevel::Warning);
+            if (errorMessage) {
+                *errorMessage = pendingMessage;
+            }
+            m_pulseGeneratorRemoteControl = remoteControl;
+            return true;
+        }
+
+        PulseGeneratorManager::Config pulseConfig;
+        pulseConfig.enabled = m_pulseGeneratorEnabled;
+        pulseConfig.portName = portName;
+        pulseConfig.baudRate = baudRate;
+        pulseConfig.terminalId = terminalId;
+        pulseConfig.frequencyHz = m_pulseGeneratorFrequencyHz;
+        pulseConfig.pulseCount = m_pulseGeneratorPulseCount;
+        pulseConfig.dutyPercent = m_pulseGeneratorDutyPercent;
+        pulseConfig.remoteControl = m_pulseGeneratorRemoteControl;
+        if (!m_pulseGenerator->setControlSource(pulseConfig, remoteControl, errorMessage)) {
+            setStatusMessage(errorMessage && !errorMessage->isEmpty()
+                                 ? *errorMessage
+                                 : QStringLiteral("触发器控制源切换失败"),
+                             UiStatusLevel::Error);
+            return false;
+        }
+
+        m_pulseGeneratorRemoteControl = remoteControl;
+        setStatusMessage(remoteControl
+                             ? QStringLiteral("触发器控制源已切换为远程")
+                             : QStringLiteral("触发器控制源已切换为本地"),
+                         UiStatusLevel::Success);
+        return true;
+        };
     m_settingsDialog->onStartPulseOutput =
         [this](QString portName,
                int baudRate,
@@ -285,13 +345,46 @@ void DIMM::setupPulseGeneratorSettingsCallbacks()
 void DIMM::setupAutoAcquisitionSettingsCallbacks()
 {
     m_settingsDialog->onApplyAutoAcquisition = [this](const AutoAcquisitionConfig& config) {
+        const QDateTime now = QDateTime::currentDateTime();
+
         const bool wasEnabled = m_autoAcquisitionConfig.enabled;
+
+        const AutoAcquisitionWindow oldWindow =
+            AutoAcquisitionScheduler::resolveWindow(
+                m_autoAcquisitionConfig,
+                now);
+
         m_autoAcquisitionConfig = config;
-        if (!wasEnabled && config.enabled) {
+
+        const AutoAcquisitionWindow newWindow =
+            AutoAcquisitionScheduler::resolveWindow(
+                m_autoAcquisitionConfig,
+                now);
+
+        const bool scheduleChanged =
+            oldWindow.valid != newWindow.valid ||
+            (oldWindow.valid &&
+             newWindow.valid &&
+             oldWindow.windowId != newWindow.windowId);
+
+        if ((!wasEnabled && config.enabled) || scheduleChanged) {
             m_autoAcquisitionSuppressedWindowId.clear();
+            m_autoAcquisitionRecovery.reset();
+            m_lastAutoAcquisitionAttemptMs = -1;
+            m_lastAutoAcquisitionStatusKey.clear();
+            m_lastAutoAcquisitionStatusMs = -1;
+
+            if (!m_autoAcquisitionStartedCurrentRun) {
+                m_autoAcquisitionActiveWindowId.clear();
+            }
+
+            resetLiveStartupRecoveryState(true);
         }
-        const AutoAcquisitionWindow window =
-            AutoAcquisitionScheduler::resolveWindow(m_autoAcquisitionConfig, QDateTime::currentDateTime());
+        if (!config.enabled) {
+            m_autoAcquisitionRecovery.reset();
+        }
+
+        const AutoAcquisitionWindow window = newWindow;
         if (m_settingsDialog->autoAcquisitionNextStartLabel) {
             m_settingsDialog->autoAcquisitionNextStartLabel->setText(
                 window.valid
@@ -315,15 +408,15 @@ void DIMM::setupProcessingSettingsCallbacks()
     m_settingsDialog->onApplyProcessing = [this](int backgroundKernelSize,
                                                  double backgroundSigmaMultiplier,
                                                  int centroidMode,
-                                                 int peakKernelMethod,
                                                  int peakKernelRadiusPx,
-                                                 double strongHotPixelExcessDn) {
+                                                 double strongHotPixelExcessDn,
+                                                 int r0HistoryWindowFrames) {
         m_imageProcessor->setBackgroundDenoiseKernelSize(backgroundKernelSize);
         m_imageProcessor->setBackgroundDenoiseSigmaMultiplier(backgroundSigmaMultiplier);
         m_imageProcessor->setCentroidMode(centroidMode);
-        m_imageProcessor->setPeakKernelCentroidConfig(peakKernelMethod,
-                                                      peakKernelRadiusPx,
+        m_imageProcessor->setPeakKernelCentroidConfig(peakKernelRadiusPx,
                                                       strongHotPixelExcessDn);
+        m_imageProcessor->setAtmosphereHistoryWindowFrames(r0HistoryWindowFrames);
         setStatusMessage(QStringLiteral("图像处理参数已更新"), UiStatusLevel::Success);
     };
     m_settingsDialog->onApplyRoiRecentering =
@@ -336,19 +429,17 @@ void DIMM::setupProcessingSettingsCallbacks()
             setStatusMessage(QStringLiteral("ROI 重居中参数已更新"), UiStatusLevel::Success);
         };
     m_settingsDialog->onApplyFullFrameStarDetection =
-        [this](double thresholdAbsolute,
-               double sigmaThreshold,
+        [this](double sigmaThreshold,
                double peakFraction,
-               double minimumIntensity,
                int minArea,
-               int maxArea) {
+               int maxArea,
+               int connectivity) {
             InitialStarDetectionConfig config;
-            config.thresholdAbsolute = thresholdAbsolute;
             config.sigmaThreshold = sigmaThreshold;
             config.peakFraction = peakFraction;
-            config.minimumIntensity = minimumIntensity;
             config.minArea = minArea;
             config.maxArea = maxArea;
+            config.connectivity = connectivity;
             setCurrentInitialStarDetectionConfig(config);
             setStatusMessage(QStringLiteral("全画幅找星参数已更新"), UiStatusLevel::Success);
         };
@@ -553,10 +644,10 @@ void DIMM::setupNetworkSettingsCallbacks()
         }
         m_commManager->disconnectFromHost();
         m_commManager->connectToHost(ip, port);
-        setStatusMessage(QStringLiteral("正在连接上位机%1:%2").arg(ip).arg(port), UiStatusLevel::Warning);
+        setStatusMessage(QStringLiteral("正在连接上位机 %1:%2").arg(ip).arg(port), UiStatusLevel::Warning);
         refreshStatusUi();
     };
-    m_settingsDialog->onAfterApply = [this]() {
+    m_settingsDialog->onAfterApply = [this](const AppConfig& config, const ConfigChangeSet& changes) {
         if (!m_settingsDialog || !m_settingsDialog->applyStatusLabel) {
             return;
         }
@@ -567,7 +658,7 @@ void DIMM::setupNetworkSettingsCallbacks()
             return;
         }
 
-        savePersistentSettings();
+        savePersistentSettings(config, changes);
 
         const int connectedCameras = openCameraCount();
         QString message;
@@ -597,9 +688,10 @@ AppConfig DIMM::currentAppConfig() const
         config.processing.backgroundKernelSize = m_imageProcessor->backgroundDenoiseKernelSize();
         config.processing.backgroundSigmaMultiplier = m_imageProcessor->backgroundDenoiseSigmaMultiplier();
         config.processing.centroidMode = m_imageProcessor->centroidMethod();
-        config.processing.peakKernelMethod = m_imageProcessor->peakKernelMethod();
         config.processing.peakKernelRadiusPx = m_imageProcessor->peakKernelRadiusPx();
         config.processing.strongHotPixelExcessDn = m_imageProcessor->strongHotPixelExcessDn();
+        config.processing.r0HistoryWindowFrames =
+            m_imageProcessor->atmosphereHistoryWindowFrames();
         config.optical.apertureDiameterMm = m_imageProcessor->apertureDiameterMm();
         config.optical.baselineSeparationMm = m_imageProcessor->baselineSeparationMm();
         config.optical.baselineAngleDeg = m_imageProcessor->baselineAngleDeg();
@@ -613,12 +705,11 @@ AppConfig DIMM::currentAppConfig() const
     config.roiRecentering.cooldownMs = m_roiRecenteringCooldownMs;
     config.roiRecentering.minimumShiftPx = m_roiRecenteringMinimumShiftPx;
     const InitialStarDetectionConfig starConfig = currentInitialStarDetectionConfig();
-    config.starDetection.thresholdAbsolute = starConfig.thresholdAbsolute;
     config.starDetection.sigmaThreshold = starConfig.sigmaThreshold;
     config.starDetection.peakFraction = starConfig.peakFraction;
-    config.starDetection.minimumIntensity = starConfig.minimumIntensity;
     config.starDetection.minArea = starConfig.minArea;
     config.starDetection.maxArea = starConfig.maxArea;
+    config.starDetection.connectivity = starConfig.connectivity;
     config.hotPixel.enabled = m_hotPixelTemplatesEnabled;
     config.hotPixel.camera0MaskPath = m_hotPixelCamera0MaskPath;
     config.hotPixel.camera0ExcessPath = m_hotPixelCamera0ExcessPath;
@@ -675,7 +766,7 @@ void DIMM::applyStartupConfig(const AppConfig& config)
     m_autoAcquisitionConfig = config.autoAcquisition;
 
     m_autoExposureConfig = config.autoExposure;
-    resetAutoExposureState();
+    resetAutoExposureState(false);
 
     m_roiRecenteringThresholdPx = config.roiRecentering.thresholdPx;
     m_roiRecenteringRequiredFrames = config.roiRecentering.requiredFrames;
@@ -683,12 +774,11 @@ void DIMM::applyStartupConfig(const AppConfig& config)
     m_roiRecenteringMinimumShiftPx = config.roiRecentering.minimumShiftPx;
 
     InitialStarDetectionConfig starConfig;
-    starConfig.thresholdAbsolute = config.starDetection.thresholdAbsolute;
     starConfig.sigmaThreshold = config.starDetection.sigmaThreshold;
     starConfig.peakFraction = config.starDetection.peakFraction;
-    starConfig.minimumIntensity = config.starDetection.minimumIntensity;
     starConfig.minArea = config.starDetection.minArea;
     starConfig.maxArea = config.starDetection.maxArea;
+    starConfig.connectivity = config.starDetection.connectivity;
     setCurrentInitialStarDetectionConfig(starConfig);
 
     m_hotPixelTemplatesEnabled = config.hotPixel.enabled;
@@ -742,9 +832,10 @@ void DIMM::applyStartupConfig(const AppConfig& config)
         m_imageProcessor->setBackgroundDenoiseSigmaMultiplier(
             config.processing.backgroundSigmaMultiplier);
         m_imageProcessor->setCentroidMethod(config.processing.centroidMode);
-        m_imageProcessor->setPeakKernelCentroidConfig(config.processing.peakKernelMethod,
-                                                      config.processing.peakKernelRadiusPx,
+        m_imageProcessor->setPeakKernelCentroidConfig(config.processing.peakKernelRadiusPx,
                                                       config.processing.strongHotPixelExcessDn);
+        m_imageProcessor->setAtmosphereHistoryWindowFrames(
+            config.processing.r0HistoryWindowFrames);
         m_imageProcessor->setOpticalParams(config.optical.apertureDiameterMm,
                                            config.optical.baselineSeparationMm,
                                            config.optical.baselineAngleDeg,
@@ -797,6 +888,10 @@ void DIMM::applyStartupConfig(const AppConfig& config)
             m_settingsDialog->autoAcquisitionStopOffsetEdit->setText(
                 QString::number(m_autoAcquisitionConfig.stopOffsetMinutesBeforeSunrise));
         }
+        if (m_settingsDialog->autoAcquisitionRecoveryScanIntervalEdit) {
+            m_settingsDialog->autoAcquisitionRecoveryScanIntervalEdit->setText(
+                QString::number(m_autoAcquisitionConfig.recoveryScanIntervalMinutes));
+        }
         if (m_settingsDialog->autoAcquisitionTestOverrideCheck) {
             m_settingsDialog->autoAcquisitionTestOverrideCheck->setChecked(
                 m_autoAcquisitionConfig.testTimeOverrideEnabled);
@@ -823,12 +918,13 @@ void DIMM::applyStartupConfig(const AppConfig& config)
                     ? QStringLiteral("下次停止: %1").arg(window.stop.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")))
                     : QStringLiteral("下次停止: %1").arg(window.errorMessage));
         }
+        m_settingsDialog->setCommittedConfig(currentAppConfig());
     }
 }
 
-void DIMM::savePersistentSettings()
+void DIMM::savePersistentSettings(const AppConfig& config, const ConfigChangeSet& changes)
 {
-    AppConfigPersistence::save(currentAppConfig());
+    AppConfigPersistence::saveChanged(config, changes);
 }
 
 QVector<int> DIMM::scanHotPixelExposureTemplates() const
@@ -993,7 +1089,7 @@ bool DIMM::applyExposureAndHotPixelTemplate(int cameraIndex, int exposureUs, QSt
 {
     if (cameraIndex < 0 || cameraIndex >= 2 || exposureUs <= 0) {
         if (reason) {
-            *reason = QStringLiteral("自动曝光: 无效相机或曝光参数。");
+            *reason = QStringLiteral("自动曝光: 无效相机或曝光参数");
         }
         return false;
     }

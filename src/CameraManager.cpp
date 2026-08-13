@@ -1,20 +1,121 @@
-#include "CameraManager.h"
-#include <QDebug>
+﻿#include "CameraManager.h"
 
-// ============================================================
-// CaptureCallbackHandler
-// ============================================================
+#include <QDebug>
+#include <QDateTime>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+
+namespace {
+constexpr quint64 kFrameIdWrapModulo = 65536;
+constexpr quint64 kFrameIdWrapBackstepThreshold = kFrameIdWrapModulo / 2;
+
+qint64 safeIncrement(qint64 increment)
+{
+    return increment > 0 ? increment : 1;
+}
+
+qint64 alignToRange(qint64 value, const RoiAxisRange& range)
+{
+    const qint64 increment = safeIncrement(range.increment);
+    const qint64 clamped = std::clamp(value, range.minValue, range.maxValue);
+    const qint64 steps = (clamped - range.minValue) / increment;
+    const qint64 aligned = range.minValue + steps * increment;
+    return std::clamp(aligned, range.minValue, range.maxValue);
+}
+
+bool isFeatureReadable(CGXFeatureControlPointer& fc, const char* nodeName)
+{
+    return !fc.IsNull() && fc->IsImplemented(nodeName) && fc->IsReadable(nodeName);
+}
+
+bool isFeatureWritable(CGXFeatureControlPointer& fc, const char* nodeName)
+{
+    return !fc.IsNull() && fc->IsImplemented(nodeName) && fc->IsWritable(nodeName);
+}
+
+bool setEnumIfWritable(CGXFeatureControlPointer& fc, const char* nodeName, const char* value)
+{
+    if (!isFeatureWritable(fc, nodeName)) {
+        return false;
+    }
+    CEnumFeaturePointer feature = fc->GetEnumFeature(nodeName);
+    feature->SetValue(value);
+    return true;
+}
+
+QString readEnumIfReadable(CGXFeatureControlPointer& fc, const char* nodeName)
+{
+    if (!isFeatureReadable(fc, nodeName)) {
+        return QString();
+    }
+    CEnumFeaturePointer feature = fc->GetEnumFeature(nodeName);
+    const GxIAPICPP::gxstring value = feature->GetValue();
+    return QString::fromLatin1(value.c_str());
+}
+
+bool is16BitMonoPixelFormat(GX_PIXEL_FORMAT_ENTRY pixelFormat)
+{
+    return pixelFormat == GX_PIXEL_FORMAT_MONO10 ||
+           pixelFormat == GX_PIXEL_FORMAT_MONO12 ||
+           pixelFormat == GX_PIXEL_FORMAT_MONO16;
+}
+
+int cameraFrameBitDepth(GX_PIXEL_FORMAT_ENTRY pixelFormat)
+{
+    switch (pixelFormat) {
+    case GX_PIXEL_FORMAT_MONO8:
+    case GX_PIXEL_FORMAT_BAYER_RG8:
+    case GX_PIXEL_FORMAT_BAYER_GB8:
+    case GX_PIXEL_FORMAT_BAYER_GR8:
+    case GX_PIXEL_FORMAT_BAYER_BG8:
+        return 8;
+    case GX_PIXEL_FORMAT_MONO10:
+        return 10;
+    case GX_PIXEL_FORMAT_MONO12:
+        return 12;
+    case GX_PIXEL_FORMAT_MONO16:
+        return 16;
+    default:
+        return 8;
+    }
+}
+
+double cameraFrameMaxPixelValue(GX_PIXEL_FORMAT_ENTRY pixelFormat)
+{
+    switch (cameraFrameBitDepth(pixelFormat)) {
+    case 10:
+        return 1023.0;
+    case 12:
+        return 4095.0;
+    case 16:
+        return 65535.0;
+    case 8:
+    default:
+        return 255.0;
+    }
+}
+
+RoiAxisRange readIntRangeChecked(CGXFeatureControlPointer& fc, const char* nodeName)
+{
+    CIntFeaturePointer feature = fc->GetIntFeature(nodeName);
+    RoiAxisRange range;
+    range.minValue = feature->GetMin();
+    range.maxValue = feature->GetMax();
+    range.increment = safeIncrement(feature->GetInc());
+    return range;
+}
+}
 
 void CaptureCallbackHandler::DoOnImageCaptured(CImageDataPointer& objImageDataPointer, void* pUserParam)
 {
     Q_UNUSED(pUserParam);
     auto* mgr = static_cast<CameraManager*>(m_manager);
-    mgr->onFrameCaptured(m_cameraIndex, objImageDataPointer);
+    if (mgr) {
+        mgr->onFrameCaptured(m_cameraIndex, objImageDataPointer);
+    }
 }
-
-// ============================================================
-// CameraManager 单例
-// ============================================================
 
 CameraManager& CameraManager::instance()
 {
@@ -32,195 +133,376 @@ CameraManager::~CameraManager()
     uninit();
 }
 
-// ============================================================
-// 初始化/反初始化
-// ============================================================
+void CameraManager::resetFrameIdTracking(CameraData& camera)
+{
+    camera.hasFrameIdTracking = false;
+    camera.lastRawFrameId = 0;
+    camera.frameIdWrapOffset = 0;
+}
+
+quint64 CameraManager::extendWrappingFrameId(CameraData& camera, quint64 rawFrameId)
+{
+    if (camera.hasFrameIdTracking &&
+        rawFrameId < camera.lastRawFrameId &&
+        camera.lastRawFrameId - rawFrameId > kFrameIdWrapBackstepThreshold) {
+        camera.frameIdWrapOffset += kFrameIdWrapModulo;
+    }
+
+    camera.hasFrameIdTracking = true;
+    camera.lastRawFrameId = rawFrameId;
+    return camera.frameIdWrapOffset + rawFrameId + 1;
+}
 
 bool CameraManager::init()
 {
-    if (m_initialized) return true;
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (m_initialized) {
+        return true;
+    }
+
     try {
-        qDebug() << "[CameraManager] 正在初始化Galaxy SDK...";
         IGXFactory::GetInstance().Init();
         m_initialized = true;
-        qDebug() << "[CameraManager] Galaxy SDK初始化成功";
         return true;
     } catch (CGalaxyException& e) {
-        qDebug() << "[CameraManager] SDK初始化失败, 错误码:" << e.GetErrorCode();
-        emit cameraError(-1, e.GetErrorCode(), "SDK初始化失败");
+        emit cameraError(-1, e.GetErrorCode(), QStringLiteral("Galaxy SDK 初始化失败"));
         return false;
     }
 }
 
 void CameraManager::uninit()
 {
-    if (!m_initialized) return;
-    try {
-        closeAll();
-        IGXFactory::GetInstance().Uninit();
-        m_initialized = false;
-    } catch (...) {
-        // 忽略反初始化异常
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (!m_initialized) {
+        return;
     }
-}
 
-// ============================================================
-// 设备枚举
-// ============================================================
+    for (int i = 0; i < 2; ++i) {
+        auto& camera = m_cameras[i];
+        {
+            QMutexLocker stateLocker(&camera.stateMutex);
+            camera.isClosing = true;
+        }
+
+        try {
+            if (!camera.remoteFeatureControl.IsNull()) {
+                try {
+                    camera.remoteFeatureControl->GetCommandFeature("AcquisitionStop")->Execute();
+                } catch (...) {
+                }
+            }
+            if (!camera.stream.IsNull()) {
+                try {
+                    camera.stream->StopGrab();
+                } catch (...) {
+                }
+                try {
+                    camera.stream->UnregisterCaptureCallback();
+                } catch (...) {
+                }
+            }
+            {
+                QMutexLocker stateLocker(&camera.stateMutex);
+                camera.isStreaming = false;
+                while (camera.activeCallbacks > 0) {
+                    camera.callbackDrained.wait(&camera.stateMutex, 300);
+                }
+            }
+            camera.callbackHandler.reset();
+            if (!camera.device.IsNull()) {
+                try {
+                    camera.device->Close();
+                } catch (...) {
+                }
+            }
+        } catch (...) {
+        }
+
+        camera.remoteFeatureControl = CGXFeatureControlPointer();
+        camera.stream = CGXStreamPointer();
+        camera.device = CGXDevicePointer();
+        {
+            QMutexLocker frameLocker(&camera.frameMutex);
+            camera.latestFrame.release();
+            camera.latestFramePacket = CameraFrame();
+        }
+        {
+            QMutexLocker stateLocker(&camera.stateMutex);
+            camera.isOpen = false;
+            camera.isStreaming = false;
+            camera.isClosing = false;
+            camera.info.isOnline = false;
+            camera.frameNotificationPending.store(false, std::memory_order_release);
+        }
+    }
+
+    try {
+        IGXFactory::GetInstance().Uninit();
+    } catch (...) {
+    }
+    m_initialized = false;
+    m_deviceCount = 0;
+}
 
 QVector<CameraInfo> CameraManager::enumerateDevices()
 {
+    QMutexLocker apiLocker(&m_apiMutex);
     QVector<CameraInfo> result;
     if (!m_initialized) {
-        qDebug() << "[CameraManager] enumerateDevices: SDK未初始化!";
         return result;
     }
 
     try {
-        qDebug() << "[CameraManager] 正在枚举设备(超时1秒)...";
         GxIAPICPP::gxdeviceinfo_vector deviceInfoVector;
         IGXFactory::GetInstance().UpdateDeviceList(1000, deviceInfoVector);
         m_deviceCount = static_cast<int>(deviceInfoVector.size());
-        qDebug() << "[CameraManager] 发现设备数量:" << m_deviceCount;
 
         for (int i = 0; i < m_deviceCount && i < 2; ++i) {
             CameraInfo info;
-            info.serialNumber = QString::fromStdString(
-                std::string(deviceInfoVector[i].GetSN()));
-            info.modelName = QString::fromStdString(
-                std::string(deviceInfoVector[i].GetModelName()));
-            info.ipAddress = QString::fromStdString(
-                std::string(deviceInfoVector[i].GetIP()));
+            info.serialNumber = QString::fromStdString(std::string(deviceInfoVector[i].GetSN()));
+            info.modelName = QString::fromStdString(std::string(deviceInfoVector[i].GetModelName()));
+            info.ipAddress = QString::fromStdString(std::string(deviceInfoVector[i].GetIP()));
             info.isOnline = true;
             m_cameras[i].info = info;
             result.append(info);
-            qDebug() << "[CameraManager] 设备" << i << ": SN=" << info.serialNumber
-                     << "型号=" << info.modelName << "IP=" << info.ipAddress;
         }
     } catch (CGalaxyException& e) {
-        qDebug() << "[CameraManager] 设备枚举失败, 错误码:" << e.GetErrorCode();
-        emit cameraError(-1, e.GetErrorCode(), "设备枚举失败");
+        emit cameraError(-1, e.GetErrorCode(), QStringLiteral("相机枚举失败"));
     }
+
     return result;
 }
 
-// ============================================================
-// 设备打开/关闭
-// ============================================================
-
 bool CameraManager::openDevice(int index)
 {
-    if (index < 0 || index >= 2) return false;
-    if (!m_initialized) {
-        qDebug() << "[CameraManager] openDevice(" << index << "): SDK未初始化!";
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
         return false;
     }
-    if (m_cameras[index].isOpen) return true;
+
+    {
+        QMutexLocker stateLocker(&m_cameras[index].stateMutex);
+        if (m_cameras[index].isOpen) {
+            return true;
+        }
+    }
 
     try {
-        // 枚举设备
-        qDebug() << "[CameraManager] openDevice(" << index << "): 重新枚举设备...";
         GxIAPICPP::gxdeviceinfo_vector deviceInfoVector;
         IGXFactory::GetInstance().UpdateDeviceList(1000, deviceInfoVector);
-        qDebug() << "[CameraManager] openDevice: 枚举到" << deviceInfoVector.size() << "个设备";
         if (index >= static_cast<int>(deviceInfoVector.size())) {
-            qDebug() << "[CameraManager] openDevice: 索引" << index << "超出范围";
-            emit cameraError(index, -1, "设备索引超出范围");
+            emit cameraError(index, -1, QStringLiteral("相机索引超出范围"));
             return false;
         }
 
-        // 打开设备
-        GxIAPICPP::gxstring sn = deviceInfoVector[index].GetSN();
-        qDebug() << "[CameraManager] openDevice: 尝试打开设备 SN=" << QString::fromStdString(std::string(sn));
-        m_cameras[index].device = IGXFactory::GetInstance().OpenDeviceBySN(
-            sn, GX_ACCESS_EXCLUSIVE);
-        qDebug() << "[CameraManager] openDevice: 设备打开成功";
+        auto& camera = m_cameras[index];
+        const GxIAPICPP::gxstring sn = deviceInfoVector[index].GetSN();
+        camera.device = IGXFactory::GetInstance().OpenDeviceBySN(sn, GX_ACCESS_EXCLUSIVE);
+        camera.remoteFeatureControl = camera.device->GetRemoteFeatureControl();
+        camera.stream = camera.device->OpenStream(0);
 
-        // 获取远程设备控制
-        m_cameras[index].remoteFeatureControl =
-            m_cameras[index].device->GetRemoteFeatureControl();
+        bool mono12Set = false;
+        try {
+            mono12Set = setEnumIfWritable(camera.remoteFeatureControl, "PixelFormat", "Mono12");
+        } catch (...) {
+            mono12Set = false;
+        }
+        QString pixelFormatValue;
+        try {
+            pixelFormatValue = readEnumIfReadable(camera.remoteFeatureControl, "PixelFormat");
+        } catch (...) {
+            pixelFormatValue.clear();
+        }
+        if (!mono12Set || (!pixelFormatValue.isEmpty() && pixelFormatValue != QStringLiteral("Mono12"))) {
+            emit cameraError(index,
+                             -1,
+                             QStringLiteral("相机%1 PixelFormat 未确认到 Mono12，当前值: %2")
+                                 .arg(index + 1)
+                                 .arg(pixelFormatValue.isEmpty()
+                                          ? QStringLiteral("unknown")
+                                          : pixelFormatValue));
+        }
 
-        // 打开流通道
-        m_cameras[index].stream = m_cameras[index].device->OpenStream(0);
+        // For GigE cameras, negotiate a stable packet size before streaming.
+        // Without this, dual-camera acquisition can degrade into one camera
+        // receiving frames while the other silently starves.
+        if (!camera.stream.IsNull() && !camera.remoteFeatureControl.IsNull() &&
+            camera.remoteFeatureControl->IsImplemented("GevSCPSPacketSize") &&
+            camera.remoteFeatureControl->IsWritable("GevSCPSPacketSize")) {
+            try {
+                const uint32_t packetSize = camera.stream->GetOptimalPacketSize();
+                if (packetSize > 0U) {
+                    camera.remoteFeatureControl->GetIntFeature("GevSCPSPacketSize")->SetValue(packetSize);
+                }
+            } catch (...) {
+            }
+        }
 
-        // 注册回调
-        m_cameras[index].callbackHandler = std::make_unique<CaptureCallbackHandler>(index, this);
-        m_cameras[index].stream->RegisterCaptureCallback(
-            m_cameras[index].callbackHandler.get(), nullptr);
+        // Stagger GigE transmission timing between the two cameras so a shared
+        // trigger does not make both devices burst a full-frame image onto the
+        // same NIC at the exact same instant.
+        if (!camera.remoteFeatureControl.IsNull()) {
+            try {
+                if (camera.remoteFeatureControl->IsImplemented("GevSCFTD") &&
+                    camera.remoteFeatureControl->IsWritable("GevSCFTD")) {
+                    const int64_t frameTxDelay = (index == 0) ? 0 : 20000;
+                    camera.remoteFeatureControl->GetIntFeature("GevSCFTD")->SetValue(frameTxDelay);
+                }
+            } catch (...) {
+            }
+            try {
+                if (camera.remoteFeatureControl->IsImplemented("GevSCPD") &&
+                    camera.remoteFeatureControl->IsWritable("GevSCPD")) {
+                    const int64_t packetDelay = (index == 0) ? 1000 : 3000;
+                    camera.remoteFeatureControl->GetIntFeature("GevSCPD")->SetValue(packetDelay);
+                }
+            } catch (...) {
+            }
+        }
 
-        m_cameras[index].isOpen = true;
+        camera.callbackHandler = std::make_unique<CaptureCallbackHandler>(index, this);
+        camera.stream->RegisterCaptureCallback(camera.callbackHandler.get(), nullptr);
 
-        // 更新信息
-        m_cameras[index].info.serialNumber = QString::fromStdString(
-            std::string(deviceInfoVector[index].GetSN()));
-        m_cameras[index].info.modelName = QString::fromStdString(
-            std::string(deviceInfoVector[index].GetModelName()));
-        m_cameras[index].info.ipAddress = QString::fromStdString(
-            std::string(deviceInfoVector[index].GetIP()));
-        m_cameras[index].info.isOnline = true;
+        camera.info.serialNumber = QString::fromStdString(std::string(deviceInfoVector[index].GetSN()));
+        camera.info.modelName = QString::fromStdString(std::string(deviceInfoVector[index].GetModelName()));
+        camera.info.ipAddress = QString::fromStdString(std::string(deviceInfoVector[index].GetIP()));
+        camera.info.isOnline = true;
 
-        emit cameraConnected(index,
-            m_cameras[index].info.serialNumber,
-            m_cameras[index].info.modelName);
+        {
+            QMutexLocker frameLocker(&camera.frameMutex);
+            camera.latestFrame.release();
+            camera.latestFramePacket = CameraFrame();
+        }
+        {
+            QMutexLocker stateLocker(&camera.stateMutex);
+            camera.isOpen = true;
+            camera.isStreaming = false;
+            camera.isClosing = false;
+            camera.activeCallbacks = 0;
+            camera.frameNotificationPending.store(false, std::memory_order_release);
+        }
+
+        emit cameraConnected(index, camera.info.serialNumber, camera.info.modelName);
         return true;
-
     } catch (CGalaxyException& e) {
-        qDebug() << "[CameraManager] openDevice失败, 错误码:" << e.GetErrorCode();
-        emit cameraError(index, e.GetErrorCode(), "打开设备失败");
+        auto& camera = m_cameras[index];
+        camera.callbackHandler.reset();
+        camera.remoteFeatureControl = CGXFeatureControlPointer();
+        camera.stream = CGXStreamPointer();
+        camera.device = CGXDevicePointer();
+        {
+            QMutexLocker frameLocker(&camera.frameMutex);
+            camera.latestFrame.release();
+            camera.latestFramePacket = CameraFrame();
+        }
+        {
+            QMutexLocker stateLocker(&camera.stateMutex);
+            camera.isOpen = false;
+            camera.isStreaming = false;
+            camera.isClosing = false;
+            camera.info.isOnline = false;
+            camera.frameNotificationPending.store(false, std::memory_order_release);
+        }
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("打开相机失败"));
         return false;
     }
 }
 
 bool CameraManager::closeDevice(int index)
 {
-    if (index < 0 || index >= 2) return false;
-    if (!m_cameras[index].isOpen) return true;
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2) {
+        return false;
+    }
+
+    auto& camera = m_cameras[index];
+    {
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen) {
+            return true;
+        }
+        camera.isClosing = true;
+    }
 
     try {
-        // 停止采集
-        if (m_cameras[index].isStreaming) {
-            stopAcquisition(index);
+        if (!camera.remoteFeatureControl.IsNull()) {
+            try {
+                camera.remoteFeatureControl->GetCommandFeature("AcquisitionStop")->Execute();
+            } catch (...) {
+            }
         }
 
-        // 注销回调
-        if (m_cameras[index].callbackHandler) {
-            m_cameras[index].stream->UnregisterCaptureCallback();
-            // 延迟释放handler，避免SDK内部仍持有指针
-            m_cameras[index].callbackHandler.reset();
+        if (!camera.stream.IsNull()) {
+            try {
+                camera.stream->StopGrab();
+            } catch (...) {
+            }
+
+            if (camera.callbackHandler) {
+                try {
+                    camera.stream->UnregisterCaptureCallback();
+                } catch (...) {
+                }
+            }
         }
 
-        // 关闭设备（先关设备，再释放流）
-        m_cameras[index].device->Close();
-        m_cameras[index].remoteFeatureControl = CGXFeatureControlPointer();
-        m_cameras[index].stream = CGXStreamPointer();
-        m_cameras[index].device = CGXDevicePointer();
+        {
+            QMutexLocker stateLocker(&camera.stateMutex);
+            camera.isStreaming = false;
+            while (camera.activeCallbacks > 0) {
+                camera.callbackDrained.wait(&camera.stateMutex, 300);
+            }
+        }
 
-        m_cameras[index].isOpen = false;
-        m_cameras[index].info.isOnline = false;
+        camera.callbackHandler.reset();
+        if (!camera.device.IsNull()) {
+            camera.device->Close();
+        }
+
+        camera.remoteFeatureControl = CGXFeatureControlPointer();
+        camera.stream = CGXStreamPointer();
+        camera.device = CGXDevicePointer();
+
+        {
+            QMutexLocker stateLocker(&camera.stateMutex);
+            camera.isOpen = false;
+            camera.isStreaming = false;
+            camera.isClosing = false;
+            camera.info.isOnline = false;
+            camera.frameNotificationPending.store(false, std::memory_order_release);
+        }
 
         emit cameraDisconnected(index);
         return true;
-
     } catch (CGalaxyException& e) {
-        // 异常路径：强制重置所有指针，确保资源释放
-        qDebug() << "[CameraManager] closeDevice异常, 相机" << index << "错误码:" << e.GetErrorCode();
-        m_cameras[index].callbackHandler.reset();
-        m_cameras[index].stream = CGXStreamPointer();
-        m_cameras[index].device = CGXDevicePointer();
-        m_cameras[index].remoteFeatureControl = CGXFeatureControlPointer();
-        m_cameras[index].isOpen = false;
-        m_cameras[index].info.isOnline = false;
-        emit cameraError(index, e.GetErrorCode(), "关闭设备失败");
+        camera.callbackHandler.reset();
+        camera.remoteFeatureControl = CGXFeatureControlPointer();
+        camera.stream = CGXStreamPointer();
+        camera.device = CGXDevicePointer();
+        {
+            QMutexLocker stateLocker(&camera.stateMutex);
+            camera.isOpen = false;
+            camera.isStreaming = false;
+            camera.isClosing = false;
+            camera.info.isOnline = false;
+        }
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("关闭相机失败"));
         return false;
     }
 }
 
 bool CameraManager::openAll()
 {
+    const auto devices = enumerateDevices();
+    if (devices.isEmpty()) {
+        return false;
+    }
+
     bool success = true;
-    enumerateDevices();
-    for (int i = 0; i < m_deviceCount && i < 2; ++i) {
-        if (!openDevice(i)) success = false;
+    for (int i = 0; i < devices.size() && i < 2; ++i) {
+        if (!openDevice(i)) {
+            success = false;
+        }
     }
     return success;
 }
@@ -229,56 +511,90 @@ bool CameraManager::closeAll()
 {
     bool success = true;
     for (int i = 0; i < 2; ++i) {
-        if (m_cameras[i].isOpen) {
-            if (!closeDevice(i)) success = false;
+        if (!closeDevice(i)) {
+            success = false;
         }
     }
     return success;
 }
 
-// ============================================================
-// 采集控制
-// ============================================================
-
 bool CameraManager::startAcquisition(int index)
 {
-    if (index < 0 || index >= 2) return false;
-    if (!m_cameras[index].isOpen) return false;
-    if (m_cameras[index].isStreaming) return true;
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2) {
+        return false;
+    }
+
+    auto& camera = m_cameras[index];
+    {
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing) {
+            return false;
+        }
+        if (camera.isStreaming) {
+            return true;
+        }
+    }
 
     try {
-        // GenICam标准流程：先 StartGrab（告诉驱动层开始拉流），再 AcquisitionStart（让相机开始曝光）
-        m_cameras[index].stream->StartGrab();
-        qDebug() << "[CameraManager] StartGrab 成功, 相机" << index;
+        if (camera.stream.IsNull() || camera.remoteFeatureControl.IsNull()) {
+            emit cameraError(index, -1, QStringLiteral("相机未完成初始化"));
+            return false;
+        }
 
-        auto& fc = m_cameras[index].remoteFeatureControl;
-        fc->GetCommandFeature("AcquisitionStart")->Execute();
-        qDebug() << "[CameraManager] AcquisitionStart 已发送, 相机" << index;
+        {
+            QMutexLocker stateLocker(&camera.stateMutex);
+            resetFrameIdTracking(camera);
+            camera.isStreaming = true;
+        }
 
-        m_cameras[index].isStreaming = true;
+        camera.stream->StartGrab();
+        camera.remoteFeatureControl->GetCommandFeature("AcquisitionStart")->Execute();
         return true;
     } catch (CGalaxyException& e) {
-        qDebug() << "[CameraManager] startAcquisition失败, 相机" << index << "错误码:" << e.GetErrorCode();
-        emit cameraError(index, e.GetErrorCode(), "开始采集失败");
+        {
+            QMutexLocker stateLocker(&camera.stateMutex);
+            camera.isStreaming = false;
+        }
+        if (!camera.stream.IsNull()) {
+            try {
+                camera.stream->StopGrab();
+            } catch (...) {
+            }
+        }
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("开始采集失败"));
         return false;
     }
 }
 
 bool CameraManager::stopAcquisition(int index)
 {
-    if (index < 0 || index >= 2) return false;
-    if (!m_cameras[index].isStreaming) return true;
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2) {
+        return false;
+    }
+
+    auto& camera = m_cameras[index];
+    {
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isStreaming) {
+            return true;
+        }
+    }
 
     try {
-        // GenICam标准流程：先 AcquisitionStop（让相机停止曝光），再 StopGrab（停止驱动层拉流）
-        auto& fc = m_cameras[index].remoteFeatureControl;
-        fc->GetCommandFeature("AcquisitionStop")->Execute();
+        if (!camera.remoteFeatureControl.IsNull()) {
+            camera.remoteFeatureControl->GetCommandFeature("AcquisitionStop")->Execute();
+        }
+        if (!camera.stream.IsNull()) {
+            camera.stream->StopGrab();
+        }
 
-        m_cameras[index].stream->StopGrab();
-        m_cameras[index].isStreaming = false;
+        QMutexLocker stateLocker(&camera.stateMutex);
+        camera.isStreaming = false;
         return true;
     } catch (CGalaxyException& e) {
-        emit cameraError(index, e.GetErrorCode(), "停止采集失败");
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("停止采集失败"));
         return false;
     }
 }
@@ -287,7 +603,13 @@ bool CameraManager::startAll()
 {
     bool success = true;
     for (int i = 0; i < 2; ++i) {
-        if (m_cameras[i].isOpen && !startAcquisition(i)) success = false;
+        if (isOpen(i) && !startAcquisition(i)) {
+            success = false;
+        }
+    }
+
+    if (!success) {
+        stopAll();
     }
     return success;
 }
@@ -296,244 +618,800 @@ bool CameraManager::stopAll()
 {
     bool success = true;
     for (int i = 0; i < 2; ++i) {
-        if (m_cameras[i].isStreaming && !stopAcquisition(i)) success = false;
+        if (!stopAcquisition(i)) {
+            success = false;
+        }
     }
     return success;
 }
 
-// ============================================================
-// 参数控制
-// ============================================================
-
 bool CameraManager::setExposure(int index, double us)
 {
-    if (index < 0 || index >= 2) return false;
-    if (!m_cameras[index].isOpen) return false;
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
     try {
-        auto& fc = m_cameras[index].remoteFeatureControl;
-        fc->GetFloatFeature("ExposureTime")->SetValue(us);
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return false;
+        }
+        camera.remoteFeatureControl->GetFloatFeature("ExposureTime")->SetValue(us);
         return true;
     } catch (CGalaxyException& e) {
-        emit cameraError(index, e.GetErrorCode(), "设置曝光失败");
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("设置曝光失败"));
         return false;
     }
 }
 
 bool CameraManager::setGain(int index, double dB)
 {
-    if (index < 0 || index >= 2) return false;
-    if (!m_cameras[index].isOpen) return false;
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
     try {
-        auto& fc = m_cameras[index].remoteFeatureControl;
-        fc->GetFloatFeature("Gain")->SetValue(dB);
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return false;
+        }
+        camera.remoteFeatureControl->GetFloatFeature("Gain")->SetValue(dB);
         return true;
     } catch (CGalaxyException& e) {
-        emit cameraError(index, e.GetErrorCode(), "设置增益失败");
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("设置增益失败"));
         return false;
     }
 }
 
 bool CameraManager::setFrameRate(int index, double fps)
 {
-    if (index < 0 || index >= 2) return false;
-    if (!m_cameras[index].isOpen) return false;
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
     try {
-        auto& fc = m_cameras[index].remoteFeatureControl;
-        // 先使能帧率控制
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return false;
+        }
+        auto& fc = camera.remoteFeatureControl;
         if (fc->IsImplemented("AcquisitionFrameRateEnable")) {
             fc->GetBoolFeature("AcquisitionFrameRateEnable")->SetValue(true);
         }
         fc->GetFloatFeature("AcquisitionFrameRate")->SetValue(fps);
         return true;
     } catch (CGalaxyException& e) {
-        emit cameraError(index, e.GetErrorCode(), "设置帧率失败");
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("设置帧率失败"));
         return false;
     }
 }
 
 bool CameraManager::setTriggerMode(int index, TriggerMode mode)
 {
-    if (index < 0 || index >= 2) return false;
-    if (!m_cameras[index].isOpen) return false;
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
     try {
-        auto& fc = m_cameras[index].remoteFeatureControl;
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return false;
+        }
+        auto& fc = camera.remoteFeatureControl;
         switch (mode) {
         case TriggerMode::Continuous:
+            if (fc->IsImplemented("AcquisitionFrameRateEnable") && fc->IsWritable("AcquisitionFrameRateEnable")) {
+                fc->GetBoolFeature("AcquisitionFrameRateEnable")->SetValue(true);
+            }
             fc->GetEnumFeature("TriggerMode")->SetValue("Off");
             break;
         case TriggerMode::Software:
+            setEnumIfWritable(fc, "AcquisitionMode", "Continuous");
             fc->GetEnumFeature("TriggerMode")->SetValue("On");
+            if (fc->IsImplemented("TriggerSelector")) {
+                fc->GetEnumFeature("TriggerSelector")->SetValue("FrameStart");
+            }
             fc->GetEnumFeature("TriggerSource")->SetValue("Software");
             break;
         case TriggerMode::Hardware:
+            setEnumIfWritable(fc, "AcquisitionMode", "Continuous");
+            if (fc->IsImplemented("AcquisitionFrameRateEnable") && fc->IsWritable("AcquisitionFrameRateEnable")) {
+                fc->GetBoolFeature("AcquisitionFrameRateEnable")->SetValue(false);
+            }
             fc->GetEnumFeature("TriggerMode")->SetValue("On");
+            if (fc->IsImplemented("TriggerSelector")) {
+                fc->GetEnumFeature("TriggerSelector")->SetValue("FrameStart");
+            }
             fc->GetEnumFeature("TriggerSource")->SetValue("Line0");
             break;
         }
         return true;
     } catch (CGalaxyException& e) {
-        emit cameraError(index, e.GetErrorCode(), "设置触发模式失败");
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("设置触发模式失败"));
         return false;
     }
 }
 
-// ============================================================
-// 参数读取
-// ============================================================
+bool CameraManager::configureExternalTrigger(int index, const QString& inputLine, const QString& triggerActivation)
+{
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
+    try {
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return false;
+        }
+
+        auto& fc = camera.remoteFeatureControl;
+        const std::string inputLineStd = inputLine.toStdString();
+        const std::string triggerActivationStd = triggerActivation.toStdString();
+        setEnumIfWritable(fc, "AcquisitionMode", "Continuous");
+        if (fc->IsImplemented("AcquisitionFrameRateEnable") && fc->IsWritable("AcquisitionFrameRateEnable")) {
+            fc->GetBoolFeature("AcquisitionFrameRateEnable")->SetValue(false);
+        }
+        setEnumIfWritable(fc, "TriggerMode", "Off");
+        if (fc->IsImplemented("TriggerSelector")) {
+            fc->GetEnumFeature("TriggerSelector")->SetValue("FrameStart");
+        }
+        fc->GetEnumFeature("LineSelector")->SetValue(inputLineStd.c_str());
+        if (fc->IsImplemented("LineMode")) {
+            fc->GetEnumFeature("LineMode")->SetValue("Input");
+        }
+        if (isFeatureWritable(fc, "LineInverter")) {
+            fc->GetBoolFeature("LineInverter")->SetValue(false);
+        }
+        fc->GetEnumFeature("TriggerSource")->SetValue(inputLineStd.c_str());
+        if (fc->IsImplemented("TriggerActivation")) {
+            fc->GetEnumFeature("TriggerActivation")->SetValue(triggerActivationStd.c_str());
+        }
+        fc->GetEnumFeature("TriggerMode")->SetValue("On");
+        return true;
+    } catch (CGalaxyException& e) {
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("配置外部触发失败"));
+        return false;
+    }
+}
+
+bool CameraManager::configureSoftwareTrigger(int index)
+{
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
+    try {
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return false;
+        }
+
+        auto& fc = camera.remoteFeatureControl;
+        setEnumIfWritable(fc, "AcquisitionMode", "Continuous");
+        setEnumIfWritable(fc, "TriggerMode", "Off");
+        if (fc->IsImplemented("TriggerSelector")) {
+            fc->GetEnumFeature("TriggerSelector")->SetValue("FrameStart");
+        }
+        fc->GetEnumFeature("TriggerSource")->SetValue("Software");
+        fc->GetEnumFeature("TriggerMode")->SetValue("On");
+        return true;
+    } catch (CGalaxyException& e) {
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("配置软件触发失败"));
+        return false;
+    }
+}
+
+bool CameraManager::prepareTriggerInputLine(int index, const QString& inputLine)
+{
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
+    try {
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return false;
+        }
+
+        auto& fc = camera.remoteFeatureControl;
+        const std::string inputLineStd = inputLine.toStdString();
+        fc->GetEnumFeature("LineSelector")->SetValue(inputLineStd.c_str());
+        if (fc->IsImplemented("LineMode")) {
+            fc->GetEnumFeature("LineMode")->SetValue("Input");
+        }
+        if (isFeatureWritable(fc, "LineInverter")) {
+            fc->GetBoolFeature("LineInverter")->SetValue(false);
+        }
+        return true;
+    } catch (CGalaxyException& e) {
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("配置触发输入线失败"));
+        return false;
+    }
+}
+
+bool CameraManager::setTriggerSource(int index, const QString& inputLine)
+{
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
+    try {
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return false;
+        }
+
+        auto& fc = camera.remoteFeatureControl;
+        if (fc->IsImplemented("TriggerSelector")) {
+            fc->GetEnumFeature("TriggerSelector")->SetValue("FrameStart");
+        }
+        const std::string inputLineStd = inputLine.toStdString();
+        fc->GetEnumFeature("TriggerSource")->SetValue(inputLineStd.c_str());
+        return true;
+    } catch (CGalaxyException& e) {
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("切换触发源失败"));
+        return false;
+    }
+}
+
+bool CameraManager::setPairTriggerSource(const QString& inputLine)
+{
+    bool success = true;
+    if (!setTriggerSource(0, inputLine)) {
+        success = false;
+    }
+    if (!setTriggerSource(1, inputLine)) {
+        success = false;
+    }
+    return success;
+}
+
+bool CameraManager::flushStreamQueue(int index)
+{
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
+    try {
+        auto& camera = m_cameras[index];
+        {
+            QMutexLocker frameLocker(&camera.frameMutex);
+            camera.latestFrame.release();
+            camera.latestFramePacket = CameraFrame();
+            camera.frameNotificationPending.store(false, std::memory_order_release);
+        }
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.stream.IsNull()) {
+            return false;
+        }
+        camera.stream->FlushQueue();
+        return true;
+    } catch (CGalaxyException& e) {
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("清空图像队列失败"));
+        return false;
+    }
+}
+
+bool CameraManager::flushPairQueues()
+{
+    bool success = true;
+    if (!flushStreamQueue(0)) {
+        success = false;
+    }
+    if (!flushStreamQueue(1)) {
+        success = false;
+    }
+    return success;
+}
+
+bool CameraManager::prepareFullFrame(int index)
+{
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
+    try {
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return false;
+        }
+
+        auto& fc = camera.remoteFeatureControl;
+        fc->GetIntFeature("OffsetX")->SetValue(0);
+        fc->GetIntFeature("OffsetY")->SetValue(0);
+        const RoiAxisRange widthRange = readIntRangeChecked(fc, "Width");
+        const RoiAxisRange heightRange = readIntRangeChecked(fc, "Height");
+        fc->GetIntFeature("Width")->SetValue(widthRange.maxValue);
+        fc->GetIntFeature("Height")->SetValue(heightRange.maxValue);
+        return true;
+    } catch (CGalaxyException& e) {
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("切换全画幅失败"));
+        return false;
+    }
+}
+
+bool CameraManager::prepareFixedRoi(int index, qint64 requestedWidth, qint64 requestedHeight, RoiCapability* capability)
+{
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
+    try {
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return false;
+        }
+
+        auto& fc = camera.remoteFeatureControl;
+        fc->GetIntFeature("OffsetX")->SetValue(0);
+        fc->GetIntFeature("OffsetY")->SetValue(0);
+
+        const RoiAxisRange widthRange = readIntRangeChecked(fc, "Width");
+        const RoiAxisRange heightRange = readIntRangeChecked(fc, "Height");
+        const qint64 width = alignToRange(requestedWidth, widthRange);
+        const qint64 height = alignToRange(requestedHeight, heightRange);
+        fc->GetIntFeature("Width")->SetValue(width);
+        fc->GetIntFeature("Height")->SetValue(height);
+
+        if (capability) {
+            capability->width = fc->GetIntFeature("Width")->GetValue();
+            capability->height = fc->GetIntFeature("Height")->GetValue();
+            capability->offsetX = readIntRangeChecked(fc, "OffsetX");
+            capability->offsetY = readIntRangeChecked(fc, "OffsetY");
+        }
+        return true;
+    } catch (CGalaxyException& e) {
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("配置固定ROI失败"));
+        return false;
+    }
+}
+
+bool CameraManager::readRoiPosition(int index, RoiPosition* position)
+{
+    if (!position) {
+        return false;
+    }
+
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
+    try {
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return false;
+        }
+        position->x = camera.remoteFeatureControl->GetIntFeature("OffsetX")->GetValue();
+        position->y = camera.remoteFeatureControl->GetIntFeature("OffsetY")->GetValue();
+        return true;
+    } catch (CGalaxyException& e) {
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("读取ROI位置失败"));
+        return false;
+    }
+}
+
+bool CameraManager::moveRoi(int index, const RoiPosition& position)
+{
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
+    try {
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return false;
+        }
+        auto& fc = camera.remoteFeatureControl;
+        const RoiAxisRange offsetXRange = readIntRangeChecked(fc, "OffsetX");
+        const RoiAxisRange offsetYRange = readIntRangeChecked(fc, "OffsetY");
+        fc->GetIntFeature("OffsetX")->SetValue(alignToRange(position.x, offsetXRange));
+        fc->GetIntFeature("OffsetY")->SetValue(alignToRange(position.y, offsetYRange));
+        return true;
+    } catch (CGalaxyException& e) {
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("移动ROI失败"));
+        return false;
+    }
+}
+
+bool CameraManager::pauseForRoiUpdate(int index, RoiUpdatePauseState* pauseState)
+{
+    if (pauseState) {
+        *pauseState = RoiUpdatePauseState();
+    }
+
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
+    try {
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull() || camera.stream.IsNull()) {
+            return false;
+        }
+
+        if (camera.isStreaming) {
+            camera.remoteFeatureControl->GetCommandFeature("AcquisitionStop")->Execute();
+            camera.isStreaming = false;
+            if (pauseState) {
+                pauseState->acquisitionStopped = true;
+            }
+            camera.stream->StopGrab();
+            if (pauseState) {
+                pauseState->streamStopped = true;
+            }
+        }
+
+        if (!isFeatureWritable(camera.remoteFeatureControl, "OffsetX") ||
+            !isFeatureWritable(camera.remoteFeatureControl, "OffsetY") ||
+            !isFeatureWritable(camera.remoteFeatureControl, "Width") ||
+            !isFeatureWritable(camera.remoteFeatureControl, "Height")) {
+            return false;
+        }
+        return true;
+    } catch (CGalaxyException& e) {
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("暂停采集以更新ROI失败"));
+        return false;
+    }
+}
+
+bool CameraManager::resumeAfterRoiUpdate(int index, const RoiUpdatePauseState& pauseState)
+{
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return false;
+    }
+
+    try {
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull() || camera.stream.IsNull()) {
+            return false;
+        }
+
+        if (pauseState.streamStopped) {
+            camera.stream->StartGrab();
+        }
+        if (pauseState.acquisitionStopped) {
+            resetFrameIdTracking(camera);
+            camera.remoteFeatureControl->GetCommandFeature("AcquisitionStart")->Execute();
+            camera.isStreaming = true;
+        }
+        return true;
+    } catch (CGalaxyException& e) {
+        emit cameraError(index, e.GetErrorCode(), QStringLiteral("恢复采集失败"));
+        return false;
+    }
+}
+
+bool CameraManager::pausePairForRoiUpdate(RoiUpdatePauseState pauseState[2])
+{
+    if (!pauseState) {
+        return false;
+    }
+    pauseState[0] = RoiUpdatePauseState();
+    pauseState[1] = RoiUpdatePauseState();
+    if (!pauseForRoiUpdate(0, &pauseState[0])) {
+        return false;
+    }
+    if (!pauseForRoiUpdate(1, &pauseState[1])) {
+        resumeAfterRoiUpdate(0, pauseState[0]);
+        pauseState[0] = RoiUpdatePauseState();
+        return false;
+    }
+    return true;
+}
+
+bool CameraManager::resumePairAfterRoiUpdate(const RoiUpdatePauseState pauseState[2])
+{
+    if (!pauseState) {
+        return false;
+    }
+
+    bool success = true;
+    if (!resumeAfterRoiUpdate(0, pauseState[0])) {
+        success = false;
+    }
+    if (!resumeAfterRoiUpdate(1, pauseState[1])) {
+        success = false;
+    }
+    return success;
+}
 
 double CameraManager::getExposure(int index)
 {
-    if (index < 0 || index >= 2 || !m_cameras[index].isOpen) return 0.0;
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return 0.0;
+    }
+
     try {
-        return m_cameras[index].remoteFeatureControl
-            ->GetFloatFeature("ExposureTime")->GetValue();
-    } catch (...) { return 0.0; }
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return 0.0;
+        }
+        return camera.remoteFeatureControl->GetFloatFeature("ExposureTime")->GetValue();
+    } catch (...) {
+        return 0.0;
+    }
 }
 
 double CameraManager::getGain(int index)
 {
-    if (index < 0 || index >= 2 || !m_cameras[index].isOpen) return 0.0;
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return 0.0;
+    }
+
     try {
-        return m_cameras[index].remoteFeatureControl
-            ->GetFloatFeature("Gain")->GetValue();
-    } catch (...) { return 0.0; }
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return 0.0;
+        }
+        return camera.remoteFeatureControl->GetFloatFeature("Gain")->GetValue();
+    } catch (...) {
+        return 0.0;
+    }
 }
 
 double CameraManager::getFrameRate(int index)
 {
-    if (index < 0 || index >= 2 || !m_cameras[index].isOpen) return 0.0;
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return 0.0;
+    }
+
     try {
-        return m_cameras[index].remoteFeatureControl
-            ->GetFloatFeature("AcquisitionFrameRate")->GetValue();
-    } catch (...) { return 0.0; }
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return 0.0;
+        }
+        return camera.remoteFeatureControl->GetFloatFeature("AcquisitionFrameRate")->GetValue();
+    } catch (...) {
+        return 0.0;
+    }
 }
 
 double CameraManager::getTemperature(int index)
 {
-    if (index < 0 || index >= 2 || !m_cameras[index].isOpen) return 0.0;
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2 || !m_initialized) {
+        return 0.0;
+    }
+
     try {
-        return m_cameras[index].remoteFeatureControl
-            ->GetFloatFeature("DeviceTemperature")->GetValue();
-    } catch (...) { return 0.0; }
+        auto& camera = m_cameras[index];
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || camera.isClosing || camera.remoteFeatureControl.IsNull()) {
+            return 0.0;
+        }
+        return camera.remoteFeatureControl->GetFloatFeature("DeviceTemperature")->GetValue();
+    } catch (...) {
+        return 0.0;
+    }
 }
 
 QString CameraManager::getSerialNumber(int index) const
 {
-    if (index < 0 || index >= 2) return "";
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2) {
+        return QString();
+    }
     return m_cameras[index].info.serialNumber;
 }
 
 QString CameraManager::getModelName(int index) const
 {
-    if (index < 0 || index >= 2) return "";
+    QMutexLocker apiLocker(&m_apiMutex);
+    if (index < 0 || index >= 2) {
+        return QString();
+    }
     return m_cameras[index].info.modelName;
 }
 
-// ============================================================
-// 图像获取
-// ============================================================
-
 cv::Mat CameraManager::getLatestFrame(int index)
 {
-    if (index < 0 || index >= 2) return cv::Mat();
+    if (index < 0 || index >= 2) {
+        return cv::Mat();
+    }
+
     QMutexLocker locker(&m_cameras[index].frameMutex);
     return m_cameras[index].latestFrame.clone();
 }
 
-// ============================================================
-// 状态查询
-// ============================================================
+cv::Mat CameraManager::takeLatestFrame(int index)
+{
+    if (index < 0 || index >= 2) {
+        return cv::Mat();
+    }
+
+    auto& camera = m_cameras[index];
+    QMutexLocker locker(&camera.frameMutex);
+    camera.frameNotificationPending.store(false, std::memory_order_release);
+    return camera.latestFrame.clone();
+}
+
+CameraFrame CameraManager::takeLatestFramePacket(int index)
+{
+    if (index < 0 || index >= 2) {
+        return CameraFrame();
+    }
+
+    auto& camera = m_cameras[index];
+    QMutexLocker locker(&camera.frameMutex);
+    camera.frameNotificationPending.store(false, std::memory_order_release);
+    return camera.latestFramePacket;
+}
 
 bool CameraManager::isOpen(int index) const
 {
-    if (index < 0 || index >= 2) return false;
+    if (index < 0 || index >= 2) {
+        return false;
+    }
+
+    QMutexLocker locker(&m_cameras[index].stateMutex);
     return m_cameras[index].isOpen;
 }
 
 bool CameraManager::isStreaming(int index) const
 {
-    if (index < 0 || index >= 2) return false;
+    if (index < 0 || index >= 2) {
+        return false;
+    }
+
+    QMutexLocker locker(&m_cameras[index].stateMutex);
     return m_cameras[index].isStreaming;
 }
 
 int CameraManager::deviceCount() const
 {
+    QMutexLocker apiLocker(&m_apiMutex);
     return m_deviceCount;
 }
 
-// ============================================================
-// 回调处理
-// ============================================================
-
 void CameraManager::onFrameCaptured(int cameraIndex, CImageDataPointer& imageData)
 {
-    if (cameraIndex < 0 || cameraIndex >= 2) return;
+    if (cameraIndex < 0 || cameraIndex >= 2) {
+        return;
+    }
+
+    auto& camera = m_cameras[cameraIndex];
+    {
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (!camera.isOpen || !camera.isStreaming || camera.isClosing) {
+            return;
+        }
+        ++camera.activeCallbacks;
+    }
+
+    const auto finishCallback = [&camera]() {
+        QMutexLocker stateLocker(&camera.stateMutex);
+        if (camera.activeCallbacks > 0) {
+            --camera.activeCallbacks;
+        }
+        if (camera.activeCallbacks == 0) {
+            camera.callbackDrained.wakeAll();
+        }
+    };
 
     try {
-        // 检查帧状态
-        GX_FRAME_STATUS status = imageData->GetStatus();
+        const GX_FRAME_STATUS status = imageData->GetStatus();
         if (status != GX_FRAME_STATUS_SUCCESS) {
-            qDebug() << "[CameraManager] 帧状态异常, 相机" << cameraIndex << "状态:" << status;
+            finishCallback();
             return;
         }
 
-        uint64_t width = imageData->GetWidth();
-        uint64_t height = imageData->GetHeight();
-        GX_PIXEL_FORMAT_ENTRY pixelFormat = imageData->GetPixelFormat();
+        const uint64_t width = imageData->GetWidth();
+        const uint64_t height = imageData->GetHeight();
+        const GX_PIXEL_FORMAT_ENTRY pixelFormat = imageData->GetPixelFormat();
+        const quint64 rawFrameId = static_cast<quint64>(imageData->GetFrameID());
+        const quint64 cameraTimestamp = static_cast<quint64>(imageData->GetTimeStamp());
+        const qint64 receivedMs = QDateTime::currentMSecsSinceEpoch();
 
-        // 先深拷贝原始缓冲区，避免SDK复用缓冲区导致数据竞争
         cv::Mat frame;
         if (pixelFormat == GX_PIXEL_FORMAT_MONO8) {
-            // 直接拷贝原始数据
-            size_t bufSize = width * height;
+            const size_t bufSize = static_cast<size_t>(width * height);
             frame = cv::Mat(static_cast<int>(height), static_cast<int>(width), CV_8UC1);
-            memcpy(frame.data, imageData->GetBuffer(), bufSize);
+            std::memcpy(frame.data, imageData->GetBuffer(), bufSize);
+        } else if (is16BitMonoPixelFormat(pixelFormat)) {
+            const size_t bufSize = static_cast<size_t>(width * height * sizeof(uint16_t));
+            frame = cv::Mat(static_cast<int>(height), static_cast<int>(width), CV_16UC1);
+            std::memcpy(frame.data, imageData->GetBuffer(), bufSize);
         } else if (pixelFormat == GX_PIXEL_FORMAT_BAYER_RG8 ||
                    pixelFormat == GX_PIXEL_FORMAT_BAYER_GB8 ||
                    pixelFormat == GX_PIXEL_FORMAT_BAYER_GR8 ||
                    pixelFormat == GX_PIXEL_FORMAT_BAYER_BG8) {
-            // Bayer转RGB（ConvertToRGB24内部使用SDK缓冲区，需立即拷贝）
-            void* rgbBuffer = imageData->ConvertToRGB24(
-                GX_BIT_0_7, GX_RAW2RGB_NEIGHBOUR, false);
-            size_t bufSize = width * height * 3;
+            void* rgbBuffer = imageData->ConvertToRGB24(GX_BIT_0_7, GX_RAW2RGB_NEIGHBOUR, false);
+            const size_t bufSize = static_cast<size_t>(width * height * 3);
             frame = cv::Mat(static_cast<int>(height), static_cast<int>(width), CV_8UC3);
-            memcpy(frame.data, rgbBuffer, bufSize);
+            std::memcpy(frame.data, rgbBuffer, bufSize);
         } else {
             void* raw8Buffer = imageData->ConvertToRaw8(GX_BIT_0_7);
-            size_t bufSize = width * height;
+            const size_t bufSize = static_cast<size_t>(width * height);
             frame = cv::Mat(static_cast<int>(height), static_cast<int>(width), CV_8UC1);
-            memcpy(frame.data, raw8Buffer, bufSize);
+            std::memcpy(frame.data, raw8Buffer, bufSize);
         }
 
         if (frame.empty()) {
-            qDebug() << "[CameraManager] 帧转换后为空, 相机" << cameraIndex;
+            finishCallback();
             return;
         }
 
-        static int s_frameCount[2] = {0, 0};
-        s_frameCount[cameraIndex]++;
-        if (s_frameCount[cameraIndex] % 100 == 1) {
-            qDebug() << "[CameraManager] 收到帧 #" << s_frameCount[cameraIndex]
-                     << "相机" << cameraIndex
-                     << "尺寸:" << frame.cols << "x" << frame.rows
-                     << "通道:" << frame.channels();
-        }
-
-        // 更新最新帧
+        bool abortCallback = false;
         {
-            QMutexLocker locker(&m_cameras[cameraIndex].frameMutex);
-            m_cameras[cameraIndex].latestFrame = frame;
+            QMutexLocker stateLocker(&camera.stateMutex);
+            if (!camera.isOpen || camera.isClosing) {
+                abortCallback = true;
+            }
+        }
+        if (abortCallback) {
+            finishCallback();
+            return;
         }
 
-        // 注意：帧率和温度不在回调中查询（线程安全），
-        // 改在主线程的onFrameReady中定时更新
+        quint64 frameId = 0;
+        {
+            QMutexLocker stateLocker(&camera.stateMutex);
+            frameId = extendWrappingFrameId(camera, rawFrameId);
+        }
 
-        // 发送信号
-        emit frameReady(cameraIndex, frame);
+        CameraFrame packet;
+        packet.image = frame;
+        packet.pixelFormat = pixelFormat;
+        packet.bitDepth = cameraFrameBitDepth(pixelFormat);
+        packet.maxPixelValue = cameraFrameMaxPixelValue(pixelFormat);
+        packet.frameId = frameId;
+        packet.cameraTimestamp = cameraTimestamp;
+        packet.receivedMs = receivedMs;
 
+        {
+            QMutexLocker locker(&camera.frameMutex);
+            camera.latestFrame = frame;
+            camera.latestFramePacket = packet;
+        }
+
+        emit frameCaptured(cameraIndex, packet);
+
+        bool expected = false;
+        if (camera.frameNotificationPending.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            emit frameReady(cameraIndex);
+        }
+        finishCallback();
     } catch (CGalaxyException& e) {
-        emit cameraError(cameraIndex, e.GetErrorCode(), "图像回调处理异常");
+        finishCallback();
+        emit cameraError(cameraIndex, e.GetErrorCode(), QStringLiteral("图像回调处理异常"));
     } catch (...) {
-        emit cameraError(cameraIndex, -1, "图像回调未知异常");
+        finishCallback();
+        emit cameraError(cameraIndex, -1, QStringLiteral("图像回调未知异常"));
     }
 }
