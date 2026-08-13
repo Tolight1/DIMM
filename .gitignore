@@ -15,3 +15,27 @@ DIMM_Release/
 *.tlog
 *.dll
 *.exe
+dark_noise_runs/
+
+# Local build trees and generated CMake output
+build*/
+DIMM_release/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+Testing/
+*.ninja
+.ninja_deps
+.ninja_log
+
+# Local agent, editor, and Python state
+.superpowers/
+.agents/
+.codex/
+**/__pycache__/
+*.py[cod]
+
+# Local document rendering and unpacked reference material
+network_comm_render/
+network_comm_unpacked/
