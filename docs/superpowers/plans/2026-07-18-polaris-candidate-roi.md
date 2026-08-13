@@ -24,7 +24,7 @@
 **Files:**
 - Create: `tests/test_polaris_candidate_roi_static.py`
 
-- [ ] **Step 1: Write the failing static test**
+- [x] **Step 1: Write the failing static test**
 
 Create `tests/test_polaris_candidate_roi_static.py` with:
 
@@ -120,7 +120,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run the new test and verify it fails**
+- [x] **Step 2: Run the new test and verify it fails**
 
 Run:
 
@@ -130,7 +130,7 @@ python -m pytest tests/test_polaris_candidate_roi_static.py -q
 
 Expected: FAIL because `InitialStarCandidate`, `detectInitialStarCandidates`, candidate overlay methods, and last target state do not exist yet.
 
-- [ ] **Step 3: Commit the failing test**
+- [x] **Step 3: Commit the failing test**
 
 Run:
 
@@ -146,7 +146,7 @@ Expected: commit contains only the new static test.
 **Files:**
 - Modify: `src/DIMM.cpp`
 
-- [ ] **Step 1: Add candidate data structures near `InitialStarDetectionConfig`**
+- [x] **Step 1: Add candidate data structures near `InitialStarDetectionConfig`**
 
 Insert near the existing initial localization helpers:
 
@@ -169,7 +169,7 @@ struct InitialStarSelection {
 };
 ```
 
-- [ ] **Step 2: Implement `detectInitialStarCandidates()`**
+- [x] **Step 2: Implement `detectInitialStarCandidates()`**
 
 Add this function before `detectInitialStarCentroid()`:
 
@@ -271,7 +271,7 @@ QVector<InitialStarCandidate> detectInitialStarCandidates(const cv::Mat& graysca
 }
 ```
 
-- [ ] **Step 3: Update compatibility wrapper**
+- [x] **Step 3: Update compatibility wrapper**
 
 At the top of `detectInitialStarCentroid()`, use candidates first:
 
@@ -290,7 +290,7 @@ if (!candidates.isEmpty()) {
 
 Keep the existing fallback logic below this block so dim full-frame images still use the fast/local peak fallback.
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 Run:
 
@@ -300,7 +300,7 @@ python -m pytest tests/test_polaris_candidate_roi_static.py::PolarisCandidateRoi
 
 Expected: new candidate detector tests PASS; existing full-frame locator test still PASS.
 
-- [ ] **Step 5: Commit candidate detection**
+- [x] **Step 5: Commit candidate detection**
 
 Run:
 
@@ -317,7 +317,7 @@ Expected: commit contains only `src/DIMM.cpp`.
 - Modify: `src/CanvasWidgets.h`
 - Modify: `src/CanvasWidgets.cpp`
 
-- [ ] **Step 1: Add overlay API to `CanvasWidgets.h`**
+- [x] **Step 1: Add overlay API to `CanvasWidgets.h`**
 
 Inside `FullFrameCanvas`, add:
 
@@ -340,7 +340,7 @@ QVector<StarCandidateOverlay> m_starCandidateOverlays;
 void drawStarCandidateOverlays(QPainter& painter);
 ```
 
-- [ ] **Step 2: Implement setters in `CanvasWidgets.cpp`**
+- [x] **Step 2: Implement setters in `CanvasWidgets.cpp`**
 
 Add near the existing `setRoiList()` methods:
 
@@ -361,7 +361,7 @@ void FullFrameCanvas::clearStarCandidateOverlays()
 }
 ```
 
-- [ ] **Step 3: Draw candidate overlays**
+- [x] **Step 3: Draw candidate overlays**
 
 Add:
 
@@ -399,7 +399,7 @@ void FullFrameCanvas::drawStarCandidateOverlays(QPainter& painter)
 
 In `paintEvent()`, call `drawStarCandidateOverlays(painter);` after `drawRoiOverlays(painter);`.
 
-- [ ] **Step 4: Run overlay tests**
+- [x] **Step 4: Run overlay tests**
 
 Run:
 
@@ -409,7 +409,7 @@ python -m pytest tests/test_polaris_candidate_roi_static.py::PolarisCandidateRoi
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit overlay rendering**
+- [x] **Step 5: Commit overlay rendering**
 
 Run:
 
@@ -426,7 +426,7 @@ Expected: commit contains only canvas overlay changes.
 - Modify: `src/DIMM.h`
 - Modify: `src/DIMM.cpp`
 
-- [ ] **Step 1: Extend live runtime state in `DIMM.h`**
+- [x] **Step 1: Extend live runtime state in `DIMM.h`**
 
 Add to `RuntimeState`:
 
@@ -439,7 +439,7 @@ bool pendingInitialCandidateSelectionRequired[2] = {false, false};
 
 The pending candidate list remains local to each frame for now. Do not store `InitialStarCandidate` in the header because it is a `DIMM.cpp` helper type.
 
-- [ ] **Step 2: Add selector helper in `DIMM.cpp`**
+- [x] **Step 2: Add selector helper in `DIMM.cpp`**
 
 Add near the candidate detection helpers:
 
@@ -500,7 +500,7 @@ InitialStarSelection selectInitialStarCandidate(QVector<InitialStarCandidate> ca
 }
 ```
 
-- [ ] **Step 3: Add overlay mapping helper**
+- [x] **Step 3: Add overlay mapping helper**
 
 Add:
 
@@ -523,7 +523,7 @@ QVector<FullFrameCanvas::StarCandidateOverlay> buildCandidateOverlays(
 }
 ```
 
-- [ ] **Step 4: Update `maybeSeedRoiFromFrame()`**
+- [x] **Step 4: Update `maybeSeedRoiFromFrame()`**
 
 Replace the direct centroid detection block with:
 
@@ -557,7 +557,7 @@ const QPointF centroid = selection.candidate.center;
 
 Keep the existing ROI construction and `commitPairedInitialRoisIfReady()` call after this block.
 
-- [ ] **Step 5: Clear candidate overlays after ROI commit**
+- [x] **Step 5: Clear candidate overlays after ROI commit**
 
 In `commitPairedInitialRoisIfReady()`, after both `runtime.initialRoiConfirmed` values become true, add:
 
@@ -572,7 +572,7 @@ runtime.pendingInitialCandidateSelectionRequired[0] = false;
 runtime.pendingInitialCandidateSelectionRequired[1] = false;
 ```
 
-- [ ] **Step 6: Run candidate selection tests**
+- [x] **Step 6: Run candidate selection tests**
 
 Run:
 
@@ -582,7 +582,7 @@ python -m pytest tests/test_polaris_candidate_roi_static.py::PolarisCandidateRoi
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit live seed selection**
+- [x] **Step 7: Commit live seed selection**
 
 Run:
 
@@ -599,7 +599,7 @@ Expected: commit contains only live seeding state and selection changes.
 - Modify: `src/DIMM.cpp`
 - Modify: `src/DIMM.h`
 
-- [ ] **Step 1: Record last absolute centroid during tracking**
+- [x] **Step 1: Record last absolute centroid during tracking**
 
 In the `ImageProcessor::centroidReady` lambda in `setupConnections()`, after `runtime.hasValidCentroid[camIdx] = true;`, add:
 
@@ -612,7 +612,7 @@ if (m_captureState == CaptureState::Live && m_liveStartupPhase == LiveStartupPha
 
 These `x` and `y` values are already absolute sensor coordinates from `ImageProcessorWorker::processFrame()`.
 
-- [ ] **Step 2: Preserve last target through full-frame relocalization reset**
+- [x] **Step 2: Preserve last target through full-frame relocalization reset**
 
 In `requestLiveFullFrameRelocalization()`, keep the reset of `hasValidCentroid`, `lostCentroidFrameCount`, `initialRoiConfirmed`, and `pendingInitialRoiReady`, but do not clear `lastTargetPosition` or `hasLastTargetPosition`.
 
@@ -623,7 +623,7 @@ Add a comment in that function:
 // choose the nearest full-frame candidate instead of the brightest unrelated star.
 ```
 
-- [ ] **Step 3: Clear target identity only on new capture state reset**
+- [x] **Step 3: Clear target identity only on new capture state reset**
 
 Find the runtime reset path used when a new capture begins. Add:
 
@@ -640,7 +640,7 @@ runtime.pendingInitialCandidateSelectionRequired[1] = false;
 
 This reset belongs at whole-run startup, not minute ROI updates or relocalization.
 
-- [ ] **Step 4: Run relocalization tests**
+- [x] **Step 4: Run relocalization tests**
 
 Run:
 
@@ -650,7 +650,7 @@ python -m pytest tests/test_polaris_candidate_roi_static.py::PolarisCandidateRoi
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit relocalization identity hint**
+- [x] **Step 5: Commit relocalization identity hint**
 
 Run:
 
