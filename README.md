@@ -15,8 +15,8 @@
 </div>
 
 > [!IMPORTANT]
-> 当前推荐开发目录为 **`src82/`**。  
-> `src731质心算法/` 等目录主要保留算法演进过程和历史实现，不建议作为新功能开发入口。
+> 当前唯一正式源码目录为 **`src/`**。
+> 旧版 `src1`、`src2`、`srcROI` 等源码副本已经从当前分支清理；如需比较历史实现，请使用 Git 历史或旧提交。
 
 ---
 
@@ -172,9 +172,9 @@ max(minimumIntensity, background + sigmaMultiplier × noiseSigma)
 核心实现位于：
 
 ```text
-src82/ImageProcessor.cpp
-src82/CentroidLogic.h
-src82/AutoExposureLogic.h
+src/ImageProcessor.cpp
+src/CentroidLogic.h
+src/AutoExposureLogic.h
 ```
 
 ### 4. 热像素修正
@@ -218,7 +218,7 @@ TrendConflict
 
 ### 6. 帧通知与顺序提交线程模型
 
-当前 `src82` 采用两层职责明确的帧传递方式。
+当前 `src` 采用两层职责明确的帧传递方式。
 
 #### CameraManager：第一层实时通知合并
 
@@ -260,7 +260,7 @@ QMetaObject::invokeMethod(
 - `frameId`、相机时间戳和 acquisition generation 会随图像一起传递；
 - Worker 仍通过 generation 检查拒绝采集切换前的旧帧。
 
-该模型恢复了 `src731质心算法` 已经过实机长时间验证的提交行为，更有利于保持双相机 FrameID 的到达顺序和配对完整性。
+该模型延续了历史版本中经过实机验证的提交行为，更有利于保持双相机 FrameID 的到达顺序和配对完整性。历史版本仍可通过 Git 提交记录追溯。
 
 需要注意：如果 Worker 长时间处理不过来，Qt 队列仍可能增长。因此实机验证应同时观察处理延迟、停止响应时间和内存占用趋势。
 
@@ -312,7 +312,7 @@ PolarisCatalog.*
 
 ```text
 DIMM/
-├─ src82/                    # 当前推荐开发版本
+├─ src/                      # 当前唯一正式源码目录
 │  ├─ DIMM.cpp               # 主窗口初始化和公共协调逻辑
 │  ├─ DIMM.Alignment.cpp     # 对准模式
 │  ├─ DIMM.AutoExposure.cpp  # 自动曝光状态与执行
@@ -331,13 +331,17 @@ DIMM/
 │  ├─ ResultWriter.*         # CSV 缓冲写入
 │  ├─ AppConfig.*            # 统一配置模型
 │  └─ ...
-├─ src731质心算法/          # 历史算法与已验证帧提交模型参考
-├─ src待优化/               # 早期重构基线
-└─ ...                       # 其他实验和历史版本
+├─ docs/                     # 项目说明、设计文档和执行计划
+├─ tests/                    # 静态检查与协议测试
+├─ scripts/                  # 构建、文档和验证脚本
+├─ resources/                # 星表等运行时资源
+├─ tools/                    # 开发辅助工具
+├─ CMakeLists.txt            # 根目录构建入口
+└─ ...                       # 配置和部署文件
 ```
 
 > [!NOTE]
-> 仓库保留多个历史源码目录是为了比较算法和工程演进。新开发应以 `src82/` 为基线，避免同时修改多个历史目录。当前 `src82` 的 `ImageProcessor` 帧提交行为已恢复为 `src731质心算法` 中经过实机验证的 `frame.clone() + Qt::QueuedConnection` 模型。
+> 新开发只应修改 `src/`。历史源码副本不再作为仓库目录保存，版本比较请使用 Git 的提交、分支和 Pull Request。
 
 ---
 
@@ -383,10 +387,10 @@ cd DIMM
 当前开发使用：
 
 ```text
-src82/
+src/
 ```
 
-请不要默认将 `src731质心算法/` 或其他历史目录与 `src82/` 同时加入同一个目标，否则容易出现重复符号和版本混用。
+根目录 `CMakeLists.txt` 会自动收集 `src/` 下的源文件。不要再创建 `src1`、`src2`、`srcROI` 等平行源码目录来保存版本。
 
 ### 3. 配置第三方依赖
 
@@ -401,7 +405,7 @@ src82/
 
 ### 4. 构建
 
-仓库当前以源码开发和硬件联调为主。请使用本地 CMake / Visual Studio 工程，将 `src82/` 中的源码、头文件和 `DIMM.ui` 加入应用目标。
+仓库当前以源码开发和硬件联调为主。根目录已经提供 `CMakeLists.txt`，构建目标会使用 `src/` 中的源码、头文件和 `DIMM.ui`。
 
 一个典型的构建流程为：
 
@@ -443,6 +447,48 @@ platforms/qwindows.dll
 8. 确认全画幅定位完成并进入 ROI 跟踪；
 9. 检查有效质心比例、处理延迟和同步残差；
 10. 确认 CSV 文件持续写入。
+
+---
+
+## Git / GitHub 工作流
+
+仓库使用 Git 管理源码版本，不再通过创建 `src1`、`src2`、`srcROI` 等目录保存整份源码副本。
+
+推荐流程：
+
+```text
+从 master 创建任务分支
+  → 只修改 src/ 和本任务相关文件
+  → 本地运行测试或记录未通过的测试
+  → 提交一个说明清楚的 Git commit
+  → 推送分支
+  → 创建 Draft Pull Request
+  → 检查 Files changed 后再合并
+```
+
+常用命令：
+
+```bash
+git switch master
+git pull --ff-only
+git switch -c codex/<task-name>
+
+# 修改代码后
+git status
+git add src/ tests/ docs/
+git commit -m "简短描述本次修改"
+git push -u origin codex/<task-name>
+```
+
+提交和 PR 的建议：
+
+- 一个提交只解决一个相对独立的问题；
+- 不要把构建目录、DLL、EXE、个人绝对路径和观测数据提交到仓库；
+- PR 默认先创建为 Draft，确认文件范围和测试结果后再转为 Ready for review；
+- 合并前查看 `Files changed`，确认没有误删 `src/` 中的正式源码；
+- 合并后继续从最新 `master` 创建新的任务分支。
+
+版本比较和回退应使用 Git 的提交、分支和 PR，而不是复制源码目录。
 
 ---
 
@@ -640,14 +686,14 @@ ImageProcessorWorker::appendDifferentialSample
 - ROI 图像坐标和全画幅绝对质心坐标一致；
 - 停止采集后没有旧 generation 的帧继续参与测量；
 - 长时间运行时处理延迟和内存占用不持续增长；
-- 停止采集后的响应时间与 `src731质心算法` 基线相当。
+- 停止采集后的响应时间与历史实机验证基线相当。
 
 ### 测量验证
 
 - 质心有效比例和真实星点质量一致；
 - 热像素不会被误识别为稳定星点；
 - 差分配对数量与采样频率相符；
-- 双相机 FrameID 配对率不低于 `src731质心算法` 的实验基线；
+- 双相机 FrameID 配对率不低于历史实验基线；
 - 同步残差和未配对样本数量可解释；
 - 自动曝光不会在稳定目标上持续振荡；
 - 自动曝光改变后热像素模板正确切换；
@@ -657,7 +703,7 @@ ImageProcessorWorker::appendDifferentialSample
 
 ## 项目状态
 
-`src82` 已完成一轮主要工程整理，包括：
+当前 `src/` 已完成一轮主要工程整理，包括：
 
 - `DIMM.cpp` 按功能拆分；
 - 统一 `AppConfig` 配置模型；
@@ -666,7 +712,7 @@ ImageProcessorWorker::appendDifferentialSample
 - 公共图像、路径和文本配置工具提取；
 - 对准流程模块化；
 - ROI 和北极星热像素缓存；
-- `ImageProcessor` 恢复 `src731质心算法` 的深拷贝顺序提交模型；
+- `ImageProcessor` 使用经过历史实机验证的深拷贝顺序提交模型；
 - 自动曝光控制器和状态机接入。
 
 当前仍属于科研原型，后续重点包括：
@@ -679,6 +725,16 @@ ImageProcessorWorker::appendDifferentialSample
 - 建立可重复的离线图像测试集；
 - 补充根目录构建脚本和自动化测试；
 - 增加正式界面截图和硬件连接说明。
+
+### 当前测试基线
+
+测试使用 Python 标准库 `unittest`，运行：
+
+```bash
+python -m unittest discover -s tests -p "test*.py" -q
+```
+
+仓库整理时的基线结果为：422 个测试，其中 89 个失败、9 个错误。它们主要反映现有静态测试与最新 `src/` 结构之间尚未完成的同步，后续应作为独立任务修复；不要为了让测试通过而恢复旧版源码目录。
 
 ---
 
