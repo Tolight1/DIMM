@@ -230,7 +230,7 @@ void DIMM::handleLiveFramePacket(int cameraIndex, const CameraFrame& packet)
         }
         const bool shouldRefreshPreview =
             runtime.lastLivePreviewUpdateMs[cameraIndex] < 0 ||
-            (nowMs - runtime.lastLivePreviewUpdateMs[cameraIndex]) >= kSimulationPreviewIntervalMs;
+            (nowMs - runtime.lastLivePreviewUpdateMs[cameraIndex]) >= kLiveFullFramePreviewIntervalMs;
         FullFrameCanvas* targetCanvas = cameraIndex == 0 ? m_fullFrameCanvas1 : m_fullFrameCanvas2;
         const bool canUpdateFullFramePreview =
             m_captureState == CaptureState::Live
