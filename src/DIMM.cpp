@@ -136,20 +136,6 @@ void DIMM::setupServiceManagers()
 
 void DIMM::setupRuntimeActions()
 {
-    m_simulationTimer = new QTimer(this);
-    m_simulationTimer->setInterval(kSimulationFrameIntervalMs);
-    connect(m_simulationTimer, &QTimer::timeout, this, &DIMM::onUpdateSimulation);
-
-    m_actionStartSimulation = new QAction(QStringLiteral("模拟采集"), this);
-    m_actionStartSimulation->setObjectName(QStringLiteral("btnStartSimulation"));
-    if (ui->toolbar) {
-        ui->toolbar->insertAction(ui->btnStop, m_actionStartSimulation);
-    }
-    if (ui->menuTools) {
-        ui->menuTools->insertAction(ui->actionROISchedule, m_actionStartSimulation);
-        ui->menuTools->insertSeparator(ui->actionROISchedule);
-    }
-
     m_actionAlignmentMode = new QAction(QStringLiteral("对准模式"), this);
     m_actionAlignmentMode->setObjectName(QStringLiteral("btnAlignmentMode"));
     m_actionAlignmentMode->setCheckable(true);
@@ -319,7 +305,6 @@ void DIMM::setupCentroidProcessorConnection()
             return;
         }
         auto& runtime = activeRuntime();
-        const bool hadBothCentroids = hasValidCentroidsForRoiUpdate();
         const bool usable = isUsableCentroidSample(camIdx,
                                                    x,
                                                    y,
@@ -351,14 +336,6 @@ void DIMM::setupCentroidProcessorConnection()
             runtime.lastTargetPosition[camIdx] = QPointF(x, y);
             runtime.hasLastTargetPosition[camIdx] = true;
         }
-        if (m_captureState == CaptureState::Simulation &&
-            !runtime.simulationRoiSeeded &&
-            !hadBothCentroids &&
-            hasValidCentroidsForRoiUpdate()) {
-            updateMinuteRoi(true);
-            runtime.simulationRoiSeeded = true;
-        }
-
         if (m_captureState == CaptureState::Live &&
             m_liveStartupPhase == LiveStartupPhase::Tracking) {
             if (shouldUpdateRoiForRecentering()) {
@@ -729,9 +706,6 @@ DIMM::~DIMM()
     if (m_1hzTimer) {
         m_1hzTimer->stop();
     }
-    if (m_simulationTimer) {
-        m_simulationTimer->stop();
-    }
     if (m_hardwareTriggerStartupTimer) {
         m_hardwareTriggerStartupTimer->stop();
     }
@@ -762,7 +736,6 @@ DIMM::~DIMM()
 void DIMM::setupConnections()
 {
     connect(ui->btnStart, &QAction::triggered, this, &DIMM::onStartCapture);
-    connect(m_actionStartSimulation, &QAction::triggered, this, &DIMM::onStartSimulation);
     connect(ui->btnStop, &QAction::triggered, this, &DIMM::onStopCapture);
     connect(ui->btnFullFrame, &QAction::triggered, this, &DIMM::onShowMainPage);
     connect(ui->btnSettings, &QAction::triggered, this, &DIMM::onShowSettings);
@@ -819,9 +792,6 @@ void DIMM::setupConnections()
 
     auto* spaceShortcut = new QShortcut(QKeySequence(Qt::Key_Space), this);
     connect(spaceShortcut, &QShortcut::activated, this, &DIMM::onStartCapture);
-
-    auto* simulationShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+M")), this);
-    connect(simulationShortcut, &QShortcut::activated, this, &DIMM::onStartSimulation);
 
     auto* escShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), this);
     connect(escShortcut, &QShortcut::activated, this, &DIMM::onStopCapture);
@@ -957,22 +927,12 @@ bool DIMM::canConnectOrDisconnectCameras(QString* reason) const
 
 DIMM::CaptureRuntimeContext& DIMM::activeRuntime()
 {
-    return isSimulationCaptureActive() ? m_simulationRuntime : m_liveRuntime;
+    return m_liveRuntime;
 }
 
 const DIMM::CaptureRuntimeContext& DIMM::activeRuntime() const
 {
-    return isSimulationCaptureActive() ? m_simulationRuntime : m_liveRuntime;
-}
-
-DIMM::CaptureRuntimeContext& DIMM::runtimeForState(CaptureState state)
-{
-    return state == CaptureState::Simulation ? m_simulationRuntime : m_liveRuntime;
-}
-
-const DIMM::CaptureRuntimeContext& DIMM::runtimeForState(CaptureState state) const
-{
-    return state == CaptureState::Simulation ? m_simulationRuntime : m_liveRuntime;
+    return m_liveRuntime;
 }
 
 bool DIMM::hasAnyOpenCamera() const
@@ -994,18 +954,12 @@ int DIMM::openCameraCount() const
 bool DIMM::hasActiveCapture() const
 {
     return m_captureState == CaptureState::Live ||
-           m_captureState == CaptureState::Simulation ||
            m_captureState == CaptureState::Alignment;
 }
 
 bool DIMM::isLiveCaptureActive() const
 {
     return m_captureState == CaptureState::Live;
-}
-
-bool DIMM::isSimulationCaptureActive() const
-{
-    return m_captureState == CaptureState::Simulation;
 }
 
 bool DIMM::canReportMeasurements() const
@@ -1018,8 +972,6 @@ QString DIMM::captureModeName() const
     switch (m_captureState) {
     case CaptureState::Live:
         return QStringLiteral("live");
-    case CaptureState::Simulation:
-        return QStringLiteral("simulation");
     case CaptureState::Paused:
         return QStringLiteral("paused");
     case CaptureState::Alignment:
@@ -1035,8 +987,6 @@ QString DIMM::captureModeLabel() const
     switch (m_captureState) {
     case CaptureState::Live:
         return QStringLiteral("实时采集");
-    case CaptureState::Simulation:
-        return QStringLiteral("模拟采集");
     case CaptureState::Paused:
         return QStringLiteral("暂停");
     case CaptureState::Alignment:
@@ -1052,8 +1002,6 @@ QString DIMM::resultSubdirectoryName() const
     switch (m_captureState) {
     case CaptureState::Live:
         return QStringLiteral("live");
-    case CaptureState::Simulation:
-        return QStringLiteral("simulation");
     case CaptureState::Paused:
         return QStringLiteral("paused");
     case CaptureState::Alignment:
@@ -1366,7 +1314,7 @@ void DIMM::evaluateAutoAcquisitionSchedule()
         return;
     }
 
-    if (m_captureState == CaptureState::Alignment || m_captureState == CaptureState::Simulation) {
+    if (m_captureState == CaptureState::Alignment) {
         setAutoAcquisitionStatus(QStringLiteral("自动采集等待当前模式结束"),
                                  UiStatusLevel::Warning,
                                  QStringLiteral("blocked-mode"));
@@ -1785,15 +1733,6 @@ void DIMM::onStartCapture()
         return;
     }
 
-    if (m_captureState == CaptureState::Simulation) {
-        stopSimulationCapture();
-        m_reporting = false;
-        if (m_reportTimer) {
-            m_reportTimer->stop();
-        }
-        updateCaptureState(CaptureState::Idle);
-    }
-
     QString reason;
     if (!canStartLiveCapture(&reason)) {
         QMessageBox::warning(this, QStringLiteral("开始采集"), reason);
@@ -1931,7 +1870,6 @@ void DIMM::onStopCapture()
     noteManualAutoAcquisitionStopIfNeeded();
 
     stopLiveCapture();
-    stopSimulationCapture();
     m_reporting = false;
     if (m_reportTimer) {
         m_reportTimer->stop();
