@@ -32,6 +32,10 @@ class SimulationCaptureRemovedStaticTest(unittest.TestCase):
             ]:
                 self.assertNotIn(token, text)
 
+    def test_active_focuser_message_has_no_simulation_wording(self):
+        focuser = read("src/EafFocuserManager.cpp")
+        self.assertNotIn("capture, simulation, or alignment", focuser)
+
 
 if __name__ == "__main__":
     unittest.main()
