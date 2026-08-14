@@ -2,7 +2,11 @@
 
 #include "ConfigTextUtils.h"
 #include "CentroidLogic.h"
+#include "ConnectedDomain.h"
 #include "ImageUtils.h"
+#include "InitialStarDetectionConfig.h"
+#include "RoiComponentSelection.h"
+#include "StarSegmentation.h"
 
 #include <QElapsedTimer>
 #include <QDateTime>
@@ -13,6 +17,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -21,6 +26,15 @@
 
 namespace {
 constexpr quint64 kMaxMeasurementSignalPixels = 1600;
+
+RoiRect sanitizeRoiRect(RoiRect roi, int minimumSize)
+{
+    roi.x = std::max(0, roi.x);
+    roi.y = std::max(0, roi.y);
+    roi.w = std::max(minimumSize, roi.w);
+    roi.h = std::max(minimumSize, roi.h);
+    return roi;
+}
 
 cv::Mat makeCentroidIntensityImage(const cv::Mat& image)
 {
@@ -36,21 +50,6 @@ cv::Mat makeCentroidIntensityImage(const cv::Mat& image)
     return intensity;
 }
 
-double pixelValueAt(const cv::Mat& image, int y, int x)
-{
-    switch (image.depth()) {
-    case CV_8U:
-        return static_cast<double>(image.at<uchar>(y, x));
-    case CV_16U:
-        return static_cast<double>(image.at<quint16>(y, x));
-    case CV_32F:
-        return static_cast<double>(image.at<float>(y, x));
-    case CV_64F:
-        return image.at<double>(y, x);
-    default:
-        return 0.0;
-    }
-}
 }
 
 ImageProcessorWorker::ImageProcessorWorker(std::shared_ptr<std::atomic<quint64>> acquisitionGeneration,
@@ -68,15 +67,13 @@ void ImageProcessorWorker::setCentroidMethod(int method)
 void ImageProcessorWorker::setCentroidMode(int mode)
 {
     QMutexLocker locker(&m_mutex);
-    m_centroidMode = mode == 1 ? 1 : 0;
+    m_centroidMode = mode == 0 ? 0 : 1;
 }
 
-void ImageProcessorWorker::setPeakKernelCentroidConfig(int method,
-                                                       int radiusPx,
+void ImageProcessorWorker::setPeakKernelCentroidConfig(int radiusPx,
                                                        double strongHotPixelExcessDn)
 {
     QMutexLocker locker(&m_mutex);
-    m_peakKernelMethod = method == 0 ? 0 : 1;
     m_peakKernelRadiusPx = std::clamp(radiusPx, 1, 20);
     m_strongHotPixelExcessDn = std::clamp(strongHotPixelExcessDn, 1.0, 4095.0);
 }
@@ -175,6 +172,15 @@ void ImageProcessorWorker::setTargetFrameRateHz(double frameRateHz)
     m_targetFrameRateHz = std::clamp(frameRateHz, 1.0, 1000.0);
 }
 
+void ImageProcessorWorker::setAtmosphereHistoryWindowFrames(int frames)
+{
+    QMutexLocker locker(&m_mutex);
+    m_atmosphereHistoryWindowFrames = std::clamp(frames, MIN_HISTORY_WINDOW, MAX_HISTORY_WINDOW);
+    while (m_differentialHistory.size() > m_atmosphereHistoryWindowFrames) {
+        m_differentialHistory.removeFirst();
+    }
+}
+
 void ImageProcessorWorker::setAutoExposureMetricConfig(bool enabled,
                                                        double hardSaturationDn,
                                                        int sampleIntervalMs,
@@ -187,9 +193,9 @@ void ImageProcessorWorker::setAutoExposureMetricConfig(bool enabled,
                                                        int saturatedPixelCount)
 {
     QMutexLocker locker(&m_mutex);
+    Q_UNUSED(sampleIntervalMs);
     m_autoExposureMetricsEnabled = enabled;
     m_autoExposureHardSaturationDn = std::clamp(hardSaturationDn, 0.0, 4095.0);
-    m_autoExposureMetricIntervalMs = std::clamp(sampleIntervalMs, 200, 10000);
     m_autoExposureSpotConfig.hardSaturationDn = m_autoExposureHardSaturationDn;
     m_autoExposureSpotConfig.supportRadiusPx = std::clamp(peakSupportRadiusPx, 1, 8);
     m_autoExposureSpotConfig.supportFraction = std::clamp(peakSupportFraction, 0.05, 1.0);
@@ -199,10 +205,6 @@ void ImageProcessorWorker::setAutoExposureMetricConfig(bool enabled,
     m_autoExposureSpotConfig.supportedPeakPercentile =
         std::clamp(supportedPeakPercentile, 0.0, 1.0);
     m_autoExposureSpotConfig.saturatedPixelCount = std::max(1, saturatedPixelCount);
-    if (!enabled) {
-        m_lastAutoExposureSampleMs[0] = -1;
-        m_lastAutoExposureSampleMs[1] = -1;
-    }
 }
 
 void ImageProcessorWorker::setCurrentRoi(int cameraIndex, const RoiRect& roi)
@@ -212,29 +214,81 @@ void ImageProcessorWorker::setCurrentRoi(int cameraIndex, const RoiRect& roi)
     }
 
     QMutexLocker locker(&m_mutex);
-    RoiRect sanitized = roi;
-    sanitized.x = std::max(0, sanitized.x);
-    sanitized.y = std::max(0, sanitized.y);
-    sanitized.w = std::max(MIN_ROI_SIZE, sanitized.w);
-    sanitized.h = std::max(MIN_ROI_SIZE, sanitized.h);
+    RoiRect sanitized = sanitizeRoiRect(roi, MIN_ROI_SIZE);
     m_currentRoi[cameraIndex] = sanitized;
-    resetRoiProcessingHistory();
+    clearLastValidGlobalCentroid(cameraIndex);
+    resetPairingState();
 }
 
 void ImageProcessorWorker::setPairRois(RoiRect roi0, RoiRect roi1)
 {
-    RoiRect sanitized[2] = {roi0, roi1};
-    for (RoiRect& roi : sanitized) {
-        roi.x = std::max(0, roi.x);
-        roi.y = std::max(0, roi.y);
-        roi.w = std::max(MIN_ROI_SIZE, roi.w);
-        roi.h = std::max(MIN_ROI_SIZE, roi.h);
-    }
+    RoiRect sanitized[2] = {sanitizeRoiRect(roi0, MIN_ROI_SIZE),
+                            sanitizeRoiRect(roi1, MIN_ROI_SIZE)};
 
     QMutexLocker locker(&m_mutex);
     m_currentRoi[0] = sanitized[0];
     m_currentRoi[1] = sanitized[1];
+    clearAllLastValidGlobalCentroids();
     resetRoiProcessingHistory();
+}
+
+void ImageProcessorWorker::setPairRoisPreservingAtmosphereWindow(RoiRect roi0, RoiRect roi1)
+{
+    const RoiRect sanitized[2] = {sanitizeRoiRect(roi0, MIN_ROI_SIZE),
+                                  sanitizeRoiRect(roi1, MIN_ROI_SIZE)};
+
+    QMutexLocker locker(&m_mutex);
+    m_currentRoi[0] = sanitized[0];
+    m_currentRoi[1] = sanitized[1];
+    clearAllLastValidGlobalCentroids();
+    resetPairingState();
+}
+
+void ImageProcessorWorker::finalizeActiveAtmosphereWindow(const QString& reason)
+{
+    QList<DifferentialSample> samples;
+    quint64 targetSampleCount = 0;
+    {
+        QMutexLocker locker(&m_mutex);
+        if (m_differentialHistory.size() < 2) {
+            resetRoiProcessingHistory();
+            return;
+        }
+        samples = m_differentialHistory;
+        targetSampleCount = static_cast<quint64>(std::max(0, m_atmosphereHistoryWindowFrames));
+        resetRoiProcessingHistory();
+    }
+
+    AtmosphericParams params = calculateAtmosphere(samples);
+    if (params.r0 <= 0.0) {
+        return;
+    }
+
+    params.partialWindow = true;
+    params.riskFlag = true;
+    params.targetSampleCount = targetSampleCount;
+    params.riskReason = reason.trimmed().isEmpty()
+                            ? QStringLiteral("星点丢失前未达到完整 r0 计算窗口")
+                            : reason.trimmed();
+
+    emit atmosphereReady(params.r0,
+                         params.seeing,
+                         params.theta0,
+                         params.tau0,
+                         params.tau0Valid,
+                         params.tau0UnderResolved,
+                         params.tau0ResolutionMs,
+                         params.longitudinalVariancePx2,
+                         params.transverseVariancePx2,
+                         params.longitudinalVarianceRad2,
+                         params.transverseVarianceRad2,
+                         params.r0LongitudinalCm,
+                         params.r0TransverseCm,
+                         params.sampleCount,
+                         params.partialWindow,
+                         params.riskFlag,
+                         params.targetSampleCount,
+                         params.riskReason);
 }
 
 cv::Mat ImageProcessorWorker::preprocess(const cv::Mat& image)
@@ -252,7 +306,8 @@ cv::Mat ImageProcessorWorker::preprocess(const cv::Mat& image)
 void ImageProcessorWorker::advanceAcquisitionGeneration()
 {
     QMutexLocker locker(&m_mutex);
-    resetRoiProcessingHistory();
+    clearAllLastValidGlobalCentroids();
+    resetPairingState();
 }
 
 cv::Mat ImageProcessorWorker::applyHotPixelCorrection(int cameraIndex,
@@ -401,74 +456,14 @@ CentroidResult ImageProcessorWorker::calculateCentroid(int cameraIndex,
 
     const cv::Mat processed = preprocess(roiImage);
 
-    int centroidMode = 0;
+    int centroidMode = 1;
     {
         QMutexLocker locker(&m_mutex);
         centroidMode = m_centroidMode;
     }
 
-    return centroidMode == 1 ? peakKernelCentroid(cameraIndex, roi, processed)
-                             : centerOfGravity(processed);
-}
-
-bool ImageProcessorWorker::hasThresholdSignalNearRoiEdge(const cv::Mat& roiImage, double threshold) const
-{
-    if (roiImage.empty() || roiImage.channels() != 1) {
-        return false;
-    }
-
-    constexpr int edgeBand = 6;
-    const int bandX = std::min(edgeBand, roiImage.cols);
-    const int bandY = std::min(edgeBand, roiImage.rows);
-    const double edgeThreshold = std::max(0.0, threshold);
-    for (int y = 0; y < roiImage.rows; ++y) {
-        const bool inYEdge = y < bandY || y >= roiImage.rows - bandY;
-        for (int x = 0; x < roiImage.cols; ++x) {
-            if (!inYEdge && x >= bandX && x < roiImage.cols - bandX) {
-                continue;
-            }
-            if (pixelValueAt(roiImage, y, x) > edgeThreshold) {
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
-CentroidQuality ImageProcessorWorker::measurementCentroidQuality(const CentroidResult& centroid,
-                                                                 const cv::Mat& roiImage) const
-{
-    if (!centroid.valid || roiImage.empty()) {
-        return CentroidQuality::EmptyImage;
-    }
-    if (!(centroid.peakValue > centroid.threshold && centroid.peakValue > centroid.background + 4.0)) {
-        return CentroidQuality::BelowThreshold;
-    }
-    if (centroid.signalPixelCount < 2) {
-        return CentroidQuality::TooFewPixels;
-    }
-    if (centroid.signalPixelCount > kMaxMeasurementSignalPixels) {
-        return CentroidQuality::TooManyPixels;
-    }
-    if (centroid.totalFlux <= 80.0) {
-        return CentroidQuality::LowFlux;
-    }
-
-    constexpr double roiEdgeMargin = 6.0;
-    if (centroid.x < roiEdgeMargin ||
-        centroid.y < roiEdgeMargin ||
-        centroid.x > static_cast<double>(roiImage.cols) - roiEdgeMargin ||
-        centroid.y > static_cast<double>(roiImage.rows) - roiEdgeMargin) {
-        return CentroidQuality::NearRoiEdge;
-    }
-    return CentroidQuality::Valid;
-}
-
-bool ImageProcessorWorker::isMeasurementUsableCentroid(const CentroidResult& centroid,
-                                                       const cv::Mat& roiImage) const
-{
-    return measurementCentroidQuality(centroid, roiImage) == CentroidQuality::Valid;
+    return centroidMode == 0 ? centerOfGravity(processed)
+                             : connectedDomainKernelCentroid(cameraIndex, roi, processed);
 }
 
 CentroidResult ImageProcessorWorker::centerOfGravity(const cv::Mat& image)
@@ -480,7 +475,7 @@ CentroidResult ImageProcessorWorker::centerOfGravity(const cv::Mat& image)
 
     int centroidMinimumIntensity = 16;
     int centroidMinimumSignalPixels = 3;
-    double manualThreshold = 0.0;
+    double configuredThreshold = 0.0;
     double roiThresholdAbsolute = -1.0;
     int backgroundKernelSize = 5;
     double noiseSigmaMultiplier = 4.0;
@@ -488,7 +483,7 @@ CentroidResult ImageProcessorWorker::centerOfGravity(const cv::Mat& image)
         QMutexLocker locker(&m_mutex);
         centroidMinimumIntensity = m_centroidMinimumIntensity;
         centroidMinimumSignalPixels = m_centroidMinimumSignalPixels;
-        manualThreshold = m_threshold;
+        configuredThreshold = m_threshold;
         roiThresholdAbsolute = m_roiThresholdAbsolute;
         backgroundKernelSize = m_backgroundDenoiseKernelSize;
         noiseSigmaMultiplier = m_backgroundDenoiseSigmaMultiplier;
@@ -541,8 +536,8 @@ CentroidResult ImageProcessorWorker::centerOfGravity(const cv::Mat& image)
     result.noiseSigma = sigma;
     result.threshold = roiThresholdAbsolute >= 0.0
                            ? roiThresholdAbsolute
-                           : (manualThreshold > 0.0
-                                  ? manualThreshold
+                           : (configuredThreshold > 0.0
+                                  ? configuredThreshold
                                   : std::max(static_cast<double>(centroidMinimumIntensity),
                                              result.background + noiseSigmaMultiplier * sigma));
 
@@ -603,13 +598,11 @@ CentroidResult ImageProcessorWorker::peakKernelCentroid(int cameraIndex,
         return result;
     }
 
-    int peakKernelMethod = 1;
     int peakKernelRadiusPx = 3;
     double strongHotPixelExcessDn = 100.0;
     AutoExposureSpotConfig spotConfig;
     {
         QMutexLocker locker(&m_mutex);
-        peakKernelMethod = m_peakKernelMethod;
         peakKernelRadiusPx = m_peakKernelRadiusPx;
         strongHotPixelExcessDn = m_strongHotPixelExcessDn;
         spotConfig = m_autoExposureSpotConfig;
@@ -633,9 +626,6 @@ CentroidResult ImageProcessorWorker::peakKernelCentroid(int cameraIndex,
 
     CentroidLogic::PeakKernelConfig kernelConfig;
     kernelConfig.radiusPx = peakKernelRadiusPx;
-    kernelConfig.method = peakKernelMethod == 0
-                              ? CentroidLogic::PeakKernelMethod::IntensityCog
-                              : CentroidLogic::PeakKernelMethod::GaussianFit;
     kernelConfig.strongHotPixelExcessDn = strongHotPixelExcessDn;
 
     const unsigned char* mask = cacheSizeMatches ? cache.mask.constData() : nullptr;
@@ -662,6 +652,137 @@ CentroidResult ImageProcessorWorker::peakKernelCentroid(int cameraIndex,
     result.background = 0.0;
     result.noiseSigma = 0.0;
     result.threshold = 0.0;
+    result.signalPixelCount = static_cast<quint64>(std::max(0, kernel.usedPixelCount));
+    return result;
+}
+
+CentroidResult ImageProcessorWorker::connectedDomainKernelCentroid(int cameraIndex,
+                                                                   const RoiRect& roi,
+                                                                   const cv::Mat& image)
+{
+    CentroidResult result;
+    if (image.empty() || cameraIndex < 0 || cameraIndex >= 2) {
+        return result;
+    }
+
+    int peakKernelRadiusPx = 3;
+    int centroidMinimumSignalPixels = 3;
+    double centroidSigmaThreshold = 4.0;
+    double centroidPeakFraction = 0.20;
+    double strongHotPixelExcessDn = 100.0;
+    RoiComponentSelection::PreviousGlobalCentroid previous;
+    {
+        QMutexLocker locker(&m_mutex);
+        peakKernelRadiusPx = m_peakKernelRadiusPx;
+        centroidMinimumSignalPixels = m_centroidMinimumSignalPixels;
+        centroidSigmaThreshold = m_centroidSigmaThreshold;
+        centroidPeakFraction = m_centroidPeakFraction;
+        strongHotPixelExcessDn = m_strongHotPixelExcessDn;
+        previous.valid = m_hasLastValidGlobalCentroid[cameraIndex];
+        previous.x = m_lastValidGlobalCentroid[cameraIndex].x();
+        previous.y = m_lastValidGlobalCentroid[cameraIndex].y();
+    }
+
+    // Keep segmentation on the camera's integer ROI image. Only the later
+    // weighted centroid accumulation needs a floating-point intensity view.
+    const StarSegmentation::ForegroundSegmentation segmentation =
+        StarSegmentation::segmentForegroundOtsu(image,
+                                                centroidSigmaThreshold,
+                                                centroidPeakFraction);
+    if (!segmentation.valid) {
+        return result;
+    }
+    emit roiThresholdReady(cameraIndex, segmentation.otsuThreshold, segmentation.actualThreshold);
+
+    cv::Mat intensity = makeCentroidIntensityImage(image);
+    if (intensity.empty()) {
+        return result;
+    }
+    if (!intensity.isContinuous()) {
+        intensity = intensity.clone();
+    }
+    if (!intensity.isContinuous()) {
+        return result;
+    }
+
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int componentCount =
+        cv::connectedComponentsWithStats(segmentation.mask,
+                                         labels,
+                                         stats,
+                                         centroids,
+                                         ConnectedDomain::sanitizeConnectivity(
+                                             currentInitialStarDetectionConfig().connectivity),
+                                         CV_32S);
+
+    std::vector<RoiComponentSelection::ComponentCandidate> candidates;
+    candidates.reserve(static_cast<std::size_t>(std::max(0, componentCount - 1)));
+    for (int label = 1; label < componentCount; ++label) {
+        RoiComponentSelection::ComponentCandidate candidate;
+        candidate.label = label;
+        candidate.area = stats.at<int>(label, cv::CC_STAT_AREA);
+        candidate.localX = centroids.at<double>(label, 0);
+        candidate.localY = centroids.at<double>(label, 1);
+        candidates.push_back(candidate);
+    }
+
+    const RoiComponentSelection::SelectionResult selected =
+        RoiComponentSelection::selectTargetComponent(candidates,
+                                                     std::max(ConnectedDomain::kMinimumComponentArea,
+                                                              centroidMinimumSignalPixels),
+                                                     roi.x,
+                                                     roi.y,
+                                                     previous);
+    if (!selected.selected) {
+        if (selected.failure ==
+            RoiComponentSelection::SelectionFailure::MissingPreviousGlobalCentroid) {
+            emit acquisitionStopRequested(
+                QStringLiteral("ROI has multiple valid components but no previous global centroid."));
+        }
+        return result;
+    }
+
+    const int centerX =
+        std::clamp(static_cast<int>(std::lround(selected.localX)), 0, intensity.cols - 1);
+    const int centerY =
+        std::clamp(static_cast<int>(std::lround(selected.localY)), 0, intensity.rows - 1);
+
+    const HotPixelRoiCache cache = hotPixelCacheSnapshot(cameraIndex, roi);
+    const bool cacheSizeMatches =
+        cache.valid &&
+        cache.mask.size() >= intensity.cols * intensity.rows &&
+        cache.excess.size() >= intensity.cols * intensity.rows;
+
+    CentroidLogic::PeakKernelConfig kernelConfig;
+    kernelConfig.radiusPx = peakKernelRadiusPx;
+    kernelConfig.strongHotPixelExcessDn = strongHotPixelExcessDn;
+
+    const double* pixels = intensity.ptr<double>(0);
+    const unsigned char* mask = cacheSizeMatches ? cache.mask.constData() : nullptr;
+    const std::uint16_t* excess = cacheSizeMatches ? cache.excess.constData() : nullptr;
+    const CentroidLogic::PeakKernelResult kernel =
+        CentroidLogic::computePeakKernelCentroid(pixels,
+                                                 intensity.cols,
+                                                 intensity.rows,
+                                                 centerX,
+                                                 centerY,
+                                                 mask,
+                                                 excess,
+                                                 kernelConfig);
+    if (!kernel.valid) {
+        return result;
+    }
+
+    result.valid = true;
+    result.x = kernel.x;
+    result.y = kernel.y;
+    result.peakValue = kernel.peakValue;
+    result.totalFlux = kernel.totalFlux;
+    result.background = 0.0;
+    result.noiseSigma = 0.0;
+    result.threshold = segmentation.otsuThreshold;
     result.signalPixelCount = static_cast<quint64>(std::max(0, kernel.usedPixelCount));
     return result;
 }
@@ -754,128 +875,333 @@ AtmosphericParams ImageProcessorWorker::calculateAtmosphere(const QList<Differen
         params.r0 = r0Zenith * 100.0;
         params.seeing = 0.98 * lambda / r0Zenith * kRadToArcsec;
         params.theta0 = 0.64 * (4.0 / std::pow(sigmaLongitudinalArcsec2, 0.65)) * std::pow(cosZenith, 8.0 / 5.0);
-        params.tau0 = estimateDifferentialAutocorrelationTimeMs(samples);
+        const Tau0Estimate tau0Estimate =
+            estimateDifferentialAutocorrelationTimeMs(samples);
+
+        params.tau0 = tau0Estimate.valueMs;
+        params.tau0Valid = tau0Estimate.valid;
+        params.tau0UnderResolved = tau0Estimate.underResolved;
+        params.tau0ResolutionMs = tau0Estimate.resolutionMs;
     }
 
     return params;
 }
 
-double ImageProcessorWorker::estimateDifferentialAutocorrelationTimeMs(
+QList<DifferentialSample> ImageProcessorWorker::tau0WindowSamples(
     const QList<DifferentialSample>& samples) const
 {
-    if (samples.size() < 3) {
-        return 0.0;
+    if (samples.isEmpty()) {
+        return {};
     }
 
-    const double longitudinalTauMs =
-        estimateScalarAutocorrelationCrossingMs(samples, true);
-    const double transverseTauMs =
-        estimateScalarAutocorrelationCrossingMs(samples, false);
+    int startIndex = 0;
+    const qint64 newestTimestampMs = samples.last().timestampMs;
 
-    if (longitudinalTauMs > 0.0 && transverseTauMs > 0.0) {
-        return 0.5 * (longitudinalTauMs + transverseTauMs);
+    if (newestTimestampMs > 0) {
+        const qint64 cutoffTimestampMs =
+            newestTimestampMs -
+            static_cast<qint64>(TAU0_HISTORY_WINDOW_SECONDS * 1000.0);
+
+        while (startIndex < samples.size() - 1 &&
+               samples[startIndex].timestampMs > 0 &&
+               samples[startIndex].timestampMs < cutoffTimestampMs) {
+            ++startIndex;
+        }
+    } else {
+        // 只有在主机时间戳不可用时，才使用目标帧率估算最近 3 秒样本数。
+        double targetFrameRateHz = 0.0;
+        {
+            QMutexLocker locker(&m_mutex);
+            targetFrameRateHz = m_targetFrameRateHz;
+        }
+
+        const int desiredSampleCount = std::max(
+            TAU0_MIN_SAMPLES,
+            static_cast<int>(std::lround(
+                targetFrameRateHz * TAU0_HISTORY_WINDOW_SECONDS)));
+
+        startIndex = std::max(0, static_cast<int>(samples.size()) - desiredSampleCount);
     }
-    return longitudinalTauMs > 0.0 ? longitudinalTauMs : transverseTauMs;
+
+    // tau0 对时间连续性敏感。
+    // 只保留最近一次 Frame ID 跳变之后的连续区间。
+    for (int i = samples.size() - 1; i > startIndex; --i) {
+        const DifferentialSample& previous = samples[i - 1];
+        const DifferentialSample& current = samples[i];
+
+        const bool camera1Gap =
+            previous.frameId1 > 0 &&
+            current.frameId1 > 0 &&
+            current.frameId1 != previous.frameId1 + 1;
+
+        const bool camera2Gap =
+            previous.frameId2 > 0 &&
+            current.frameId2 > 0 &&
+            current.frameId2 != previous.frameId2 + 1;
+
+        if (camera1Gap || camera2Gap) {
+            startIndex = i;
+            break;
+        }
+    }
+
+    return samples.mid(startIndex);
 }
 
-double ImageProcessorWorker::estimateScalarAutocorrelationCrossingMs(
+Tau0Estimate ImageProcessorWorker::estimateDifferentialAutocorrelationTimeMs(
+    const QList<DifferentialSample>& allSamples) const
+{
+    const QList<DifferentialSample> samples = tau0WindowSamples(allSamples);
+
+    if (samples.size() < TAU0_MIN_SAMPLES) {
+        return {};
+    }
+
+    const Tau0Estimate longitudinalEstimate =
+        estimateScalarAutocorrelationCrossingMs(samples, true);
+    const Tau0Estimate transverseEstimate =
+        estimateScalarAutocorrelationCrossingMs(samples, false);
+
+    if (longitudinalEstimate.valid && transverseEstimate.valid) {
+        // 任意一个方向欠分辨时，不再把两个方向平均成一个伪精确值。
+        // 采用保守状态：整体结果标记为欠分辨。
+        if (longitudinalEstimate.underResolved ||
+            transverseEstimate.underResolved) {
+            Tau0Estimate result;
+            result.valid = true;
+            result.underResolved = true;
+            result.resolutionMs = std::max(
+                longitudinalEstimate.resolutionMs,
+                transverseEstimate.resolutionMs);
+            result.valueMs = result.resolutionMs;
+            return result;
+        }
+
+        Tau0Estimate result;
+        result.valid = true;
+        result.underResolved = false;
+        result.valueMs = 0.5 *
+            (longitudinalEstimate.valueMs + transverseEstimate.valueMs);
+        result.resolutionMs = 0.5 *
+            (longitudinalEstimate.resolutionMs +
+             transverseEstimate.resolutionMs);
+        return result;
+    }
+
+    if (longitudinalEstimate.valid) {
+        return longitudinalEstimate;
+    }
+
+    if (transverseEstimate.valid) {
+        return transverseEstimate;
+    }
+
+    return {};
+}
+
+Tau0Estimate ImageProcessorWorker::estimateScalarAutocorrelationCrossingMs(
     const QList<DifferentialSample>& samples,
     bool useLongitudinal) const
 {
-    if (samples.size() < 3) {
-        return 0.0;
+    if (samples.size() < TAU0_MIN_SAMPLES) {
+        return {};
     }
 
-    double totalIntervalMs = 0.0;
-    int intervalCount = 0;
+    std::vector<double> intervalsMs;
+    intervalsMs.reserve(static_cast<std::size_t>(samples.size() - 1));
+
     for (int i = 1; i < samples.size(); ++i) {
         double dtMs = 0.0;
-        if (samples[i].cameraTimestamp1 > samples[i - 1].cameraTimestamp1 &&
+
+        if (samples[i].cameraTimestamp1 >
+                samples[i - 1].cameraTimestamp1 &&
             samples[i - 1].cameraTimestamp1 > 0) {
-            const quint64 dtTicks = samples[i].cameraTimestamp1 - samples[i - 1].cameraTimestamp1;
-            dtMs = static_cast<double>(dtTicks) * MARS_GIGE_TIMESTAMP_TICK_US / 1000.0;
-        } else if (samples[i].cameraTimestamp2 > samples[i - 1].cameraTimestamp2 &&
+            const quint64 dtTicks =
+                samples[i].cameraTimestamp1 -
+                samples[i - 1].cameraTimestamp1;
+
+            dtMs = static_cast<double>(dtTicks) *
+                   MARS_GIGE_TIMESTAMP_TICK_US /
+                   1000.0;
+        } else if (samples[i].cameraTimestamp2 >
+                       samples[i - 1].cameraTimestamp2 &&
                    samples[i - 1].cameraTimestamp2 > 0) {
-            const quint64 dtTicks = samples[i].cameraTimestamp2 - samples[i - 1].cameraTimestamp2;
-            dtMs = static_cast<double>(dtTicks) * MARS_GIGE_TIMESTAMP_TICK_US / 1000.0;
-        } else if (samples[i].timestampMs > samples[i - 1].timestampMs) {
-            dtMs = static_cast<double>(samples[i].timestampMs - samples[i - 1].timestampMs);
+            const quint64 dtTicks =
+                samples[i].cameraTimestamp2 -
+                samples[i - 1].cameraTimestamp2;
+
+            dtMs = static_cast<double>(dtTicks) *
+                   MARS_GIGE_TIMESTAMP_TICK_US /
+                   1000.0;
+        } else if (samples[i].timestampMs >
+                   samples[i - 1].timestampMs) {
+            dtMs = static_cast<double>(
+                samples[i].timestampMs -
+                samples[i - 1].timestampMs);
         }
 
-        if (dtMs > 0.0) {
-            totalIntervalMs += dtMs;
-            ++intervalCount;
+        if (std::isfinite(dtMs) && dtMs > 0.0) {
+            intervalsMs.push_back(dtMs);
         }
     }
-    if (intervalCount == 0) {
-        return 0.0;
+
+    if (intervalsMs.empty()) {
+        return {};
     }
-    const double sampleIntervalMs = totalIntervalMs / static_cast<double>(intervalCount);
+
+    const std::size_t middleIndex = intervalsMs.size() / 2;
+    std::nth_element(intervalsMs.begin(),
+                     intervalsMs.begin() +
+                         static_cast<std::ptrdiff_t>(middleIndex),
+                     intervalsMs.end());
+
+    const double sampleIntervalMs = intervalsMs[middleIndex];
+    if (!std::isfinite(sampleIntervalMs) || sampleIntervalMs <= 0.0) {
+        return {};
+    }
 
     const int sampleCount = static_cast<int>(samples.size());
+
     double mean = 0.0;
-    for (const auto& sample : samples) {
-        mean += useLongitudinal ? sample.longitudinal : sample.transverse;
+    for (const DifferentialSample& sample : samples) {
+        mean += useLongitudinal
+                    ? sample.longitudinal
+                    : sample.transverse;
     }
     mean /= static_cast<double>(sampleCount);
 
     double varianceSum = 0.0;
-    for (const auto& sample : samples) {
-        const double value = useLongitudinal ? sample.longitudinal : sample.transverse;
+    for (const DifferentialSample& sample : samples) {
+        const double value = useLongitudinal
+                                 ? sample.longitudinal
+                                 : sample.transverse;
         const double centered = value - mean;
         varianceSum += centered * centered;
     }
-    if (varianceSum <= 0.0) {
-        return 0.0;
+
+    if (!std::isfinite(varianceSum) || varianceSum <= 0.0) {
+        return {};
     }
 
-    const double kOneOverE = 1.0 / std::exp(1.0);
-    const int maxLag = sampleCount / 2;
+    const int maxLagByTime = std::max(
+        1,
+        static_cast<int>(std::ceil(
+            TAU0_MAX_LAG_MS / sampleIntervalMs)));
+
+    const int maxLag = std::min(
+        sampleCount / 2,
+        maxLagByTime);
+
+    if (maxLag < 1) {
+        return {};
+    }
+
+    const double oneOverE = 1.0 / std::exp(1.0);
     double previousCorrelation = 1.0;
+
     for (int lag = 1; lag <= maxLag; ++lag) {
         double numerator = 0.0;
+
         for (int i = 0; i + lag < sampleCount; ++i) {
             const DifferentialSample& a = samples[i];
             const DifferentialSample& b = samples[i + lag];
-            const double valueA = useLongitudinal ? a.longitudinal : a.transverse;
-            const double valueB = useLongitudinal ? b.longitudinal : b.transverse;
+
+            const double valueA = useLongitudinal
+                                      ? a.longitudinal
+                                      : a.transverse;
+            const double valueB = useLongitudinal
+                                      ? b.longitudinal
+                                      : b.transverse;
+
             numerator += (valueA - mean) * (valueB - mean);
         }
 
         const double correlation =
             (numerator / static_cast<double>(sampleCount - lag)) /
             (varianceSum / static_cast<double>(sampleCount));
+
         if (!std::isfinite(correlation)) {
             continue;
         }
-        if (correlation <= kOneOverE) {
-            if (lag == 1 || previousCorrelation <= kOneOverE ||
-                qFuzzyCompare(previousCorrelation + 1.0, correlation + 1.0)) {
-                return static_cast<double>(lag) * sampleIntervalMs;
+
+        if (correlation <= oneOverE) {
+            Tau0Estimate result;
+            result.valid = true;
+            result.resolutionMs = sampleIntervalMs;
+
+            if (lag == 1) {
+                // 只能确定 tau0 小于或接近一个采样周期。
+                // 不进行 lag=0 到 lag=1 的伪精确插值。
+                result.underResolved = true;
+                result.valueMs = sampleIntervalMs;
+                return result;
+            }
+
+            const double denominator =
+                previousCorrelation - correlation;
+
+            if (!std::isfinite(denominator) ||
+                std::abs(denominator) <= 1e-12) {
+                result.underResolved = false;
+                result.valueMs =
+                    static_cast<double>(lag) * sampleIntervalMs;
+                return result;
             }
 
             const double crossingLag =
                 static_cast<double>(lag - 1) +
-                (previousCorrelation - kOneOverE) / (previousCorrelation - correlation);
-            return crossingLag * sampleIntervalMs;
+                (previousCorrelation - oneOverE) /
+                    denominator;
+
+            if (!std::isfinite(crossingLag) || crossingLag <= 0.0) {
+                return {};
+            }
+
+            result.underResolved = false;
+            result.valueMs = crossingLag * sampleIntervalMs;
+            return result;
         }
+
         previousCorrelation = correlation;
     }
 
-    return 0.0;
+    // 200 ms 范围内没有找到 1/e 交点。
+    // 当前任务不增加“超出最大搜索范围”状态，按无效结果处理。
+    return {};
 }
 
 int ImageProcessorWorker::historyWindowSize() const
 {
     QMutexLocker locker(&m_mutex);
-    return std::clamp(static_cast<int>(std::lround(m_targetFrameRateHz)),
-                      MIN_HISTORY_WINDOW,
-                      MAX_HISTORY_WINDOW);
+    return m_atmosphereHistoryWindowFrames;
 }
 
 int ImageProcessorWorker::minimumAtmosphereSamples() const
 {
     return historyWindowSize();
+}
+
+int ImageProcessorWorker::pendingCentroidQueueLimit() const
+{
+    QMutexLocker locker(&m_mutex);
+    return std::clamp(static_cast<int>(std::lround(m_targetFrameRateHz)),
+                      MIN_HISTORY_WINDOW,
+                      MAX_PENDING_PAIR_QUEUE);
+}
+
+void ImageProcessorWorker::clearLastValidGlobalCentroid(int cameraIndex)
+{
+    if (cameraIndex < 0 || cameraIndex >= 2) {
+        return;
+    }
+    m_lastValidGlobalCentroid[cameraIndex] = QPointF();
+    m_hasLastValidGlobalCentroid[cameraIndex] = false;
+}
+
+void ImageProcessorWorker::clearAllLastValidGlobalCentroids()
+{
+    clearLastValidGlobalCentroid(0);
+    clearLastValidGlobalCentroid(1);
 }
 
 void ImageProcessorWorker::resetRoiProcessingHistory()
@@ -884,6 +1210,11 @@ void ImageProcessorWorker::resetRoiProcessingHistory()
     m_lastRoiImagePublishMs[0] = 0;
     m_lastRoiImagePublishMs[1] = 0;
     m_differentialHistory.clear();
+    resetPairingState();
+}
+
+void ImageProcessorWorker::resetPairingState()
+{
     m_pendingCentroids[0].clear();
     m_pendingCentroids[1].clear();
     m_syncCalibrated = false;
@@ -895,14 +1226,6 @@ void ImageProcessorWorker::resetRoiProcessingHistory()
     m_frameIdOffset = 0;
     m_timestampOffsetTicks = 0.0L;
     m_diagnosticUnpairedDropLogCount = 0;
-}
-
-void ImageProcessorWorker::resetRunProcessingState()
-{
-    QMutexLocker locker(&m_mutex);
-    m_lastPairedSerial = 0;
-    m_droppedUnpairedSamples = 0;
-    resetRoiProcessingHistory();
 }
 
 bool ImageProcessorWorker::appendDifferentialSample()
@@ -1118,90 +1441,68 @@ void ImageProcessorWorker::processFrame(int cameraIndex,
     }
 
     bool shouldEmitAutoExposureSample = false;
-    double hardSaturationDn = 4090.0;
+    AutoExposureSpotConfig autoExposureSpotConfig;
+    double autoExposureThresholdNative = 16.0;
     {
         QMutexLocker locker(&m_mutex);
         if (cameraIndex >= 0 && cameraIndex < 2 && m_autoExposureMetricsEnabled) {
-            const qint64 lastSampleMs = m_lastAutoExposureSampleMs[cameraIndex];
-            shouldEmitAutoExposureSample =
-                lastSampleMs < 0 || nowMs - lastSampleMs >= m_autoExposureMetricIntervalMs;
-            if (shouldEmitAutoExposureSample) {
-                m_lastAutoExposureSampleMs[cameraIndex] = nowMs;
-                hardSaturationDn = m_autoExposureHardSaturationDn;
-            }
-        }
-    }
-    const double autoExposureDnScale = roiImage.depth() == CV_8U ? 4095.0 / 255.0 : 1.0;
-    const double rawHardSaturationDn = hardSaturationDn / autoExposureDnScale;
-    quint64 saturatedPixelCount = 0;
-    if (shouldEmitAutoExposureSample) {
-        for (int y = 0; y < roiImage.rows; ++y) {
-            for (int x = 0; x < roiImage.cols; ++x) {
-                if (pixelValueAt(roiImage, y, x) >= rawHardSaturationDn) {
-                    ++saturatedPixelCount;
-                }
-            }
+            shouldEmitAutoExposureSample = true;
+            autoExposureSpotConfig = m_autoExposureSpotConfig;
+            autoExposureThresholdNative =
+                m_roiThresholdAbsolute >= 0.0
+                    ? m_roiThresholdAbsolute
+                    : static_cast<double>(m_centroidMinimumIntensity);
         }
     }
 
     const cv::Mat correctedRoiImage = applyHotPixelCorrection(cameraIndex, roi, roiImage);
     CentroidResult centroid = calculateCentroid(cameraIndex, roi, correctedRoiImage);
-    AutoExposureSpotResult autoExposureSpot;
-    const bool correctedMeasurementUsable =
-        centroid.valid && isMeasurementUsableCentroid(centroid, correctedRoiImage);
-    const bool measurementUsable = correctedMeasurementUsable;
     const bool autoExposureMeasurementUsable =
         centroid.valid && centroid.signalPixelCount <= kMaxMeasurementSignalPixels;
     if (shouldEmitAutoExposureSample) {
-        AutoExposureSpotConfig spotConfig;
-        double fallbackSpotThresholdDn = 0.0;
-        {
-            QMutexLocker locker(&m_mutex);
-            spotConfig = m_autoExposureSpotConfig;
-            fallbackSpotThresholdDn =
-                m_roiThresholdAbsolute >= 0.0
-                    ? m_roiThresholdAbsolute
-                    : (m_threshold > 0.0
-                           ? m_threshold
-                           : static_cast<double>(m_centroidMinimumIntensity));
+        cv::Mat autoExposureIntensity = makeCentroidIntensityImage(correctedRoiImage);
+        if (!autoExposureIntensity.empty() && !autoExposureIntensity.isContinuous()) {
+            autoExposureIntensity = autoExposureIntensity.clone();
         }
-        spotConfig.thresholdDn = centroid.threshold > 0.0 ? centroid.threshold
-                                                          : fallbackSpotThresholdDn;
-        spotConfig.hardSaturationDn = rawHardSaturationDn;
-        const cv::Mat aeIntensity = makeCentroidIntensityImage(correctedRoiImage);
-        std::vector<double> aePixels;
-        if (!aeIntensity.empty()) {
-            aePixels.reserve(static_cast<std::size_t>(aeIntensity.rows * aeIntensity.cols));
-            for (int y = 0; y < aeIntensity.rows; ++y) {
-                const double* row = aeIntensity.ptr<double>(y);
-                for (int x = 0; x < aeIntensity.cols; ++x) {
-                    aePixels.push_back(row[x]);
-                }
-            }
-            autoExposureSpot = analyzeAutoExposureSpot(aePixels.data(),
-                                                       aeIntensity.cols,
-                                                       aeIntensity.rows,
-                                                       spotConfig);
+
+        const double autoExposureDnScale =
+            correctedRoiImage.depth() == CV_8U ? 4095.0 / 255.0 : 1.0;
+        if (centroid.threshold > 0.0) {
+            autoExposureThresholdNative = centroid.threshold;
         }
-        const double aePeakValue =
-            autoExposureSpot.validSpotPeak
-                ? autoExposureSpot.supportedPeakDn
-                : centroid.peakValue;
+        autoExposureSpotConfig.thresholdDn = autoExposureThresholdNative;
+        autoExposureSpotConfig.hardSaturationDn =
+            autoExposureSpotConfig.hardSaturationDn / autoExposureDnScale;
+
+        AutoExposureSpotResult spot;
+        if (!autoExposureIntensity.empty() && autoExposureIntensity.isContinuous()) {
+            spot = analyzeAutoExposureSpot(autoExposureIntensity.ptr<double>(0),
+                                           autoExposureIntensity.cols,
+                                           autoExposureIntensity.rows,
+                                           autoExposureSpotConfig);
+        }
+
+        const bool hasValidSpot =
+            spot.quality == AutoExposurePeakQuality::ValidSpotPeak ||
+            spot.quality == AutoExposurePeakQuality::SpotSaturated;
+        const double aePeakValue = hasValidSpot ? spot.peakDn : 0.0;
+        const double aeSupportedPeakValue = hasValidSpot ? spot.supportedPeakDn : 0.0;
         emit autoExposureSampleReady(cameraIndex,
                                      aePeakValue * autoExposureDnScale,
                                      centroid.background * autoExposureDnScale,
                                      centroid.noiseSigma * autoExposureDnScale,
                                      centroid.threshold * autoExposureDnScale,
                                      centroid.signalPixelCount,
-                                     saturatedPixelCount,
-                                     static_cast<int>(autoExposureSpot.quality),
-                                     autoExposureSpot.supportedPeakDn * autoExposureDnScale,
-                                     static_cast<quint64>(std::max(0, autoExposureSpot.supportPixelCount)),
-                                     autoExposureSpot.rejectedPeakDn * autoExposureDnScale,
-                                     autoExposureSpot.rejectedCandidateCount,
-                                     autoExposureSpot.spotHardSaturated,
+                                     static_cast<quint64>(std::max(0, spot.spotSaturatedPixelCount)),
+                                     static_cast<int>(spot.quality),
+                                     aeSupportedPeakValue * autoExposureDnScale,
+                                     static_cast<quint64>(std::max(0, spot.supportPixelCount)),
+                                     spot.rejectedPeakDn * autoExposureDnScale,
+                                     spot.rejectedCandidateCount,
+                                     spot.spotHardSaturated,
                                      centroid.valid,
                                      autoExposureMeasurementUsable,
+                                     spot.decisionSample,
                                      frameId,
                                      nowMs);
     }
@@ -1209,6 +1510,12 @@ void ImageProcessorWorker::processFrame(int cameraIndex,
         CentroidResult absoluteCentroid = centroid;
         absoluteCentroid.x += roi.x;
         absoluteCentroid.y += roi.y;
+        {
+            QMutexLocker locker(&m_mutex);
+            m_lastValidGlobalCentroid[cameraIndex] =
+                QPointF(absoluteCentroid.x, absoluteCentroid.y);
+            m_hasLastValidGlobalCentroid[cameraIndex] = true;
+        }
         emit centroidReady(cameraIndex,
                            absoluteCentroid.x,
                            absoluteCentroid.y,
@@ -1218,19 +1525,13 @@ void ImageProcessorWorker::processFrame(int cameraIndex,
                            absoluteCentroid.threshold,
                            absoluteCentroid.signalPixelCount);
 
-        if (!measurementUsable) {
-            emitRoiImageIfDue(cameraIndex, roiImage, nowMs);
-            finishProcessing(true);
-            return;
-        }
-
         PendingCentroidSample pending;
         pending.centroid = absoluteCentroid;
         pending.frameId = frameId;
         pending.cameraTimestamp = cameraTimestamp;
         pending.timestampMs = nowMs;
         m_pendingCentroids[cameraIndex].append(pending);
-        while (m_pendingCentroids[cameraIndex].size() > historyWindowSize()) {
+        while (m_pendingCentroids[cameraIndex].size() > pendingCentroidQueueLimit()) {
             m_pendingCentroids[cameraIndex].removeFirst();
             ++m_droppedUnpairedSamples;
         }
@@ -1255,13 +1556,20 @@ void ImageProcessorWorker::processFrame(int cameraIndex,
                                      params.seeing,
                                      params.theta0,
                                      params.tau0,
+                                     params.tau0Valid,
+                                     params.tau0UnderResolved,
+                                     params.tau0ResolutionMs,
                                      params.longitudinalVariancePx2,
                                      params.transverseVariancePx2,
                                      params.longitudinalVarianceRad2,
                                      params.transverseVarianceRad2,
                                      params.r0LongitudinalCm,
                                      params.r0TransverseCm,
-                                     params.sampleCount);
+                                     params.sampleCount,
+                                     params.partialWindow,
+                                     params.riskFlag,
+                                     params.targetSampleCount,
+                                     params.riskReason);
             }
         }
     }
@@ -1273,6 +1581,7 @@ void ImageProcessorWorker::processFrame(int cameraIndex,
 ImageProcessor::ImageProcessor(QObject* parent)
     : QObject(parent)
 {
+    qRegisterMetaType<AtmosphericParams>("AtmosphericParams");
     m_workerThread = new QThread(this);
     m_worker = new ImageProcessorWorker(m_acquisitionGeneration);
     m_worker->moveToThread(m_workerThread);
@@ -1286,7 +1595,13 @@ ImageProcessor::ImageProcessor(QObject* parent)
             &ImageProcessor::differentialSampleDetailReady);
     connect(m_worker, &ImageProcessorWorker::roiImageReady, this, &ImageProcessor::roiImageReady);
     connect(m_worker, &ImageProcessorWorker::atmosphereReady, this, &ImageProcessor::atmosphereReady);
-    connect(m_worker, &ImageProcessorWorker::frameProcessed, this, &ImageProcessor::frameProcessed);
+    connect(m_worker,
+            &ImageProcessorWorker::frameProcessed,
+            this,
+            [this](int cameraIndex, bool centroidValid, double elapsedMs) {
+                Q_UNUSED(cameraIndex);
+                emit frameProcessed(cameraIndex, centroidValid, elapsedMs);
+            });
     connect(m_worker, &ImageProcessorWorker::syncSampleReady, this, &ImageProcessor::syncSampleReady);
     connect(m_worker,
             &ImageProcessorWorker::unpairedSampleDropped,
@@ -1296,6 +1611,14 @@ ImageProcessor::ImageProcessor(QObject* parent)
             &ImageProcessorWorker::autoExposureSampleReady,
             this,
             &ImageProcessor::autoExposureSampleReady);
+    connect(m_worker,
+            &ImageProcessorWorker::roiThresholdReady,
+            this,
+            &ImageProcessor::roiThresholdReady);
+    connect(m_worker,
+            &ImageProcessorWorker::acquisitionStopRequested,
+            this,
+            &ImageProcessor::acquisitionStopRequested);
 
     m_workerThread->start();
 }
@@ -1315,24 +1638,21 @@ void ImageProcessor::setCentroidMethod(int method)
 
 void ImageProcessor::setCentroidMode(int mode)
 {
-    m_centroidMode = mode == 1 ? 1 : 0;
+    m_centroidMode = mode == 0 ? 0 : 1;
     QMetaObject::invokeMethod(m_worker,
                               "setCentroidMode",
                               Qt::QueuedConnection,
                               Q_ARG(int, m_centroidMode));
 }
 
-void ImageProcessor::setPeakKernelCentroidConfig(int method,
-                                                 int radiusPx,
+void ImageProcessor::setPeakKernelCentroidConfig(int radiusPx,
                                                  double strongHotPixelExcessDn)
 {
-    m_peakKernelMethod = method == 0 ? 0 : 1;
     m_peakKernelRadiusPx = std::clamp(radiusPx, 1, 20);
     m_strongHotPixelExcessDn = std::clamp(strongHotPixelExcessDn, 1.0, 4095.0);
     QMetaObject::invokeMethod(m_worker,
                               "setPeakKernelCentroidConfig",
                               Qt::QueuedConnection,
-                              Q_ARG(int, m_peakKernelMethod),
                               Q_ARG(int, m_peakKernelRadiusPx),
                               Q_ARG(double, m_strongHotPixelExcessDn));
 }
@@ -1396,6 +1716,15 @@ void ImageProcessor::setTargetFrameRateHz(double frameRateHz)
                               "setTargetFrameRateHz",
                               Qt::QueuedConnection,
                               Q_ARG(double, m_targetFrameRateHz));
+}
+
+void ImageProcessor::setAtmosphereHistoryWindowFrames(int frames)
+{
+    m_atmosphereHistoryWindowFrames = std::clamp(frames, 50, 60000);
+    QMetaObject::invokeMethod(m_worker,
+                              "setAtmosphereHistoryWindowFrames",
+                              Qt::QueuedConnection,
+                              Q_ARG(int, m_atmosphereHistoryWindowFrames));
 }
 
 void ImageProcessor::setAutoExposureMetricConfig(bool enabled,
@@ -1603,21 +1932,32 @@ void ImageProcessor::setPairRois(const RoiRect rois[2])
                               Q_ARG(RoiRect, rois[1]));
 }
 
+void ImageProcessor::setPairRoisPreservingAtmosphereWindow(const RoiRect rois[2])
+{
+    if (!rois) {
+        return;
+    }
+
+    m_currentRoi[0] = rois[0];
+    m_currentRoi[1] = rois[1];
+    QMetaObject::invokeMethod(m_worker,
+                              "setPairRoisPreservingAtmosphereWindow",
+                              Qt::QueuedConnection,
+                              Q_ARG(RoiRect, rois[0]),
+                              Q_ARG(RoiRect, rois[1]));
+}
+
+void ImageProcessor::finalizeActiveAtmosphereWindow(const QString& reason)
+{
+    QMetaObject::invokeMethod(m_worker,
+                              "finalizeActiveAtmosphereWindow",
+                              Qt::QueuedConnection,
+                              Q_ARG(QString, reason));
+}
+
 void ImageProcessor::advanceAcquisitionGeneration()
 {
     ++(*m_acquisitionGeneration);
-    QMetaObject::invokeMethod(m_worker, "advanceAcquisitionGeneration", Qt::QueuedConnection);
-}
-
-quint64 ImageProcessor::currentAcquisitionGeneration() const
-{
-    return m_acquisitionGeneration->load();
-}
-
-void ImageProcessor::resetProcessingState()
-{
-    ++(*m_acquisitionGeneration);
-    QMetaObject::invokeMethod(m_worker, "resetRunProcessingState", Qt::QueuedConnection);
 }
 
 RoiRect ImageProcessor::getCurrentRoi(int cameraIndex) const
@@ -1639,6 +1979,10 @@ void ImageProcessor::processFrame(int cameraIndex,
     }
 
     cv::Mat frameCopy = frame.clone();
+    if (frameCopy.empty()) {
+        return;
+    }
+
     QMetaObject::invokeMethod(m_worker,
                               "processFrame",
                               Qt::QueuedConnection,

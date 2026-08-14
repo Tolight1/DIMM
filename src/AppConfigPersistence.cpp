@@ -49,6 +49,12 @@ void saveAutoExposure(QSettings& settings, const AutoExposureConfig& config)
                       config.autoExposureSampleIntervalMs);
     settings.setValue(QStringLiteral("autoExposure/minDecisionSampleCount"),
                       config.minDecisionSampleCount);
+    settings.setValue(QStringLiteral("autoExposure/autoExposureStepUs"),
+                      config.autoExposureStepUs);
+    settings.setValue(QStringLiteral("autoExposure/initialExposureUs"),
+                      config.initialExposureUs);
+    settings.setValue(QStringLiteral("autoExposure/autoExposureDecisionCooldownMin"),
+                      config.autoExposureDecisionCooldownMin);
     settings.setValue(QStringLiteral("autoExposure/trendConflictPersistenceSec"),
                       config.trendConflictPersistenceSec);
     settings.setValue(QStringLiteral("autoExposure/minExposureUs"), config.minExposureUs);
@@ -124,6 +130,15 @@ void loadAutoExposure(QSettings& settings, AppConfig* config, const AppConfig& d
     target.minDecisionSampleCount =
         settings.value(QStringLiteral("autoExposure/minDecisionSampleCount"),
                        fallback.minDecisionSampleCount).toInt();
+    target.autoExposureStepUs =
+        settings.value(QStringLiteral("autoExposure/autoExposureStepUs"),
+                       fallback.autoExposureStepUs).toDouble();
+    target.initialExposureUs =
+        settings.value(QStringLiteral("autoExposure/initialExposureUs"),
+                       fallback.initialExposureUs).toDouble();
+    target.autoExposureDecisionCooldownMin =
+        settings.value(QStringLiteral("autoExposure/autoExposureDecisionCooldownMin"),
+                       fallback.autoExposureDecisionCooldownMin).toInt();
     target.trendConflictPersistenceSec =
         settings.value(QStringLiteral("autoExposure/trendConflictPersistenceSec"),
                        fallback.trendConflictPersistenceSec).toInt();
@@ -175,23 +190,21 @@ void saveSimpleGroups(QSettings& settings, const AppConfig& config)
     settings.setValue(QStringLiteral("processing/backgroundSigmaMultiplier"),
                       config.processing.backgroundSigmaMultiplier);
     settings.setValue(QStringLiteral("processing/centroidMode"), config.processing.centroidMode);
-    settings.setValue(QStringLiteral("processing/peakKernelMethod"), config.processing.peakKernelMethod);
     settings.setValue(QStringLiteral("processing/peakKernelRadiusPx"),
                       config.processing.peakKernelRadiusPx);
     settings.setValue(QStringLiteral("processing/strongHotPixelExcessDn"),
                       config.processing.strongHotPixelExcessDn);
+    settings.setValue(QStringLiteral("processing/r0HistoryWindowFrames"),
+                      config.processing.r0HistoryWindowFrames);
     settings.setValue(QStringLiteral("roiRecentering/thresholdPx"), config.roiRecentering.thresholdPx);
     settings.setValue(QStringLiteral("roiRecentering/requiredFrames"), config.roiRecentering.requiredFrames);
     settings.setValue(QStringLiteral("roiRecentering/cooldownMs"), config.roiRecentering.cooldownMs);
     settings.setValue(QStringLiteral("roiRecentering/minimumShiftPx"), config.roiRecentering.minimumShiftPx);
-    settings.setValue(QStringLiteral("starDetection/thresholdAbsolute"),
-                      config.starDetection.thresholdAbsolute);
     settings.setValue(QStringLiteral("starDetection/sigmaThreshold"), config.starDetection.sigmaThreshold);
     settings.setValue(QStringLiteral("starDetection/peakFraction"), config.starDetection.peakFraction);
-    settings.setValue(QStringLiteral("starDetection/minimumIntensity"),
-                      config.starDetection.minimumIntensity);
     settings.setValue(QStringLiteral("starDetection/minArea"), config.starDetection.minArea);
     settings.setValue(QStringLiteral("starDetection/maxArea"), config.starDetection.maxArea);
+    settings.setValue(QStringLiteral("starDetection/connectivity"), config.starDetection.connectivity);
     settings.setValue(QStringLiteral("hotPixel/enabled"), config.hotPixel.enabled);
     settings.setValue(QStringLiteral("hotPixel/camera0MaskPath"), config.hotPixel.camera0MaskPath);
     settings.setValue(QStringLiteral("hotPixel/camera0ExcessPath"), config.hotPixel.camera0ExcessPath);
@@ -252,6 +265,8 @@ void saveSimpleGroups(QSettings& settings, const AppConfig& config)
                       config.autoAcquisition.startOffsetMinutesAfterSunset);
     settings.setValue(QStringLiteral("autoAcquisition/stopOffsetMinutesBeforeSunrise"),
                       config.autoAcquisition.stopOffsetMinutesBeforeSunrise);
+    settings.setValue(QStringLiteral("autoAcquisition/recoveryScanIntervalMinutes"),
+                      config.autoAcquisition.recoveryScanIntervalMinutes);
     settings.setValue(QStringLiteral("autoAcquisition/testTimeOverrideEnabled"),
                       config.autoAcquisition.testTimeOverrideEnabled);
     settings.setValue(QStringLiteral("autoAcquisition/testStartTime"),
@@ -274,15 +289,15 @@ void loadSimpleGroups(QSettings& settings, AppConfig* config, const AppConfig& d
     target.processing.centroidMode =
         settings.value(QStringLiteral("processing/centroidMode"),
                        defaults.processing.centroidMode).toInt();
-    target.processing.peakKernelMethod =
-        settings.value(QStringLiteral("processing/peakKernelMethod"),
-                       defaults.processing.peakKernelMethod).toInt();
     target.processing.peakKernelRadiusPx =
         settings.value(QStringLiteral("processing/peakKernelRadiusPx"),
                        defaults.processing.peakKernelRadiusPx).toInt();
     target.processing.strongHotPixelExcessDn =
         settings.value(QStringLiteral("processing/strongHotPixelExcessDn"),
                        defaults.processing.strongHotPixelExcessDn).toDouble();
+    target.processing.r0HistoryWindowFrames =
+        settings.value(QStringLiteral("processing/r0HistoryWindowFrames"),
+                       defaults.processing.r0HistoryWindowFrames).toInt();
     target.roiRecentering.thresholdPx =
         settings.value(QStringLiteral("roiRecentering/thresholdPx"),
                        defaults.roiRecentering.thresholdPx).toDouble();
@@ -295,22 +310,19 @@ void loadSimpleGroups(QSettings& settings, AppConfig* config, const AppConfig& d
     target.roiRecentering.minimumShiftPx =
         settings.value(QStringLiteral("roiRecentering/minimumShiftPx"),
                        defaults.roiRecentering.minimumShiftPx).toDouble();
-    target.starDetection.thresholdAbsolute =
-        settings.value(QStringLiteral("starDetection/thresholdAbsolute"),
-                       defaults.starDetection.thresholdAbsolute).toDouble();
     target.starDetection.sigmaThreshold =
         settings.value(QStringLiteral("starDetection/sigmaThreshold"),
                        defaults.starDetection.sigmaThreshold).toDouble();
     target.starDetection.peakFraction =
         settings.value(QStringLiteral("starDetection/peakFraction"),
                        defaults.starDetection.peakFraction).toDouble();
-    target.starDetection.minimumIntensity =
-        settings.value(QStringLiteral("starDetection/minimumIntensity"),
-                       defaults.starDetection.minimumIntensity).toDouble();
     target.starDetection.minArea =
         settings.value(QStringLiteral("starDetection/minArea"), defaults.starDetection.minArea).toInt();
     target.starDetection.maxArea =
         settings.value(QStringLiteral("starDetection/maxArea"), defaults.starDetection.maxArea).toInt();
+    target.starDetection.connectivity = ConnectedDomain::sanitizeConnectivity(
+        settings.value(QStringLiteral("starDetection/connectivity"),
+                       defaults.starDetection.connectivity).toInt());
     target.hotPixel.enabled =
         settings.value(QStringLiteral("hotPixel/enabled"), defaults.hotPixel.enabled).toBool();
     target.hotPixel.camera0MaskPath =
@@ -448,6 +460,9 @@ void loadSimpleGroups(QSettings& settings, AppConfig* config, const AppConfig& d
     target.autoAcquisition.stopOffsetMinutesBeforeSunrise =
         settings.value(QStringLiteral("autoAcquisition/stopOffsetMinutesBeforeSunrise"),
                        defaults.autoAcquisition.stopOffsetMinutesBeforeSunrise).toInt();
+    target.autoAcquisition.recoveryScanIntervalMinutes =
+        settings.value(QStringLiteral("autoAcquisition/recoveryScanIntervalMinutes"),
+                       defaults.autoAcquisition.recoveryScanIntervalMinutes).toInt();
     target.autoAcquisition.testTimeOverrideEnabled =
         settings.value(QStringLiteral("autoAcquisition/testTimeOverrideEnabled"),
                        defaults.autoAcquisition.testTimeOverrideEnabled).toBool();
@@ -486,6 +501,141 @@ void save(const AppConfig& config)
     saveCamera(settings, config.camera);
     saveAutoExposure(settings, config.autoExposure);
     saveSimpleGroups(settings, config);
+    settings.endGroup();
+    settings.sync();
+}
+
+void saveChanged(const AppConfig& config, const ConfigChangeSet& changes)
+{
+    if (!changes.any()) {
+        return;
+    }
+
+    QSettings settings;
+    settings.beginGroup(QStringLiteral("settings"));
+    if (changes.camera) {
+        saveCamera(settings, config.camera);
+    }
+    if (changes.autoExposure) {
+        saveAutoExposure(settings, config.autoExposure);
+    }
+    if (changes.processing) {
+        settings.setValue(QStringLiteral("processing/backgroundKernelSize"),
+                          config.processing.backgroundKernelSize);
+        settings.setValue(QStringLiteral("processing/backgroundSigmaMultiplier"),
+                          config.processing.backgroundSigmaMultiplier);
+        settings.setValue(QStringLiteral("processing/centroidMode"), config.processing.centroidMode);
+        settings.setValue(QStringLiteral("processing/peakKernelRadiusPx"),
+                          config.processing.peakKernelRadiusPx);
+        settings.setValue(QStringLiteral("processing/strongHotPixelExcessDn"),
+                          config.processing.strongHotPixelExcessDn);
+        settings.setValue(QStringLiteral("processing/r0HistoryWindowFrames"),
+                          config.processing.r0HistoryWindowFrames);
+    }
+    if (changes.roiRecentering) {
+        settings.setValue(QStringLiteral("roiRecentering/thresholdPx"), config.roiRecentering.thresholdPx);
+        settings.setValue(QStringLiteral("roiRecentering/requiredFrames"), config.roiRecentering.requiredFrames);
+        settings.setValue(QStringLiteral("roiRecentering/cooldownMs"), config.roiRecentering.cooldownMs);
+        settings.setValue(QStringLiteral("roiRecentering/minimumShiftPx"), config.roiRecentering.minimumShiftPx);
+    }
+    if (changes.fullFrameStarDetection) {
+        settings.setValue(QStringLiteral("starDetection/sigmaThreshold"), config.starDetection.sigmaThreshold);
+        settings.setValue(QStringLiteral("starDetection/peakFraction"), config.starDetection.peakFraction);
+        settings.setValue(QStringLiteral("starDetection/minArea"), config.starDetection.minArea);
+        settings.setValue(QStringLiteral("starDetection/maxArea"), config.starDetection.maxArea);
+        settings.setValue(QStringLiteral("starDetection/connectivity"), config.starDetection.connectivity);
+    }
+    if (changes.hotPixel) {
+        settings.setValue(QStringLiteral("hotPixel/enabled"), config.hotPixel.enabled);
+        settings.setValue(QStringLiteral("hotPixel/camera0MaskPath"), config.hotPixel.camera0MaskPath);
+        settings.setValue(QStringLiteral("hotPixel/camera0ExcessPath"), config.hotPixel.camera0ExcessPath);
+        settings.setValue(QStringLiteral("hotPixel/camera1MaskPath"), config.hotPixel.camera1MaskPath);
+        settings.setValue(QStringLiteral("hotPixel/camera1ExcessPath"), config.hotPixel.camera1ExcessPath);
+        settings.setValue(QStringLiteral("hotPixel/templateWidth"), config.hotPixel.templateWidth);
+        settings.setValue(QStringLiteral("hotPixel/templateHeight"), config.hotPixel.templateHeight);
+    }
+    if (changes.optics) {
+        settings.setValue(QStringLiteral("optical/apertureDiameterMm"), config.optical.apertureDiameterMm);
+        settings.setValue(QStringLiteral("optical/baselineSeparationMm"), config.optical.baselineSeparationMm);
+        settings.setValue(QStringLiteral("optical/baselineAngleDeg"), config.optical.baselineAngleDeg);
+        settings.setValue(QStringLiteral("optical/focalLengthCm"), config.optical.focalLengthCm);
+        settings.setValue(QStringLiteral("optical/zenithAngleDeg"), config.optical.zenithAngleDeg);
+        settings.setValue(QStringLiteral("optical/wavelengthNm"), config.optical.wavelengthNm);
+        settings.setValue(QStringLiteral("optical/pixelSizeUm"), config.optical.pixelSizeUm);
+    }
+    if (changes.alignment) {
+        settings.setValue(QStringLiteral("alignment/autoRadius"), config.alignment.autoRadius);
+        settings.setValue(QStringLiteral("alignment/focalLengthMm"), config.alignment.focalLengthMm);
+        settings.setValue(QStringLiteral("alignment/pixelSizeUm"), config.alignment.pixelSizeUm);
+        settings.setValue(QStringLiteral("alignment/polarDistanceArcmin"), config.alignment.polarDistanceArcmin);
+        settings.setValue(QStringLiteral("alignment/radiusAdjustPx"), config.alignment.radiusAdjustPx);
+        settings.setValue(QStringLiteral("alignment/previewRateHz"), config.alignment.previewRateHz);
+    }
+    if (changes.polarisSolver) {
+        settings.setValue(QStringLiteral("polarisSolver/enabled"), config.polarisSolver.enabled);
+        settings.setValue(QStringLiteral("polarisSolver/showMatchedCatalogStars"),
+                          config.polarisSolver.showMatchedCatalogStars);
+        settings.setValue(QStringLiteral("polarisSolver/maxDetectedStars"), config.polarisSolver.maxDetectedStars);
+        settings.setValue(QStringLiteral("polarisSolver/minMatchedStars"), config.polarisSolver.minMatchedStars);
+        settings.setValue(QStringLiteral("polarisSolver/maxRmsPx"), config.polarisSolver.maxRmsPx);
+        settings.setValue(QStringLiteral("polarisSolver/retryIntervalMs"), config.polarisSolver.retryIntervalMs);
+        settings.setValue(QStringLiteral("polarisSolver/minMatchedSpatialSpreadPx"),
+                          config.polarisSolver.minMatchedSpatialSpreadPx);
+        settings.setValue(QStringLiteral("polarisSolver/minPolarisSnr"), config.polarisSolver.minPolarisSnr);
+        settings.setValue(QStringLiteral("polarisSolver/allowSaturatedPolarisConfirmation"),
+                          config.polarisSolver.allowSaturatedPolarisConfirmation);
+    }
+    if (changes.storage) {
+        settings.setValue(QStringLiteral("storage/path"), config.storage.path);
+        settings.setValue(QStringLiteral("storage/interval"), config.storage.interval);
+        settings.setValue(QStringLiteral("storage/parameterValidationEnabled"),
+                          config.storage.parameterValidationEnabled);
+        settings.setValue(QStringLiteral("storage/syncDiagnosticLoggingEnabled"),
+                          config.storage.syncDiagnosticLoggingEnabled);
+    }
+    if (changes.trigger) {
+        settings.setValue(QStringLiteral("trigger/mode"), config.trigger.mode);
+    }
+    if (changes.environmentSensor) {
+        settings.setValue(QStringLiteral("environmentSensor/enabled"), config.environmentSensor.enabled);
+        settings.setValue(QStringLiteral("environmentSensor/portName"), config.environmentSensor.portName);
+        settings.setValue(QStringLiteral("environmentSensor/baudRate"), config.environmentSensor.baudRate);
+        settings.setValue(QStringLiteral("environmentSensor/deviceAddress"),
+                          config.environmentSensor.deviceAddress);
+        settings.setValue(QStringLiteral("environmentSensor/pollIntervalMs"),
+                          config.environmentSensor.pollIntervalMs);
+    }
+    if (changes.pulseGenerator) {
+        settings.setValue(QStringLiteral("pulseGenerator/enabled"), config.pulseGenerator.enabled);
+        settings.setValue(QStringLiteral("pulseGenerator/portName"), config.pulseGenerator.portName);
+        settings.setValue(QStringLiteral("pulseGenerator/baudRate"), config.pulseGenerator.baudRate);
+        settings.setValue(QStringLiteral("pulseGenerator/terminalId"), config.pulseGenerator.terminalId);
+        settings.setValue(QStringLiteral("pulseGenerator/frequencyHz"), config.pulseGenerator.frequencyHz);
+        settings.setValue(QStringLiteral("pulseGenerator/pulseCount"), config.pulseGenerator.pulseCount);
+        settings.setValue(QStringLiteral("pulseGenerator/dutyPercent"), config.pulseGenerator.dutyPercent);
+        settings.setValue(QStringLiteral("pulseGenerator/remoteControl"), config.pulseGenerator.remoteControl);
+    }
+    if (changes.autoAcquisition) {
+        settings.setValue(QStringLiteral("autoAcquisition/enabled"), config.autoAcquisition.enabled);
+        settings.setValue(QStringLiteral("autoAcquisition/latitudeDeg"), config.autoAcquisition.latitudeDeg);
+        settings.setValue(QStringLiteral("autoAcquisition/longitudeDeg"), config.autoAcquisition.longitudeDeg);
+        settings.setValue(QStringLiteral("autoAcquisition/startOffsetMinutesAfterSunset"),
+                          config.autoAcquisition.startOffsetMinutesAfterSunset);
+        settings.setValue(QStringLiteral("autoAcquisition/stopOffsetMinutesBeforeSunrise"),
+                          config.autoAcquisition.stopOffsetMinutesBeforeSunrise);
+        settings.setValue(QStringLiteral("autoAcquisition/recoveryScanIntervalMinutes"),
+                          config.autoAcquisition.recoveryScanIntervalMinutes);
+        settings.setValue(QStringLiteral("autoAcquisition/testTimeOverrideEnabled"),
+                          config.autoAcquisition.testTimeOverrideEnabled);
+        settings.setValue(QStringLiteral("autoAcquisition/testStartTime"),
+                          config.autoAcquisition.testStartTime);
+        settings.setValue(QStringLiteral("autoAcquisition/testStopTime"),
+                          config.autoAcquisition.testStopTime);
+    }
+    if (changes.network) {
+        settings.setValue(QStringLiteral("network/ip"), config.network.ip);
+        settings.setValue(QStringLiteral("network/port"), config.network.port);
+    }
     settings.endGroup();
     settings.sync();
 }

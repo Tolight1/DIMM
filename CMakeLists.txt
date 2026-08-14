@@ -18,6 +18,8 @@ list(APPEND srcs
     src/ConfigApplicationController.cpp
     src/ConfigTextUtils.h
     src/ConfigTextUtils.cpp
+    src/CommProtocol.h
+    src/CommProtocol.cpp
     src/DimmRuntimeHelpers.h
     src/DimmRuntimeHelpers.cpp
     src/DIMM.Config.cpp
@@ -91,6 +93,58 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE NOMINMAX)
 target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Widgets Qt6::Network GxIAPICPPEx.lib
     $<IF:$<CONFIG:Debug>,opencv_world4120d.lib,opencv_world4120.lib>
 ) # Qt6 + Galaxy SDK + OpenCV
+
+# Deploy Qt runtime files into the executable directory so the whole
+# build/<config> directory can be copied to a test computer.
+find_program(QT_WINDEPLOYQT_EXECUTABLE
+    NAMES windeployqt.exe windeployqt
+    HINTS
+        "${CMAKE_PREFIX_PATH}/bin"
+        "${Qt6_DIR}/../../../bin"
+)
+if(QT_WINDEPLOYQT_EXECUTABLE)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND "${QT_WINDEPLOYQT_EXECUTABLE}"
+            $<$<CONFIG:Debug>:--debug>
+            $<$<NOT:$<CONFIG:Debug>>:--release>
+            --compiler-runtime
+            --no-translations
+            "$<TARGET_FILE:${PROJECT_NAME}>"
+        COMMENT "Deploying Qt runtime files..."
+    )
+else()
+    message(WARNING "windeployqt was not found; Qt runtime files will not be deployed automatically")
+endif()
+
+set(MSVC_REDIST_ROOT "")
+if(CMAKE_GENERATOR_INSTANCE)
+    file(GLOB MSVC_REDIST_CANDIDATES
+        "${CMAKE_GENERATOR_INSTANCE}/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT")
+    list(SORT MSVC_REDIST_CANDIDATES ORDER DESCENDING)
+    if(MSVC_REDIST_CANDIDATES)
+        list(GET MSVC_REDIST_CANDIDATES 0 MSVC_REDIST_ROOT)
+    endif()
+endif()
+if(EXISTS "${MSVC_REDIST_ROOT}/vcruntime140.dll")
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${MSVC_REDIST_ROOT}"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+        COMMENT "Deploying MSVC runtime files..."
+    )
+else()
+    message(WARNING "MSVC x64 runtime directory was not found; install VC++ Redistributable on the target computer")
+endif()
+
+add_executable(comm_protocol_test
+    tests/comm_protocol_test.cpp
+    src/CommProtocol.cpp
+    src/CommProtocol.h
+)
+target_include_directories(comm_protocol_test PRIVATE src)
+target_link_libraries(comm_protocol_test PRIVATE Qt6::Core)
+enable_testing()
+add_test(NAME comm_protocol_test COMMAND comm_protocol_test)
 
 # Auto-copy Galaxy DLLs to output directory after build
 set(GALAXY_DLL_DIR "E:/Softwoare/Galaxy/GalaxySDK/APIDll/Win64")

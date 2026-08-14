@@ -51,15 +51,16 @@ struct AutoExposureSpotResult {
 };
 
 struct AutoExposureDecisionConfig {
-    double targetPeakLowDn = 3000.0;
+    double targetPeakLowDn = 500.0;
     double targetPeakHighDn = 3600.0;
-    double exposureHysteresisDn = 200.0;
+    double exposureHysteresisDn = 300.0;
     double hardSaturationDn = 4090.0;
     double darkFrameRatioThreshold = 0.60;
     double brightFrameRatioThreshold = 0.60;
     double stableFrameRatioThreshold = 0.70;
     double hardSaturationFrameRatioThreshold = 0.05;
-    int minDecisionSampleCount = 20;
+    int minDecisionSampleCount = 500;
+    double autoExposureStepUs = 200.0;
     double minExposureUs = 500.0;
     double maxExposureUs = 20000.0;
     double maxExposureChangeRatioUp = 1.30;
@@ -67,6 +68,12 @@ struct AutoExposureDecisionConfig {
     double minExposureDeltaUs = 10.0;
     double minExposureChangeRatio = 0.02;
 };
+
+inline bool shouldApplyAutoExposureInitialExposure(bool autoAcquisitionEnabled,
+                                                    bool autoExposureEnabled)
+{
+    return autoAcquisitionEnabled && autoExposureEnabled;
+}
 
 struct AutoExposureWindowStats {
     int decisionSampleCount = 0;
@@ -274,9 +281,7 @@ inline AutoExposureControlAction exposureAction(AutoExposureAdjustDirection dire
 {
     const double clampedTarget = std::clamp(targetExposureUs, config.minExposureUs, config.maxExposureUs);
     const double absoluteDelta = std::abs(clampedTarget - currentExposureUs);
-    const double relativeDelta = currentExposureUs > 0.0 ? absoluteDelta / currentExposureUs : 1.0;
-    if (absoluteDelta < config.minExposureDeltaUs ||
-        relativeDelta < config.minExposureChangeRatio) {
+    if (absoluteDelta <= 0.0) {
         return holdAction(currentExposureUs, "SMALL_DELTA_HOLD");
     }
     AutoExposureControlAction action;
@@ -395,7 +400,6 @@ inline AutoExposureWindowStats summarizeAutoExposureWindow(
         case AutoExposurePeakQuality::WeakOrNoSignal:
             ++stats.invalidPeakSampleCount;
             ++stats.weakOrNoSignalCount;
-            ++stats.darkEvidenceCount;
             break;
         case AutoExposurePeakQuality::RejectedIsolatedPeak:
             ++stats.invalidPeakSampleCount;
@@ -433,24 +437,10 @@ inline AutoExposureControlAction chooseAutoExposureAction(const AutoExposureWind
         return AutoExposureLogicDetail::holdAction(currentExposureUs, "WAIT_SAMPLES");
     }
 
-    if (stats.hardSaturationRatio >= config.hardSaturationFrameRatioThreshold) {
-        const double target = currentExposureUs * config.maxExposureChangeRatioDown;
-        return AutoExposureLogicDetail::exposureAction(AutoExposureAdjustDirection::Decrease,
-                                                       currentExposureUs,
-                                                       target,
-                                                       config,
-                                                       "HARD_SATURATION_DECREASE");
-    }
-
     if (stats.brightRatio >= config.brightFrameRatioThreshold) {
-        const double reference = std::max(stats.peakP90Dn, 1.0);
-        const double ratio = std::clamp(
-            AutoExposureLogicDetail::brightAdjustmentTargetDn(config) / reference,
-            config.maxExposureChangeRatioDown,
-            1.0);
         return AutoExposureLogicDetail::exposureAction(AutoExposureAdjustDirection::Decrease,
                                                        currentExposureUs,
-                                                       currentExposureUs * ratio,
+                                                       currentExposureUs - std::max(0.0, config.autoExposureStepUs),
                                                        config,
                                                        "BRIGHT_DECREASE");
     }
@@ -459,16 +449,9 @@ inline AutoExposureControlAction chooseAutoExposureAction(const AutoExposureWind
         if (currentExposureUs >= config.maxExposureUs) {
             return AutoExposureLogicDetail::holdAction(currentExposureUs, "MAX_EXPOSURE_DARK_HOLD");
         }
-        const double reference = stats.peakP50Dn > 0.0 ? stats.peakP50Dn : 1.0;
-        const double ratio = stats.peakP50Dn > 0.0
-                                 ? std::clamp(
-                                       AutoExposureLogicDetail::darkAdjustmentTargetDn(config) / reference,
-                                       1.0,
-                                       config.maxExposureChangeRatioUp)
-                                 : config.maxExposureChangeRatioUp;
         return AutoExposureLogicDetail::exposureAction(AutoExposureAdjustDirection::Increase,
                                                        currentExposureUs,
-                                                       currentExposureUs * ratio,
+                                                       currentExposureUs + std::max(0.0, config.autoExposureStepUs),
                                                        config,
                                                        "DARK_INCREASE");
     }
@@ -476,14 +459,9 @@ inline AutoExposureControlAction chooseAutoExposureAction(const AutoExposureWind
     if (activeAdjustmentDirection == AutoExposureAdjustDirection::Decrease &&
         stats.validPeakSampleCount > 0 &&
         stats.peakP90Dn > AutoExposureLogicDetail::brightAdjustmentTargetDn(config)) {
-        const double reference = std::max(stats.peakP90Dn, 1.0);
-        const double ratio = std::clamp(
-            AutoExposureLogicDetail::brightAdjustmentTargetDn(config) / reference,
-            config.maxExposureChangeRatioDown,
-            1.0);
         return AutoExposureLogicDetail::exposureAction(AutoExposureAdjustDirection::Decrease,
                                                        currentExposureUs,
-                                                       currentExposureUs * ratio,
+                                                       currentExposureUs - std::max(0.0, config.autoExposureStepUs),
                                                        config,
                                                        "BRIGHT_RECOVERY_DECREASE");
     }
@@ -494,14 +472,9 @@ inline AutoExposureControlAction chooseAutoExposureAction(const AutoExposureWind
         if (currentExposureUs >= config.maxExposureUs) {
             return AutoExposureLogicDetail::holdAction(currentExposureUs, "MAX_EXPOSURE_DARK_HOLD");
         }
-        const double reference = stats.peakP50Dn;
-        const double ratio = std::clamp(
-            AutoExposureLogicDetail::darkAdjustmentTargetDn(config) / reference,
-            1.0,
-            config.maxExposureChangeRatioUp);
         return AutoExposureLogicDetail::exposureAction(AutoExposureAdjustDirection::Increase,
                                                        currentExposureUs,
-                                                       currentExposureUs * ratio,
+                                                       currentExposureUs + std::max(0.0, config.autoExposureStepUs),
                                                        config,
                                                        "DARK_RECOVERY_INCREASE");
     }

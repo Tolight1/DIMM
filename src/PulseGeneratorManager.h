@@ -2,6 +2,7 @@
 
 #include <QString>
 
+#include <atomic>
 #include <functional>
 
 class QObject;
@@ -25,6 +26,7 @@ public:
     ~PulseGeneratorManager();
 
     bool applyConfig(const Config& config, QString* errorMessage = nullptr);
+    bool setControlSource(const Config& config, bool remoteControl, QString* errorMessage = nullptr);
     bool configureAndStart(const Config& config, QString* errorMessage = nullptr);
     bool stop(QString* errorMessage = nullptr);
     bool isRunning() const;
@@ -33,6 +35,7 @@ public:
 private:
     bool validateConfig(const Config& config, QString* errorMessage) const;
     bool configureDevice(const Config& config, bool enableOutput, QString* errorMessage);
+    bool setControlSourceDevice(const Config& config, QString* errorMessage);
     bool stopDevice(const Config& config, QString* errorMessage);
     bool runWorkerOperation(const QString& operationName,
                             const std::function<bool(QString*)>& operation,
@@ -54,6 +57,7 @@ private:
 
     Config m_config;
     bool m_running = false;
+    std::atomic_bool m_operationInProgress{false};
     QThread* m_workerThread = nullptr;
     QObject* m_workerContext = nullptr;
 };

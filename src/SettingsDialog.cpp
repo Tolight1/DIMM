@@ -4,6 +4,7 @@
 #include "ConfigValidator.h"
 #include "InitialStarDetectionConfig.h"
 #include "PathUtils.h"
+#include "SettingsApplyPolicy.h"
 #include <algorithm>
 #include <cmath>
 #include <QCheckBox>
@@ -53,6 +54,208 @@ QString statusLabelStyle(UiStatusLevel level)
 {
     return statusLabelStyle(uiStatusColor(level));
 }
+
+bool sameDouble(double lhs, double rhs)
+{
+    return std::fabs(lhs - rhs) < 1e-9;
+}
+
+bool sameCameraConfig(const CameraConfig& lhs, const CameraConfig& rhs)
+{
+    return sameDouble(lhs.exposureUs, rhs.exposureUs) &&
+           sameDouble(lhs.gainDb, rhs.gainDb) &&
+           sameDouble(lhs.continuousFrameRateHz, rhs.continuousFrameRateHz);
+}
+
+bool sameAutoExposureConfig(const AutoExposureConfig& lhs, const AutoExposureConfig& rhs)
+{
+    return lhs.enabled == rhs.enabled &&
+           lhs.trendConflictEnabled == rhs.trendConflictEnabled &&
+           sameDouble(lhs.targetPeakLowDn, rhs.targetPeakLowDn) &&
+           sameDouble(lhs.targetPeakHighDn, rhs.targetPeakHighDn) &&
+           sameDouble(lhs.exposureHysteresisDn, rhs.exposureHysteresisDn) &&
+           sameDouble(lhs.hardSaturationDn, rhs.hardSaturationDn) &&
+           lhs.saturatedPixelCount == rhs.saturatedPixelCount &&
+           sameDouble(lhs.darkSnrWarning, rhs.darkSnrWarning) &&
+           sameDouble(lhs.darkSnrCritical, rhs.darkSnrCritical) &&
+           sameDouble(lhs.minValidCentroidRatio, rhs.minValidCentroidRatio) &&
+           sameDouble(lhs.starLostValidRatio, rhs.starLostValidRatio) &&
+           sameDouble(lhs.brightFrameRatioThreshold, rhs.brightFrameRatioThreshold) &&
+           sameDouble(lhs.darkFrameRatioThreshold, rhs.darkFrameRatioThreshold) &&
+           sameDouble(lhs.stableFrameRatioThreshold, rhs.stableFrameRatioThreshold) &&
+           sameDouble(lhs.hardSaturationFrameRatioThreshold, rhs.hardSaturationFrameRatioThreshold) &&
+           lhs.sampleWindowSec == rhs.sampleWindowSec &&
+           lhs.autoExposureSampleIntervalMs == rhs.autoExposureSampleIntervalMs &&
+           lhs.minDecisionSampleCount == rhs.minDecisionSampleCount &&
+           sameDouble(lhs.autoExposureStepUs, rhs.autoExposureStepUs) &&
+           sameDouble(lhs.initialExposureUs, rhs.initialExposureUs) &&
+           lhs.autoExposureDecisionCooldownMin == rhs.autoExposureDecisionCooldownMin &&
+           lhs.trendConflictPersistenceSec == rhs.trendConflictPersistenceSec &&
+           sameDouble(lhs.minExposureUs, rhs.minExposureUs) &&
+           sameDouble(lhs.maxExposureUs, rhs.maxExposureUs) &&
+           sameDouble(lhs.maxExposureChangeRatioUp, rhs.maxExposureChangeRatioUp) &&
+           sameDouble(lhs.maxExposureChangeRatioDown, rhs.maxExposureChangeRatioDown) &&
+           sameDouble(lhs.cameraAgreementRatio, rhs.cameraAgreementRatio) &&
+           lhs.peakSupportRadiusPx == rhs.peakSupportRadiusPx &&
+           sameDouble(lhs.peakSupportFraction, rhs.peakSupportFraction) &&
+           lhs.minPeakSupportPixelCount == rhs.minPeakSupportPixelCount &&
+           sameDouble(lhs.minNeighborPeakRatio, rhs.minNeighborPeakRatio) &&
+           lhs.maxPeakCandidateCount == rhs.maxPeakCandidateCount &&
+           sameDouble(lhs.supportedPeakPercentile, rhs.supportedPeakPercentile) &&
+           lhs.exposureSettleMs == rhs.exposureSettleMs &&
+           sameDouble(lhs.minExposureDeltaUs, rhs.minExposureDeltaUs) &&
+           sameDouble(lhs.minExposureChangeRatio, rhs.minExposureChangeRatio);
+}
+
+bool sameProcessingConfig(const ProcessingConfig& lhs, const ProcessingConfig& rhs)
+{
+    return lhs.backgroundKernelSize == rhs.backgroundKernelSize &&
+           sameDouble(lhs.backgroundSigmaMultiplier, rhs.backgroundSigmaMultiplier) &&
+           lhs.centroidMode == rhs.centroidMode &&
+           lhs.peakKernelRadiusPx == rhs.peakKernelRadiusPx &&
+           sameDouble(lhs.strongHotPixelExcessDn, rhs.strongHotPixelExcessDn) &&
+           lhs.r0HistoryWindowFrames == rhs.r0HistoryWindowFrames;
+}
+
+bool sameRoiRecenteringConfig(const RoiRecenteringConfig& lhs, const RoiRecenteringConfig& rhs)
+{
+    return sameDouble(lhs.thresholdPx, rhs.thresholdPx) &&
+           lhs.requiredFrames == rhs.requiredFrames &&
+           lhs.cooldownMs == rhs.cooldownMs &&
+           sameDouble(lhs.minimumShiftPx, rhs.minimumShiftPx);
+}
+
+bool sameStarDetectionConfig(const StarDetectionConfig& lhs, const StarDetectionConfig& rhs)
+{
+    return sameDouble(lhs.sigmaThreshold, rhs.sigmaThreshold) &&
+           sameDouble(lhs.peakFraction, rhs.peakFraction) &&
+           lhs.minArea == rhs.minArea &&
+           lhs.maxArea == rhs.maxArea &&
+           lhs.connectivity == rhs.connectivity;
+}
+
+bool sameHotPixelConfig(const HotPixelConfig& lhs, const HotPixelConfig& rhs)
+{
+    return lhs.enabled == rhs.enabled &&
+           lhs.camera0MaskPath == rhs.camera0MaskPath &&
+           lhs.camera0ExcessPath == rhs.camera0ExcessPath &&
+           lhs.camera1MaskPath == rhs.camera1MaskPath &&
+           lhs.camera1ExcessPath == rhs.camera1ExcessPath &&
+           lhs.templateWidth == rhs.templateWidth &&
+           lhs.templateHeight == rhs.templateHeight;
+}
+
+bool sameOpticalConfig(const OpticalConfig& lhs, const OpticalConfig& rhs)
+{
+    return sameDouble(lhs.apertureDiameterMm, rhs.apertureDiameterMm) &&
+           sameDouble(lhs.baselineSeparationMm, rhs.baselineSeparationMm) &&
+           sameDouble(lhs.baselineAngleDeg, rhs.baselineAngleDeg) &&
+           sameDouble(lhs.focalLengthCm, rhs.focalLengthCm) &&
+           sameDouble(lhs.zenithAngleDeg, rhs.zenithAngleDeg) &&
+           sameDouble(lhs.wavelengthNm, rhs.wavelengthNm) &&
+           sameDouble(lhs.pixelSizeUm, rhs.pixelSizeUm);
+}
+
+bool sameAlignmentConfig(const AlignmentConfig& lhs, const AlignmentConfig& rhs)
+{
+    return lhs.autoRadius == rhs.autoRadius &&
+           sameDouble(lhs.focalLengthMm, rhs.focalLengthMm) &&
+           sameDouble(lhs.pixelSizeUm, rhs.pixelSizeUm) &&
+           sameDouble(lhs.polarDistanceArcmin, rhs.polarDistanceArcmin) &&
+           sameDouble(lhs.radiusAdjustPx, rhs.radiusAdjustPx) &&
+           sameDouble(lhs.previewRateHz, rhs.previewRateHz);
+}
+
+bool samePolarisSolverConfig(const PolarisSolverSettingsConfig& lhs,
+                             const PolarisSolverSettingsConfig& rhs)
+{
+    return lhs.enabled == rhs.enabled &&
+           lhs.showMatchedCatalogStars == rhs.showMatchedCatalogStars &&
+           lhs.maxDetectedStars == rhs.maxDetectedStars &&
+           lhs.minMatchedStars == rhs.minMatchedStars &&
+           sameDouble(lhs.maxRmsPx, rhs.maxRmsPx) &&
+           lhs.retryIntervalMs == rhs.retryIntervalMs &&
+           sameDouble(lhs.minMatchedSpatialSpreadPx, rhs.minMatchedSpatialSpreadPx) &&
+           sameDouble(lhs.minPolarisSnr, rhs.minPolarisSnr) &&
+           lhs.allowSaturatedPolarisConfirmation == rhs.allowSaturatedPolarisConfirmation;
+}
+
+bool sameStorageConfig(const StorageConfig& lhs, const StorageConfig& rhs)
+{
+    return lhs.path == rhs.path &&
+           lhs.interval == rhs.interval &&
+           lhs.parameterValidationEnabled == rhs.parameterValidationEnabled &&
+           lhs.syncDiagnosticLoggingEnabled == rhs.syncDiagnosticLoggingEnabled;
+}
+
+bool sameEnvironmentSensorConfig(const EnvironmentSensorConfig& lhs,
+                                 const EnvironmentSensorConfig& rhs)
+{
+    return lhs.enabled == rhs.enabled &&
+           lhs.portName == rhs.portName &&
+           lhs.baudRate == rhs.baudRate &&
+           lhs.dataBits == rhs.dataBits &&
+           lhs.stopBits == rhs.stopBits &&
+           lhs.readTimeoutMs == rhs.readTimeoutMs &&
+           lhs.writeTimeoutMs == rhs.writeTimeoutMs &&
+           lhs.pollIntervalMs == rhs.pollIntervalMs &&
+           lhs.deviceAddress == rhs.deviceAddress;
+}
+
+bool samePulseGeneratorConfig(const PulseGeneratorConfig& lhs, const PulseGeneratorConfig& rhs)
+{
+    return lhs.enabled == rhs.enabled &&
+           lhs.portName == rhs.portName &&
+           lhs.baudRate == rhs.baudRate &&
+           lhs.terminalId == rhs.terminalId &&
+           sameDouble(lhs.frequencyHz, rhs.frequencyHz) &&
+           lhs.pulseCount == rhs.pulseCount &&
+           sameDouble(lhs.dutyPercent, rhs.dutyPercent) &&
+           lhs.remoteControl == rhs.remoteControl;
+}
+
+bool sameAutoAcquisitionConfig(const AutoAcquisitionConfig& lhs,
+                               const AutoAcquisitionConfig& rhs)
+{
+    return lhs.enabled == rhs.enabled &&
+           sameDouble(lhs.latitudeDeg, rhs.latitudeDeg) &&
+           sameDouble(lhs.longitudeDeg, rhs.longitudeDeg) &&
+           lhs.startOffsetMinutesAfterSunset == rhs.startOffsetMinutesAfterSunset &&
+           lhs.stopOffsetMinutesBeforeSunrise == rhs.stopOffsetMinutesBeforeSunrise &&
+           lhs.recoveryScanIntervalMinutes == rhs.recoveryScanIntervalMinutes &&
+           lhs.testTimeOverrideEnabled == rhs.testTimeOverrideEnabled &&
+           lhs.testStartTime == rhs.testStartTime &&
+           lhs.testStopTime == rhs.testStopTime;
+}
+
+bool sameNetworkConfig(const NetworkConfig& lhs, const NetworkConfig& rhs)
+{
+    return lhs.ip == rhs.ip &&
+           lhs.port == rhs.port;
+}
+
+ConfigChangeSet changedSections(const AppConfig& baseline, const AppConfig& current)
+{
+    ConfigChangeSet changes;
+    changes.camera = !sameCameraConfig(baseline.camera, current.camera);
+    changes.autoExposure = !sameAutoExposureConfig(baseline.autoExposure, current.autoExposure);
+    changes.trigger = baseline.trigger.mode != current.trigger.mode;
+    changes.processing = !sameProcessingConfig(baseline.processing, current.processing);
+    changes.roiRecentering = !sameRoiRecenteringConfig(baseline.roiRecentering, current.roiRecentering);
+    changes.fullFrameStarDetection = !sameStarDetectionConfig(baseline.starDetection, current.starDetection);
+    changes.hotPixel = !sameHotPixelConfig(baseline.hotPixel, current.hotPixel);
+    changes.optics = !sameOpticalConfig(baseline.optical, current.optical);
+    changes.alignment = !sameAlignmentConfig(baseline.alignment, current.alignment);
+    changes.polarisSolver = !samePolarisSolverConfig(baseline.polarisSolver, current.polarisSolver);
+    changes.storage = !sameStorageConfig(baseline.storage, current.storage);
+    changes.environmentSensor = !sameEnvironmentSensorConfig(baseline.environmentSensor,
+                                                             current.environmentSensor);
+    changes.pulseGenerator = !samePulseGeneratorConfig(baseline.pulseGenerator, current.pulseGenerator);
+    changes.autoAcquisition = !sameAutoAcquisitionConfig(baseline.autoAcquisition,
+                                                         current.autoAcquisition);
+    changes.network = !sameNetworkConfig(baseline.network, current.network);
+    return changes;
+}
 } // namespace
 SettingsDialog::SettingsDialog(QWidget* parent)
     : QDialog(parent)
@@ -77,7 +280,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
         "1. 确保两台相机均已连接后再开始实时采集。\n"
         "2. 网络参数用于连接上位机或远端控制端。\n"
         "3. 点击应用后将立即写入当前运行配置。\n"
-        "4. ROI 固定为 64x64，启动后两台相机分别全画幅定位，再切换各自独立 ROI。"));
+        "4. ROI 固定为 64x64，启动后两台相机分别全画幅定位，再切换各自独立 ROI"));
     infoLabel->setWordWrap(true);
     infoLayout->addWidget(infoLabel);
     camLayout->addWidget(infoGroup);
@@ -133,211 +336,121 @@ SettingsDialog::SettingsDialog(QWidget* parent)
         autoExposureLayout->addWidget(section);
         return form;
     };
-    auto addToolTipRow = [](QFormLayout* layout, const QString& labelText, QWidget* widget, const QString& tip) {
-        auto* label = new QLabel(labelText);
-        label->setToolTip(tip);
-        if (widget) {
-            widget->setToolTip(tip);
-        }
-        layout->addRow(label, widget);
-    };
-    auto addToolTipCheck = [](QFormLayout* layout, QCheckBox* check, const QString& tip) {
-        if (check) {
-            check->setToolTip(tip);
-        }
-        layout->addRow(check);
-    };
 
     auto* autoExpBasicLayout = makeAutoExposureSection(QStringLiteral("基础开关"), true);
     auto* autoExpCoreLayout = makeAutoExposureSection(QStringLiteral("核心调光"), true);
     auto* autoExpRangeLayout = makeAutoExposureSection(QStringLiteral("曝光范围与单步限制"), false);
-    auto* autoExpWindowLayout = makeAutoExposureSection(QStringLiteral("窗口判定"), true);
+    auto* autoExpWindowLayout = makeAutoExposureSection(QStringLiteral("样本判定"), true);
     auto* autoExpSyncLayout = makeAutoExposureSection(QStringLiteral("双相机同步"), false);
     auto* autoExpDarkWeakLayout = makeAutoExposureSection(QStringLiteral("暗弱与丢星判定"), false);
     auto* autoExpPeakSupportLayout = makeAutoExposureSection(QStringLiteral("峰值支持检查"), false);
 
     autoExposureCheck = new QCheckBox(QStringLiteral("启用自动曝光"));
-    addToolTipCheck(autoExpBasicLayout,
-                    autoExposureCheck,
-                    QStringLiteral("开启后系统会根据 AE 峰值窗口统计自动调整相机曝光；关闭后使用手动曝光。"));
+    autoExpBasicLayout->addRow(autoExposureCheck);
     autoExpTrendConflictCheck = new QCheckBox(QStringLiteral("启用双相机趋势同步"));
     autoExpTrendConflictCheck->setChecked(true);
-    addToolTipCheck(autoExpBasicLayout,
-                    autoExpTrendConflictCheck,
-                    QStringLiteral("开启时两台相机同步判断并同步调整曝光；关闭时两台相机各自独立调整。"));
+    autoExpBasicLayout->addRow(autoExpTrendConflictCheck);
 
-    autoExpTargetPeakLowEdit = new QLineEdit(QStringLiteral("3000"));
-    addToolTipRow(autoExpCoreLayout,
-                  QStringLiteral("过暗触发阈值 (DN):"),
-                  autoExpTargetPeakLowEdit,
-                  QStringLiteral("有效峰值低于该值时计入过暗帧；过暗帧比例达到阈值后触发增曝光。"));
+    autoExpTargetPeakLowEdit = new QLineEdit(QStringLiteral("500"));
+    autoExpCoreLayout->addRow(QStringLiteral("过暗触发阈值(DN):"), autoExpTargetPeakLowEdit);
     autoExpTargetPeakHighEdit = new QLineEdit(QStringLiteral("3600"));
-    addToolTipRow(autoExpCoreLayout,
-                  QStringLiteral("过曝触发阈值 (DN):"),
-                  autoExpTargetPeakHighEdit,
-                  QStringLiteral("有效峰值高于该值时计入过曝帧；过曝帧比例达到阈值后触发降曝光。"));
-    autoExpExposureHysteresisEdit = new QLineEdit(QStringLiteral("200"));
-    addToolTipRow(autoExpCoreLayout,
-                  QStringLiteral("曝光滞回 (DN):"),
-                  autoExpExposureHysteresisEdit,
-                  QStringLiteral("触发调光后用于生成停止目标，避免曝光刚跨过触发线就停止调整。"));
-    autoExpDarkAdjustmentTargetEdit = new QLineEdit(QStringLiteral("3200.0"));
+    autoExpCoreLayout->addRow(QStringLiteral("过曝触发阈值(DN):"), autoExpTargetPeakHighEdit);
+    autoExpExposureHysteresisEdit = new QLineEdit(QStringLiteral("300"));
+    autoExpCoreLayout->addRow(QStringLiteral("曝光滞回 (DN):"), autoExpExposureHysteresisEdit);
+    autoExpDarkAdjustmentTargetEdit = new QLineEdit(QStringLiteral("800.0"));
     autoExpDarkAdjustmentTargetEdit->setReadOnly(true);
-    addToolTipRow(autoExpCoreLayout,
-                  QStringLiteral("偏暗调整目标 (DN):"),
-                  autoExpDarkAdjustmentTargetEdit,
-                  QStringLiteral("只读派生值，等于“过暗触发阈值 + 曝光滞回”；增曝光后达到该目标才停止。"));
-    autoExpBrightAdjustmentTargetEdit = new QLineEdit(QStringLiteral("3400.0"));
+    autoExpCoreLayout->addRow(QStringLiteral("偏暗调整目标 (DN):"), autoExpDarkAdjustmentTargetEdit);
+    autoExpBrightAdjustmentTargetEdit = new QLineEdit(QStringLiteral("3300.0"));
     autoExpBrightAdjustmentTargetEdit->setReadOnly(true);
-    addToolTipRow(autoExpCoreLayout,
-                  QStringLiteral("过曝调整目标 (DN):"),
-                  autoExpBrightAdjustmentTargetEdit,
-                  QStringLiteral("只读派生值，等于“过曝触发阈值 - 曝光滞回”；降曝光后达到该目标才停止。"));
+    autoExpCoreLayout->addRow(QStringLiteral("过曝调整目标 (DN):"), autoExpBrightAdjustmentTargetEdit);
     autoExpHardSaturationEdit = new QLineEdit(QStringLiteral("4090"));
-    addToolTipRow(autoExpCoreLayout,
-                  QStringLiteral("硬饱和阈值 (DN):"),
-                  autoExpHardSaturationEdit,
-                  QStringLiteral("光斑支持区域达到该亮度时认为存在硬饱和风险，会优先触发强制降曝光。"));
+    autoExpCoreLayout->addRow(QStringLiteral("硬饱和阈值(DN):"), autoExpHardSaturationEdit);
     autoExpSaturatedPixelCountEdit = new QLineEdit(QStringLiteral("1"));
-    addToolTipRow(autoExpCoreLayout,
-                  QStringLiteral("硬饱和像素数:"),
-                  autoExpSaturatedPixelCountEdit,
-                  QStringLiteral("支持区域内达到硬饱和阈值的像素数量达到该值时，该帧计入硬饱和帧。"));
+    autoExpCoreLayout->addRow(QStringLiteral("硬饱和像素数:"), autoExpSaturatedPixelCountEdit);
 
     autoExpMinEdit = new QLineEdit(QStringLiteral("500"));
-    addToolTipRow(autoExpRangeLayout,
-                  QStringLiteral("最小曝光 (μs):"),
-                  autoExpMinEdit,
-                  QStringLiteral("自动曝光计算出的目标曝光不会低于该值。"));
+    autoExpRangeLayout->addRow(QStringLiteral("最小曝光(μs):"), autoExpMinEdit);
     autoExpMaxEdit = new QLineEdit(QStringLiteral("20000"));
-    addToolTipRow(autoExpRangeLayout,
-                  QStringLiteral("最大曝光 (μs):"),
-                  autoExpMaxEdit,
-                  QStringLiteral("自动曝光计算出的目标曝光不会高于该值。"));
+    autoExpRangeLayout->addRow(QStringLiteral("最大曝光(μs):"), autoExpMaxEdit);
     autoExpMaxChangeUpEdit = new QLineEdit(QStringLiteral("1.30"));
-    addToolTipRow(autoExpRangeLayout,
-                  QStringLiteral("单次调亮比例上限:"),
-                  autoExpMaxChangeUpEdit,
-                  QStringLiteral("每次增曝光允许的最大比例，防止一步增加过多。"));
+    autoExpRangeLayout->addRow(QStringLiteral("单次调亮比例上限:"), autoExpMaxChangeUpEdit);
     autoExpMaxChangeDownEdit = new QLineEdit(QStringLiteral("0.70"));
-    addToolTipRow(autoExpRangeLayout,
-                  QStringLiteral("单次调暗比例下限:"),
-                  autoExpMaxChangeDownEdit,
-                  QStringLiteral("每次降曝光允许的最低比例；硬饱和强制降曝光也使用该比例。"));
+    autoExpRangeLayout->addRow(QStringLiteral("单次调暗比例下限:"), autoExpMaxChangeDownEdit);
     autoExpMinExposureDeltaEdit = new QLineEdit(QStringLiteral("10"));
-    addToolTipRow(autoExpRangeLayout,
-                  QStringLiteral("最小曝光变化 (μs):"),
-                  autoExpMinExposureDeltaEdit,
-                  QStringLiteral("目标曝光与当前曝光的绝对差值小于该值时，不下发曝光命令。"));
+    autoExpRangeLayout->addRow(QStringLiteral("最小曝光变化(μs):"), autoExpMinExposureDeltaEdit);
     autoExpMinExposureChangeRatioEdit = new QLineEdit(QStringLiteral("0.02"));
-    addToolTipRow(autoExpRangeLayout,
-                  QStringLiteral("最小曝光变化比例:"),
-                  autoExpMinExposureChangeRatioEdit,
-                  QStringLiteral("目标曝光与当前曝光的相对变化小于该比例时，不下发曝光命令。"));
+    autoExpRangeLayout->addRow(QStringLiteral("最小曝光变化比例"), autoExpMinExposureChangeRatioEdit);
     autoExpExposureSettleMsEdit = new QLineEdit(QStringLiteral("750"));
-    addToolTipRow(autoExpRangeLayout,
-                  QStringLiteral("曝光稳定等待 (ms):"),
-                  autoExpExposureSettleMsEdit,
-                  QStringLiteral("曝光命令成功后等待一段时间再采纳 sample，避免旧曝光帧影响新判断。"));
+    autoExpRangeLayout->addRow(QStringLiteral("曝光稳定等待 (ms):"), autoExpExposureSettleMsEdit);
+    autoExpStepUsEdit = new QLineEdit(QStringLiteral("200"));
+    autoExpRangeLayout->addRow(QString::fromUtf8("\xe5\x8d\x95\xe6\xad\xa5\xe6\x9b\x9d\xe5\x85\x89\xe8\xb0\x83\xe6\x95\xb4\x20\x28\x75\x73\x29\x3a"), autoExpStepUsEdit);
+    autoExpInitialExposureUsEdit = new QLineEdit(QStringLiteral("4000"));
+    autoExpRangeLayout->addRow(QString::fromUtf8("\xe5\x90\xaf\xe5\x8a\xa8\xe9\xbb\x98\xe8\xae\xa4\xe6\x9b\x9d\xe5\x85\x89\x20\x28\x75\x73\x29\x3a"), autoExpInitialExposureUsEdit);
 
-    autoExpSampleWindowSecEdit = new QLineEdit(QStringLiteral("10"));
-    addToolTipRow(autoExpWindowLayout,
-                  QStringLiteral("统计窗口 (s):"),
-                  autoExpSampleWindowSecEdit,
-                  QStringLiteral("自动曝光使用最近多少秒的 sample 做统计；窗口越长越稳，响应越慢。"));
-    autoExpSampleIntervalMsEdit = new QLineEdit(QStringLiteral("500"));
-    addToolTipRow(autoExpWindowLayout,
-                  QStringLiteral("采样间隔 (ms):"),
-                  autoExpSampleIntervalMsEdit,
-                  QStringLiteral("自动曝光 sample 的采集间隔。"));
-    autoExpMinDecisionSampleCountEdit = new QLineEdit(QStringLiteral("20"));
-    addToolTipRow(autoExpWindowLayout,
-                  QStringLiteral("最小决策样本数:"),
-                  autoExpMinDecisionSampleCountEdit,
-                  QStringLiteral("窗口内 sample 数不足该值时，不做曝光调整。"));
+    autoExpSampleWindowSecEdit = nullptr;
+    autoExpSampleIntervalMsEdit = nullptr;
+    autoExpMinDecisionSampleCountEdit = new QLineEdit(QStringLiteral("500"));
+    autoExpWindowLayout->addRow(QStringLiteral("最小决策样本数:"), autoExpMinDecisionSampleCountEdit);
+    autoExpDecisionCooldownMinEdit = new QLineEdit(QStringLiteral("30"));
+    autoExpWindowLayout->addRow(QStringLiteral("稳定后冷却 (min):"), autoExpDecisionCooldownMinEdit);
     autoExpDarkFrameRatioEdit = new QLineEdit(QStringLiteral("0.50"));
-    addToolTipRow(autoExpWindowLayout,
-                  QStringLiteral("过暗帧比例阈值:"),
-                  autoExpDarkFrameRatioEdit,
-                  QStringLiteral("过暗帧占窗口决策样本的比例达到该值后触发增曝光。"));
+    autoExpWindowLayout->addRow(QStringLiteral("过暗帧比例阈值"), autoExpDarkFrameRatioEdit);
     autoExpBrightFrameRatioEdit = new QLineEdit(QStringLiteral("0.30"));
-    addToolTipRow(autoExpWindowLayout,
-                  QStringLiteral("过亮帧比例阈值:"),
-                  autoExpBrightFrameRatioEdit,
-                  QStringLiteral("过曝帧占有效峰值样本的比例达到该值后触发降曝光。"));
+    autoExpWindowLayout->addRow(QStringLiteral("过亮帧比例阈值"), autoExpBrightFrameRatioEdit);
     autoExpStableFrameRatioEdit = new QLineEdit(QStringLiteral("0.70"));
-    addToolTipRow(autoExpWindowLayout,
-                  QStringLiteral("稳定帧比例阈值:"),
-                  autoExpStableFrameRatioEdit,
-                  QStringLiteral("稳定帧占有效峰值样本的比例达到该值后认为曝光稳定。"));
+    autoExpWindowLayout->addRow(QStringLiteral("稳定帧比例阈值"), autoExpStableFrameRatioEdit);
     autoExpHardSaturationFrameRatioEdit = new QLineEdit(QStringLiteral("0.05"));
-    addToolTipRow(autoExpWindowLayout,
-                  QStringLiteral("硬饱和帧比例阈值:"),
-                  autoExpHardSaturationFrameRatioEdit,
-                  QStringLiteral("硬饱和帧占窗口决策样本的比例达到该值后优先强制降曝光。"));
+    autoExpWindowLayout->addRow(QStringLiteral("硬饱和帧比例阈值"), autoExpHardSaturationFrameRatioEdit);
 
     autoExpCameraAgreementRatioEdit = new QLineEdit(QStringLiteral("0.50"));
-    addToolTipRow(autoExpSyncLayout,
-                  QStringLiteral("双相机峰值差异上限:"),
-                  autoExpCameraAgreementRatioEdit,
-                  QStringLiteral("两台相机峰值差异超过该比例时，可能认为趋势冲突。"));
+    autoExpSyncLayout->addRow(QStringLiteral("双相机峰值差异上限"), autoExpCameraAgreementRatioEdit);
     autoExpTrendConflictPersistenceSecEdit = new QLineEdit(QStringLiteral("30"));
-    addToolTipRow(autoExpSyncLayout,
-                  QStringLiteral("趋势冲突持续时间 (s):"),
-                  autoExpTrendConflictPersistenceSecEdit,
-                  QStringLiteral("趋势冲突持续达到该时间后进入保护状态，暂停同步曝光调整。"));
+    autoExpSyncLayout->addRow(QStringLiteral("趋势冲突持续时间 (s):"), autoExpTrendConflictPersistenceSecEdit);
 
     autoExpDarkSnrWarningEdit = new QLineEdit(QStringLiteral("8.0"));
-    addToolTipRow(autoExpDarkWeakLayout,
-                  QStringLiteral("偏暗 SNR 报警:"),
-                  autoExpDarkSnrWarningEdit,
-                  QStringLiteral("SNR 低于该值时提示偏暗风险。"));
+    autoExpDarkWeakLayout->addRow(QStringLiteral("偏暗 SNR 报警:"), autoExpDarkSnrWarningEdit);
     autoExpDarkSnrCriticalEdit = new QLineEdit(QStringLiteral("5.0"));
-    addToolTipRow(autoExpDarkWeakLayout,
-                  QStringLiteral("严重偏暗 SNR:"),
-                  autoExpDarkSnrCriticalEdit,
-                  QStringLiteral("SNR 低于该值时认为偏暗更严重；必须小于偏暗 SNR 报警。"));
+    autoExpDarkWeakLayout->addRow(QStringLiteral("严重偏暗 SNR:"), autoExpDarkSnrCriticalEdit);
     autoExpMinValidCentroidRatioEdit = new QLineEdit(QStringLiteral("0.50"));
-    addToolTipRow(autoExpDarkWeakLayout,
-                  QStringLiteral("最小有效质心比例:"),
-                  autoExpMinValidCentroidRatioEdit,
-                  QStringLiteral("有效质心比例低于该值时，说明当前窗口内跟踪质量偏差。"));
+    autoExpDarkWeakLayout->addRow(QStringLiteral("最小有效质心比例"), autoExpMinValidCentroidRatioEdit);
     autoExpStarLostValidRatioEdit = new QLineEdit(QStringLiteral("0.10"));
-    addToolTipRow(autoExpDarkWeakLayout,
-                  QStringLiteral("丢星有效质心比例:"),
-                  autoExpStarLostValidRatioEdit,
-                  QStringLiteral("有效质心比例低于该值时，更倾向判断为丢星或信号过弱。"));
+    autoExpDarkWeakLayout->addRow(QStringLiteral("丢星有效质心比例:"), autoExpStarLostValidRatioEdit);
 
     autoExpPeakSupportRadiusEdit = new QLineEdit(QStringLiteral("2"));
-    addToolTipRow(autoExpPeakSupportLayout,
-                  QStringLiteral("峰值支持半径 (px):"),
-                  autoExpPeakSupportRadiusEdit,
-                  QStringLiteral("检查候选峰值周围多大半径内是否存在足够支持像素。"));
+    autoExpPeakSupportLayout->addRow(QStringLiteral("峰值支持半径(px):"), autoExpPeakSupportRadiusEdit);
     autoExpPeakSupportFractionEdit = new QLineEdit(QStringLiteral("0.50"));
-    addToolTipRow(autoExpPeakSupportLayout,
-                  QStringLiteral("峰值支持比例:"),
-                  autoExpPeakSupportFractionEdit,
-                  QStringLiteral("支持像素需要达到候选峰值的一定比例，用来区分真实光斑和孤立亮点。"));
+    autoExpPeakSupportLayout->addRow(QStringLiteral("峰值支持比例"), autoExpPeakSupportFractionEdit);
     autoExpMinPeakSupportPixelsEdit = new QLineEdit(QStringLiteral("3"));
-    addToolTipRow(autoExpPeakSupportLayout,
-                  QStringLiteral("最小支持像素数:"),
-                  autoExpMinPeakSupportPixelsEdit,
-                  QStringLiteral("候选峰值邻域内至少需要多少个支持像素才认为峰值有效。"));
+    autoExpPeakSupportLayout->addRow(QStringLiteral("最小支持像素数:"), autoExpMinPeakSupportPixelsEdit);
     autoExpMinNeighborPeakRatioEdit = new QLineEdit(QStringLiteral("0.35"));
-    addToolTipRow(autoExpPeakSupportLayout,
-                  QStringLiteral("邻域峰值比例下限:"),
-                  autoExpMinNeighborPeakRatioEdit,
-                  QStringLiteral("邻域最强像素相对候选峰值的比例下限，用于过滤单点热像素。"));
+    autoExpPeakSupportLayout->addRow(QStringLiteral("邻域峰值比例下限"), autoExpMinNeighborPeakRatioEdit);
     autoExpMaxPeakCandidateCountEdit = new QLineEdit(QStringLiteral("8"));
-    addToolTipRow(autoExpPeakSupportLayout,
-                  QStringLiteral("最大峰值候选数:"),
-                  autoExpMaxPeakCandidateCountEdit,
-                  QStringLiteral("单帧最多检查多少个峰值候选，避免最高点异常时错过真实光斑。"));
+    autoExpPeakSupportLayout->addRow(QStringLiteral("最大峰值候选数:"), autoExpMaxPeakCandidateCountEdit);
     autoExpSupportedPeakPercentileEdit = new QLineEdit(QStringLiteral("0.95"));
-    addToolTipRow(autoExpPeakSupportLayout,
-                  QStringLiteral("支持区域峰值分位:"),
-                  autoExpSupportedPeakPercentileEdit,
-                  QStringLiteral("在支持区域内取该分位值作为 AE 峰值，降低单个异常亮点的影响。"));
+    autoExpPeakSupportLayout->addRow(QStringLiteral("支持区域峰值分位"), autoExpSupportedPeakPercentileEdit);
+    auto hideAutoExposureRow = [](QFormLayout* layout, QWidget* widget) {
+        if (!layout || !widget) {
+            return;
+        }
+        if (QWidget* label = layout->labelForField(widget)) {
+            label->hide();
+        }
+        widget->hide();
+    };
+    hideAutoExposureRow(autoExpCoreLayout, autoExpHardSaturationEdit);
+    hideAutoExposureRow(autoExpCoreLayout, autoExpSaturatedPixelCountEdit);
+    hideAutoExposureRow(autoExpWindowLayout, autoExpSampleIntervalMsEdit);
+    hideAutoExposureRow(autoExpWindowLayout, autoExpHardSaturationFrameRatioEdit);
+    hideAutoExposureRow(autoExpRangeLayout, autoExpMaxChangeUpEdit);
+    hideAutoExposureRow(autoExpRangeLayout, autoExpMaxChangeDownEdit);
+    hideAutoExposureRow(autoExpRangeLayout, autoExpMinExposureDeltaEdit);
+    hideAutoExposureRow(autoExpRangeLayout, autoExpMinExposureChangeRatioEdit);
+    if (autoExpPeakSupportLayout &&
+        autoExpPeakSupportLayout->parentWidget() &&
+        autoExpPeakSupportLayout->parentWidget()->parentWidget()) {
+        autoExpPeakSupportLayout->parentWidget()->parentWidget()->hide();
+    }
+
     auto updateAutoExposureAdjustmentTargets = [this]() {
         bool lowOk = false;
         bool highOk = false;
@@ -400,7 +513,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     envSensorEnableCheck->setChecked(true);
     envSensorLayout->addRow(envSensorEnableCheck);
     envSensorPortEdit = new QLineEdit(QStringLiteral("COM6"));
-    envSensorLayout->addRow(QStringLiteral("串口号:"), envSensorPortEdit);
+    envSensorLayout->addRow(QStringLiteral("串口:"), envSensorPortEdit);
     envSensorBaudCombo = new QComboBox();
     envSensorBaudCombo->addItems({QStringLiteral("9600"),
                                   QStringLiteral("19200"),
@@ -413,7 +526,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     envSensorLayout->addRow(QStringLiteral("设备地址:"), envSensorAddressEdit);
     envSensorPollIntervalEdit = new QLineEdit(QStringLiteral("1000"));
     envSensorLayout->addRow(QStringLiteral("轮询间隔 (ms):"), envSensorPollIntervalEdit);
-    auto* envSensorHint = new QLabel(QStringLiteral("说明: 修改串口后点击“应用”，环境温度、湿度、气压读取线程会使用新端口重新连接。"));
+    auto* envSensorHint = new QLabel(QStringLiteral("说明: 修改串口后点击“应用”，环境温度、湿度、气压读取线程会使用新端口重新连接"));
     envSensorHint->setWordWrap(true);
     envSensorLayout->addRow(QString(), envSensorHint);
     triggerTabLayout->addWidget(envSensorGroup);
@@ -427,7 +540,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     pulseEnableCheck = new QCheckBox(QStringLiteral("启用触发输出"));
     pulseLayout->addRow(pulseEnableCheck);
     pulsePortEdit = new QLineEdit(QStringLiteral("COM9"));
-    pulseLayout->addRow(QStringLiteral("端口号:"), pulsePortEdit);
+    pulseLayout->addRow(QStringLiteral("端口:"), pulsePortEdit);
     pulseBaudCombo = new QComboBox();
     pulseBaudCombo->addItems({QStringLiteral("9600"),
                               QStringLiteral("19200"),
@@ -466,7 +579,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     dutyLayout->setSpacing(10);
     dutyLayout->addWidget(pulseDutyEdit, 1);
     dutyLayout->addWidget(pulseApplyDutyBtn);
-    pulseLayout->addRow(QStringLiteral("占空比 (%):"), dutyRow);
+    pulseLayout->addRow(QStringLiteral("占空比(%):"), dutyRow);
 
     auto* sourceWidget = new QWidget();
     auto* sourceLayout = new QHBoxLayout(sourceWidget);
@@ -482,12 +595,21 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     sourceLayout->addStretch();
     pulseLayout->addRow(QStringLiteral("来源控制:"), sourceWidget);
 
-    auto* pulseHint = new QLabel(QStringLiteral("默认建议: 波特率 19200，终端号 1，占空比 50，来源控制选择远程。"));
+    auto* pulseHint = new QLabel(QStringLiteral("默认建议: 波特率:19200，终端号 1，占空比 50，来源控制选择远程"));
     pulseHint->setWordWrap(true);
     pulseLayout->addRow(QString(), pulseHint);
-    auto* pulseCommitHint = new QLabel(QStringLiteral("说明: 输出频率、脉冲个数、占空比、来源控制修改后，需点击对应按钮才算生效。"));
+    auto* pulseCommitHint = new QLabel(QStringLiteral("说明: 输出频率、脉冲个数、占空比、来源控制修改后，需点击对应按钮才算生效"));
     pulseCommitHint->setWordWrap(true);
     pulseLayout->addRow(QString(), pulseCommitHint);
+    auto* pulseApplyConfigRow = new QWidget();
+    auto* pulseApplyConfigLayout = new QHBoxLayout(pulseApplyConfigRow);
+    pulseApplyConfigLayout->setContentsMargins(0, 0, 0, 0);
+    pulseApplyConfigLayout->setSpacing(10);
+    pulseApplyConfigBtn = new QPushButton(QStringLiteral("下发触发器参数"));
+    pulseApplyConfigBtn->setProperty("role", "primary");
+    pulseApplyConfigLayout->addWidget(pulseApplyConfigBtn);
+    pulseApplyConfigLayout->addStretch();
+    pulseLayout->addRow(QStringLiteral("参数下发:"), pulseApplyConfigRow);
     auto* pulseActionRow = new QWidget();
     auto* pulseActionLayout = new QHBoxLayout(pulseActionRow);
     pulseActionLayout->setContentsMargins(0, 4, 0, 0);
@@ -516,52 +638,45 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     centroidLayout->setVerticalSpacing(10);
     centroidModeCombo = new QComboBox();
     centroidModeCombo->addItem(QStringLiteral("背景阈值重心"), 0);
-    centroidModeCombo->addItem(QStringLiteral("峰值小核"), 1);
-    centroidModeCombo->setToolTip(QStringLiteral(
-        "选择 ROI 质心处理路径。背景阈值重心保留旧流程；峰值小核只在光斑峰值周围计算质心。"));
+    centroidModeCombo->addItem(QStringLiteral("Otsu 连通域 + 小核质心"), 1);
     centroidLayout->addRow(QStringLiteral("质心处理模式:"), centroidModeCombo);
     procLayout->addWidget(centroidGroup);
 
     auto* preprocessGroup = new QGroupBox(QStringLiteral("背景阈值重心参数"));
     auto* preprocessLayout = new QGridLayout(preprocessGroup);
     auto* backgroundKernelLabel = new QLabel(QStringLiteral("背景核大小:"));
-    backgroundKernelLabel->setToolTip(QStringLiteral("旧模式左上角背景统计核边长，运行时会夹到有效奇数尺寸。"));
     preprocessLayout->addWidget(backgroundKernelLabel, 0, 0);
     procKernelSize = new QLineEdit(QStringLiteral("5"));
-    procKernelSize->setToolTip(QStringLiteral("旧模式左上角背景统计核边长，默认 5。"));
     preprocessLayout->addWidget(procKernelSize, 0, 1);
     auto* backgroundSigmaLabel = new QLabel(QStringLiteral("背景标准差倍数:"));
-    backgroundSigmaLabel->setToolTip(QStringLiteral("旧模式动态阈值使用 background + k*sigma，默认 4.0。"));
     preprocessLayout->addWidget(backgroundSigmaLabel, 1, 0);
     procSigma = new QLineEdit(QStringLiteral("4.0"));
-    procSigma->setToolTip(QStringLiteral("旧模式动态阈值的背景标准差倍数，必须不小于 0。"));
     preprocessLayout->addWidget(procSigma, 1, 1);
     auto* centroidPipelineHint =
-        new QLabel(QStringLiteral("ROI质心流程: 热像素修正 -> 左上角背景核估计 -> 阈值去噪 -> 背景扣除重心。"));
+        new QLabel(QStringLiteral("ROI质心流程: 热像素修正 -> Otsu/阈值分割 -> 连通域选星 -> 质心计算小核加权。"));
     centroidPipelineHint->setWordWrap(true);
     preprocessLayout->addWidget(centroidPipelineHint, 2, 0, 1, 2);
     procLayout->addWidget(preprocessGroup);
 
-    auto* peakKernelGroup = new QGroupBox(QStringLiteral("峰值小核参数"));
+    auto* atmosphereGroup = new QGroupBox(QStringLiteral("大气参数"));
+    auto* atmosphereLayout = new QFormLayout(atmosphereGroup);
+    atmosphereLayout->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    atmosphereLayout->setFormAlignment(Qt::AlignTop);
+    atmosphereLayout->setHorizontalSpacing(16);
+    atmosphereLayout->setVerticalSpacing(10);
+    r0HistoryWindowFramesEdit = new QLineEdit(QStringLiteral("5000"));
+    atmosphereLayout->addRow(QStringLiteral("r0 计算窗口（帧）:"), r0HistoryWindowFramesEdit);
+    procLayout->addWidget(atmosphereGroup);
+
+    auto* peakKernelGroup = new QGroupBox(QStringLiteral("质心计算小核参数"));
     auto* peakKernelLayout = new QFormLayout(peakKernelGroup);
     peakKernelLayout->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     peakKernelLayout->setFormAlignment(Qt::AlignTop);
     peakKernelLayout->setHorizontalSpacing(16);
     peakKernelLayout->setVerticalSpacing(10);
-    peakKernelMethodCombo = new QComboBox();
-    peakKernelMethodCombo->addItem(QStringLiteral("光强重心"), 0);
-    peakKernelMethodCombo->addItem(QStringLiteral("高斯拟合峰值"), 1);
-    peakKernelMethodCombo->setCurrentIndex(1);
-    peakKernelMethodCombo->setToolTip(QStringLiteral(
-        "光强重心直接使用小核内扣模板后的像素强度；高斯拟合峰值忽略强固定热像素并拟合峰值坐标。"));
     peakKernelRadiusEdit = new QLineEdit(QStringLiteral("3"));
-    peakKernelRadiusEdit->setToolTip(QStringLiteral(
-        "以 AE 峰值坐标为中心的小核半径，默认 3，实际核大小为 (2r+1)x(2r+1)。"));
     strongHotPixelExcessEdit = new QLineEdit(QStringLiteral("100"));
-    strongHotPixelExcessEdit->setToolTip(QStringLiteral(
-        "只有固定热像素模板中 excess 严格大于该 DN 的点位参与小核强坏点判断。"));
-    peakKernelLayout->addRow(QStringLiteral("小核算法:"), peakKernelMethodCombo);
-    peakKernelLayout->addRow(QStringLiteral("小核半径(px):"), peakKernelRadiusEdit);
+    peakKernelLayout->addRow(QStringLiteral("质心计算小核半径(px):"), peakKernelRadiusEdit);
     peakKernelLayout->addRow(QStringLiteral("强固定热像素阈值(DN):"), strongHotPixelExcessEdit);
     procLayout->addWidget(peakKernelGroup);
 
@@ -591,7 +706,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     roiRecenterMinimumShiftEdit = new QLineEdit(QStringLiteral("8.0"));
     roiRecenterLayout->addRow(QStringLiteral("最小位移(px):"), roiRecenterMinimumShiftEdit);
     auto* roiRecenterHint = new QLabel(QStringLiteral(
-        "这些参数只控制运行中 ROI 重新居中；星点靠边或丢失时仍会进入全画幅重定位。"));
+        "这些参数只控制运行中 ROI 重新居中；星点靠边或丢失时仍会进入全画幅重定位"));
     roiRecenterHint->setWordWrap(true);
     roiRecenterLayout->addRow(QString(), roiRecenterHint);
     procLayout->addWidget(roiRecenterGroup);
@@ -603,21 +718,23 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     starDetectionLayout->setFormAlignment(Qt::AlignTop);
     starDetectionLayout->setHorizontalSpacing(16);
     starDetectionLayout->setVerticalSpacing(10);
-    starThresholdAbsoluteEdit =
-        new QLineEdit(QString::number(starConfig.thresholdAbsolute, 'f', 1));
-    starDetectionLayout->addRow(QStringLiteral("绝对阈值 (-1 自动):"), starThresholdAbsoluteEdit);
     starSigmaThresholdEdit = new QLineEdit(QString::number(starConfig.sigmaThreshold, 'f', 2));
     starDetectionLayout->addRow(QStringLiteral("背景倍数 σ:"), starSigmaThresholdEdit);
     starPeakFractionEdit = new QLineEdit(QString::number(starConfig.peakFraction, 'f', 2));
-    starDetectionLayout->addRow(QStringLiteral("峰值比例:"), starPeakFractionEdit);
-    starMinimumIntensityEdit = new QLineEdit(QString::number(starConfig.minimumIntensity, 'f', 1));
-    starDetectionLayout->addRow(QStringLiteral("最低亮度:"), starMinimumIntensityEdit);
+    starDetectionLayout->addRow(QStringLiteral("峰值比例"), starPeakFractionEdit);
     starMinAreaEdit = new QLineEdit(QString::number(starConfig.minArea));
-    starDetectionLayout->addRow(QStringLiteral("最小面积:"), starMinAreaEdit);
+    starDetectionLayout->addRow(QStringLiteral("最小面积"), starMinAreaEdit);
     starMaxAreaEdit = new QLineEdit(QString::number(starConfig.maxArea));
-    starDetectionLayout->addRow(QStringLiteral("最大面积:"), starMaxAreaEdit);
+    starDetectionLayout->addRow(QStringLiteral("最大面积"), starMaxAreaEdit);
+    starConnectivityCombo = new QComboBox();
+    starConnectivityCombo->addItem(QStringLiteral("4 连通"), ConnectedDomain::kFourConnectivity);
+    starConnectivityCombo->addItem(QStringLiteral("8 连通"), ConnectedDomain::kEightConnectivity);
+    const int connectivityIndex =
+        starConnectivityCombo->findData(starConfig.connectivity);
+    starConnectivityCombo->setCurrentIndex(connectivityIndex >= 0 ? connectivityIndex : 1);
+    starDetectionLayout->addRow(QStringLiteral("连通域模式"), starConnectivityCombo);
     auto* starDetectionHint = new QLabel(QStringLiteral(
-        "这些参数只影响全画幅候选框/首次定位/重定位，不改变 ROI 内高频质心算法。"));
+        "阈值/面积参数只影响全画幅找星；连通域模式同时用于全画幅、ROI 和星图检测"));
     starDetectionHint->setWordWrap(true);
     starDetectionLayout->addRow(QString(), starDetectionHint);
     procLayout->addWidget(starDetectionGroup);
@@ -661,7 +778,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     hotPixelLayout->addRow(QStringLiteral("模板宽度:"), hotPixelTemplateWidthEdit);
     hotPixelTemplateHeightEdit = new QLineEdit(QStringLiteral("0"));
     hotPixelLayout->addRow(QStringLiteral("模板高度:"), hotPixelTemplateHeightEdit);
-    auto* hotPixelHint = new QLabel(QStringLiteral("启用后需提供两台相机的 mask/excess 模板和完整模板尺寸；未启用时会清空当前热像素修正。"));
+    auto* hotPixelHint = new QLabel(QStringLiteral("启用后需提供两台相机的 mask/excess 模板和完整模板尺寸；未启用时会清空当前热像素修正"));
     hotPixelHint->setWordWrap(true);
     hotPixelLayout->addRow(QString(), hotPixelHint);
     procLayout->addWidget(hotPixelGroup);
@@ -691,7 +808,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     opticsLayout->addWidget(opticsZenith, 4, 1);
     sysLayout->addWidget(opticsGroup);
 
-    auto* detectorGroup = new QGroupBox(QStringLiteral("探测器"));
+    auto* detectorGroup = new QGroupBox(QStringLiteral("探测"));
     auto* detectorLayout = new QGridLayout(detectorGroup);
     detectorLayout->addWidget(new QLabel(QStringLiteral("像素尺寸 (μm):")), 0, 0);
     detectorPixelSize = new QLineEdit(QStringLiteral("2.5"));
@@ -713,7 +830,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     alignmentAutoSolveCheck = new QCheckBox(QStringLiteral("启用北极星自动识别"));
     alignmentAutoSolveCheck->setChecked(true);
     alignmentLayout->addRow(alignmentAutoSolveCheck);
-    alignmentShowMatchedCatalogStarsCheck = new QCheckBox(QStringLiteral("显示星表匹配星"));
+    alignmentShowMatchedCatalogStarsCheck = new QCheckBox(QStringLiteral("显示星表匹配"));
     alignmentShowMatchedCatalogStarsCheck->setChecked(true);
     alignmentLayout->addRow(alignmentShowMatchedCatalogStarsCheck);
     alignmentFocalLengthEdit = new QLineEdit(QStringLiteral("269"));
@@ -722,7 +839,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     alignmentLayout->addRow(QStringLiteral("像元尺寸 (μm):"), alignmentPixelSizeEdit);
     alignmentPolarDistanceEdit =
         new QLineEdit(QString::number(kAlignmentDefaultPolarisPolarDistanceArcmin, 'f', 1));
-    alignmentLayout->addRow(QStringLiteral("北极星极距 (arcmin):"), alignmentPolarDistanceEdit);
+    alignmentLayout->addRow(QStringLiteral("北极星极距(arcmin):"), alignmentPolarDistanceEdit);
     alignmentRadiusAdjustEdit = new QLineEdit(QStringLiteral("0"));
     alignmentLayout->addRow(QStringLiteral("轨道半径微调 (px):"), alignmentRadiusAdjustEdit);
     alignmentPreviewRateEdit = new QLineEdit(QStringLiteral("1.0"));
@@ -736,14 +853,14 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     alignmentRetryIntervalEdit = new QLineEdit(QStringLiteral("3.0"));
     alignmentLayout->addRow(QStringLiteral("自动重试间隔 (s):"), alignmentRetryIntervalEdit);
     alignmentMinSpatialSpreadEdit = new QLineEdit(QStringLiteral("50.0"));
-    alignmentLayout->addRow(QStringLiteral("最小空间跨度 (px):"), alignmentMinSpatialSpreadEdit);
+    alignmentLayout->addRow(QStringLiteral("最小空间跨度(px):"), alignmentMinSpatialSpreadEdit);
     alignmentMinPolarisSnrEdit = new QLineEdit(QStringLiteral("5.0"));
     alignmentLayout->addRow(QStringLiteral("北极星最小 SNR:"), alignmentMinPolarisSnrEdit);
     alignmentAllowSaturatedPolarisCheck = new QCheckBox(QStringLiteral("允许饱和北极星自动确认"));
     alignmentAllowSaturatedPolarisCheck->setChecked(false);
     alignmentLayout->addRow(alignmentAllowSaturatedPolarisCheck);
     auto* alignmentHint = new QLabel(QStringLiteral(
-        "对准模式只用于低频全画幅寻星，不启用 ROI、不计算大气参数、不保存测量数据。"));
+        "对准模式只用于低频全画幅寻星，不启用 ROI、不计算大气参数、不保存测量数据"));
     alignmentHint->setWordWrap(true);
     alignmentLayout->addRow(QString(), alignmentHint);
     sysLayout->addWidget(alignmentGroup);
@@ -772,18 +889,14 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     auto* paramGroup = new QGroupBox(QStringLiteral("参数存储"));
     auto* paramLayout = new QVBoxLayout(paramGroup);
     auto* intervalLayout = new QHBoxLayout();
-    intervalLayout->addWidget(new QLabel(QStringLiteral("参数记录间隔 (次):")));
+    intervalLayout->addWidget(new QLabel(QStringLiteral("参数记录间隔 (s):")));
     saveIntervalEdit = new QLineEdit(QStringLiteral("1"));
     intervalLayout->addWidget(saveIntervalEdit);
     parameterValidationCheck = new QCheckBox(QStringLiteral("参数验证模式"));
     parameterValidationCheck->setChecked(false);
     syncDiagnosticLogCheck = new QCheckBox(QStringLiteral("保存同步诊断日志"));
     syncDiagnosticLogCheck->setChecked(false);
-    syncDiagnosticLogCheck->setToolTip(
-        QStringLiteral("开启后随结果文件保存 capture/submit/unpaired_drop 事件，用于定位硬件触发双目配对丢帧。"));
-    parameterValidationCheck->setToolTip(
-        QStringLiteral("开启后额外保存每秒双相机配对质心明细，用于核对方差和参数计算"));
-    auto* paramInfo = new QLabel(QStringLiteral("仅保存计算后的质心、ROI 和大气参数，不保存全画幅或 ROI 图像。"));
+    auto* paramInfo = new QLabel(QStringLiteral("仅保存计算后的质心、ROI 和大气参数，不保存全画幅/ROI 图像"));
     paramInfo->setWordWrap(true);
     paramLayout->addLayout(intervalLayout);
     paramLayout->addWidget(parameterValidationCheck);
@@ -816,31 +929,28 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     autoAcquisitionForm->addRow(autoAcquisitionEnableCheck);
 
     autoAcquisitionLatitudeEdit = new QLineEdit(QStringLiteral("0.000000"));
-    autoAcquisitionLatitudeEdit->setToolTip(QStringLiteral("观测地点纬度，北纬为正，范围 -90 到 90。"));
     autoAcquisitionForm->addRow(QStringLiteral("纬度 (deg):"), autoAcquisitionLatitudeEdit);
 
     autoAcquisitionLongitudeEdit = new QLineEdit(QStringLiteral("0.000000"));
-    autoAcquisitionLongitudeEdit->setToolTip(QStringLiteral("观测地点经度，东经为正，范围 -180 到 180。"));
     autoAcquisitionForm->addRow(QStringLiteral("经度 (deg):"), autoAcquisitionLongitudeEdit);
 
     autoAcquisitionStartOffsetEdit = new QLineEdit(QStringLiteral("30"));
-    autoAcquisitionStartOffsetEdit->setToolTip(QStringLiteral("当地日落后等待多少分钟再自动开始采集。"));
-    autoAcquisitionForm->addRow(QStringLiteral("日落后启动 (min):"), autoAcquisitionStartOffsetEdit);
+    autoAcquisitionForm->addRow(QStringLiteral("日落后启动(min):"), autoAcquisitionStartOffsetEdit);
 
     autoAcquisitionStopOffsetEdit = new QLineEdit(QStringLiteral("30"));
-    autoAcquisitionStopOffsetEdit->setToolTip(QStringLiteral("当地日出前提前多少分钟自动停止采集。"));
-    autoAcquisitionForm->addRow(QStringLiteral("日出前停止 (min):"), autoAcquisitionStopOffsetEdit);
+    autoAcquisitionForm->addRow(QStringLiteral("日出前停止(min):"), autoAcquisitionStopOffsetEdit);
+
+    autoAcquisitionRecoveryScanIntervalEdit = new QLineEdit(QStringLiteral("20"));
+    autoAcquisitionForm->addRow(QStringLiteral("丢星/无星扫描间隔(min):"),
+                                autoAcquisitionRecoveryScanIntervalEdit);
 
     autoAcquisitionTestOverrideCheck = new QCheckBox(QStringLiteral("启用测试时间"));
-    autoAcquisitionTestOverrideCheck->setToolTip(QStringLiteral("启用后使用下面的固定时间窗口，方便实验室测试。"));
     autoAcquisitionForm->addRow(autoAcquisitionTestOverrideCheck);
 
     autoAcquisitionTestStartEdit = new QLineEdit(QStringLiteral("18:30"));
-    autoAcquisitionTestStartEdit->setToolTip(QStringLiteral("测试开始时间，格式 HH:mm。"));
     autoAcquisitionForm->addRow(QStringLiteral("测试开始:"), autoAcquisitionTestStartEdit);
 
     autoAcquisitionTestStopEdit = new QLineEdit(QStringLiteral("06:00"));
-    autoAcquisitionTestStopEdit->setToolTip(QStringLiteral("测试停止时间，格式 HH:mm。"));
     autoAcquisitionForm->addRow(QStringLiteral("测试停止:"), autoAcquisitionTestStopEdit);
 
     autoAcquisitionNextStartLabel = new QLabel(QStringLiteral("下次开始: 应用后计算"));
@@ -862,7 +972,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     auto* connGroup = new QGroupBox(QStringLiteral("上位机连接"));
     auto* connLayout = new QGridLayout(connGroup);
     connLayout->addWidget(new QLabel(QStringLiteral("IP地址:")), 0, 0);
-    netIpEdit = new QLineEdit(QStringLiteral("192.168.10.1"));
+    netIpEdit = new QLineEdit(QStringLiteral("169.254.100.2"));
     connLayout->addWidget(netIpEdit, 0, 1);
     connLayout->addWidget(new QLabel(QStringLiteral("端口:")), 1, 0);
     netPortEdit = new QLineEdit(QStringLiteral("5000"));
@@ -877,13 +987,16 @@ SettingsDialog::SettingsDialog(QWidget* parent)
 
     auto* protoGroup = new QGroupBox(QStringLiteral("通信协议"));
     auto* protoLayout = new QVBoxLayout(protoGroup);
-    auto* protoInfo = new QLabel(QStringLiteral(
-        "协议: TCP 二进制\n"
-        "帧头: 0xAA55\n"
-        "校验: XOR\n\n"
-        "指令:\n"
-        "  上位机→设备: 0x01 开始上报 / 0x02 停止 / 0x03 查询状态\n"
-        "  设备→上位机: 0x81 测量结果 / 0x82 设备状态 / 0x83 应答"));
+    auto* protoInfo = new QLabel();
+    protoInfo->setText(QStringLiteral(
+        "TCP monitoring frame\n"
+        "SOF: 49 96 02 D2\n"
+        "EOF: B6 69 FD 2E\n"
+        "MSG_TYPE: 0x07\n"
+        "LEN: 85 bytes, total frame: 93 bytes\n"
+        "CRC: CRC-32/ISO-HDLC\n"
+        "DATA: temperature, humidity, pressure, r0, seeing, theta0, tau0, "
+        "cameraA/cameraB peak brightness, cameraA/cameraB exposure, frame rate, status"));
     protoInfo->setWordWrap(true);
     protoLayout->addWidget(protoInfo);
     netLayout->addWidget(protoGroup);
@@ -923,13 +1036,13 @@ SettingsDialog::SettingsDialog(QWidget* parent)
         bool ok = false;
         const double value = pulseFreqEdit->text().toDouble(&ok);
         if (!ok || value <= 0.0) {
-            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("输出频率必须大于 0。"));
+            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("输出频率必须大于 0"));
             updateApplyStatus(QStringLiteral("输出频率未提交"), UiStatusLevel::Error);
             return;
         }
         m_committedPulseFrequencyHz = value;
         if (applyCommittedPulseSettings(true)) {
-            updateApplyStatus(QStringLiteral("输出频率已设为当前值"), UiStatusLevel::Success);
+            updateApplyStatus(QStringLiteral("输出频率已设为当前"), UiStatusLevel::Success);
         }
     });
 
@@ -937,13 +1050,13 @@ SettingsDialog::SettingsDialog(QWidget* parent)
         bool ok = false;
         const quint32 value = pulseCountEdit->text().toUInt(&ok);
         if (!ok || value == 0U) {
-            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("脉冲个数必须大于 0。"));
+            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("脉冲个数必须大于 0"));
             updateApplyStatus(QStringLiteral("脉冲个数未提交"), UiStatusLevel::Error);
             return;
         }
         m_committedPulseCount = value;
         if (applyCommittedPulseSettings(true)) {
-            updateApplyStatus(QStringLiteral("脉冲个数已设为当前值"), UiStatusLevel::Success);
+            updateApplyStatus(QStringLiteral("脉冲个数已设为当前"), UiStatusLevel::Success);
         }
     });
 
@@ -951,20 +1064,97 @@ SettingsDialog::SettingsDialog(QWidget* parent)
         bool ok = false;
         const double value = pulseDutyEdit->text().toDouble(&ok);
         if (!ok || value < 0.0 || value > 100.0) {
-            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("占空比必须在 0 到 100 之间。"));
+            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("占空比必须在 0 到 100 之间"));
             updateApplyStatus(QStringLiteral("占空比未提交"), UiStatusLevel::Error);
             return;
         }
         m_committedPulseDutyPercent = value;
         if (applyCommittedPulseSettings(true)) {
-            updateApplyStatus(QStringLiteral("占空比已设为当前值"), UiStatusLevel::Success);
+            updateApplyStatus(QStringLiteral("占空比已设为当前"), UiStatusLevel::Success);
         }
     });
 
     connect(pulseApplySourceBtn, &QPushButton::clicked, this, [this]() {
-        m_committedPulseRemoteControl = pulseSourceRemote->isChecked();
+        if (!pulseSourceRemote || !pulseSourceLocal || !pulsePortEdit || !pulseBaudCombo || !pulseTerminalEdit) {
+            return;
+        }
+
+        const bool requestedRemoteControl = pulseSourceRemote->isChecked();
+        bool ok = false;
+        const int pulseBaudRate = pulseBaudCombo->currentText().toInt(&ok);
+        if (!ok || pulseBaudRate <= 0) {
+            updateApplyStatus(QStringLiteral("触发器波特率无效"), UiStatusLevel::Error);
+            pulseSourceRemote->setChecked(m_committedPulseRemoteControl);
+            pulseSourceLocal->setChecked(!m_committedPulseRemoteControl);
+            return;
+        }
+        const int pulseTerminalId = pulseTerminalEdit->text().toInt(&ok);
+        if (!ok || pulseTerminalId < 1 || pulseTerminalId > 255) {
+            updateApplyStatus(QStringLiteral("触发器终端号必须在 1 到 255 之间"), UiStatusLevel::Error);
+            pulseSourceRemote->setChecked(m_committedPulseRemoteControl);
+            pulseSourceLocal->setChecked(!m_committedPulseRemoteControl);
+            return;
+        }
+        const QString portName = pulsePortEdit->text().trimmed();
+        if (portName.isEmpty()) {
+            updateApplyStatus(QStringLiteral("切换控制源前请填写触发器端口"), UiStatusLevel::Error);
+            pulseSourceRemote->setChecked(m_committedPulseRemoteControl);
+            pulseSourceLocal->setChecked(!m_committedPulseRemoteControl);
+            return;
+        }
+
+        QString errorMessage;
+        const bool success = !onSetPulseControlSource ||
+                             onSetPulseControlSource(portName,
+                                                     pulseBaudRate,
+                                                     pulseTerminalId,
+                                                     requestedRemoteControl,
+                                                     &errorMessage);
+        if (!success) {
+            pulseSourceRemote->setChecked(m_committedPulseRemoteControl);
+            pulseSourceLocal->setChecked(!m_committedPulseRemoteControl);
+            updateApplyStatus(errorMessage.isEmpty() ? QStringLiteral("触发器控制源切换失败") : errorMessage,
+                              UiStatusLevel::Error);
+            return;
+        }
+
+        m_committedPulseRemoteControl = requestedRemoteControl;
+        if (!errorMessage.isEmpty()) {
+            updateApplyStatus(errorMessage, UiStatusLevel::Warning);
+        } else {
+            updateApplyStatus(QStringLiteral("触发器控制源已切换"), UiStatusLevel::Success);
+        }
+    });
+
+    connect(pulseApplyConfigBtn, &QPushButton::clicked, this, [this]() {
+        bool ok = false;
+        const double frequencyHz = pulseFreqEdit->text().toDouble(&ok);
+        if (!ok || frequencyHz <= 0.0) {
+            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("输出频率必须大于 0"));
+            updateApplyStatus(QStringLiteral("触发器参数下发失败：频率无效"), UiStatusLevel::Error);
+            return;
+        }
+
+        const quint32 pulseCount = pulseCountEdit->text().toUInt(&ok);
+        if (!ok || pulseCount == 0U) {
+            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("脉冲个数必须大于 0"));
+            updateApplyStatus(QStringLiteral("触发器参数下发失败：脉冲个数无效"), UiStatusLevel::Error);
+            return;
+        }
+
+        const double dutyPercent = pulseDutyEdit->text().toDouble(&ok);
+        if (!ok || dutyPercent <= 0.0 || dutyPercent >= 100.0) {
+            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("占空比必须在 0 到 100 之间"));
+            updateApplyStatus(QStringLiteral("触发器参数下发失败：占空比无效"), UiStatusLevel::Error);
+            return;
+        }
+
+        m_committedPulseFrequencyHz = frequencyHz;
+        m_committedPulseCount = pulseCount;
+        m_committedPulseDutyPercent = dutyPercent;
+        m_committedPulseRemoteControl = pulseSourceRemote && pulseSourceRemote->isChecked();
         if (applyCommittedPulseSettings(true)) {
-            updateApplyStatus(QStringLiteral("来源控制已设为当前值"), UiStatusLevel::Success);
+            updateApplyStatus(QStringLiteral("触发器参数已下发"), UiStatusLevel::Success);
         }
     });
 
@@ -972,13 +1162,13 @@ SettingsDialog::SettingsDialog(QWidget* parent)
         if (!pulseEnableCheck || !pulseEnableCheck->isChecked()) {
             QMessageBox::warning(this,
                                  QStringLiteral("触发设置"),
-                                 QStringLiteral("请先勾选“启用触发输出”，再启动脉冲。"));
+                                 QStringLiteral("请先勾选“启用触发输出”，再启动脉冲"));
             updateApplyStatus(QStringLiteral("输出脉冲失败：未启用触发输出"), UiStatusLevel::Error);
             return;
         }
 
         if (!pulsePortEdit || pulsePortEdit->text().trimmed().isEmpty()) {
-            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("启动脉冲前请填写端口号。"));
+            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("启动脉冲前请填写端口号"));
             updateApplyStatus(QStringLiteral("输出脉冲失败：串口为空"), UiStatusLevel::Error);
             return;
         }
@@ -986,35 +1176,35 @@ SettingsDialog::SettingsDialog(QWidget* parent)
         bool ok = false;
         const int pulseBaudRate = pulseBaudCombo->currentText().toInt(&ok);
         if (!ok || pulseBaudRate <= 0) {
-            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("波特率无效。"));
+            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("波特率无效"));
             updateApplyStatus(QStringLiteral("输出脉冲失败：波特率无效"), UiStatusLevel::Error);
             return;
         }
 
         const int pulseTerminalId = pulseTerminalEdit->text().toInt(&ok);
         if (!ok || pulseTerminalId < 1 || pulseTerminalId > 255) {
-            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("终端号必须在 1 到 255 之间。"));
+            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("终端号必须在 1 到 255 之间"));
             updateApplyStatus(QStringLiteral("输出脉冲失败：终端号无效"), UiStatusLevel::Error);
             return;
         }
 
         m_committedPulseFrequencyHz = pulseFreqEdit->text().toDouble(&ok);
         if (!ok || m_committedPulseFrequencyHz <= 0.0) {
-            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("输出频率必须大于 0。"));
+            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("输出频率必须大于 0"));
             updateApplyStatus(QStringLiteral("输出脉冲失败：频率无效"), UiStatusLevel::Error);
             return;
         }
 
         m_committedPulseCount = pulseCountEdit->text().toUInt(&ok);
         if (!ok || m_committedPulseCount == 0U) {
-            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("脉冲个数必须大于 0。"));
+            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("脉冲个数必须大于 0"));
             updateApplyStatus(QStringLiteral("输出脉冲失败：脉冲个数无效"), UiStatusLevel::Error);
             return;
         }
 
         m_committedPulseDutyPercent = pulseDutyEdit->text().toDouble(&ok);
         if (!ok || m_committedPulseDutyPercent < 0.0 || m_committedPulseDutyPercent > 100.0) {
-            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("占空比必须在 0 到 100 之间。"));
+            QMessageBox::warning(this, QStringLiteral("触发设置"), QStringLiteral("占空比必须在 0 到 100 之间"));
             updateApplyStatus(QStringLiteral("输出脉冲失败：占空比无效"), UiStatusLevel::Error);
             return;
         }
@@ -1062,13 +1252,13 @@ SettingsDialog::SettingsDialog(QWidget* parent)
         bool ok = false;
         const quint16 port = netPortEdit->text().toUShort(&ok);
         if (!ok || port == 0) {
-            QMessageBox::warning(this, QStringLiteral("网络设置"), QStringLiteral("端口必须在 1 到 65535 之间。"));
+            QMessageBox::warning(this, QStringLiteral("网络设置"), QStringLiteral("端口必须在 1 到 65535 之间"));
             updateApplyStatus(QStringLiteral("网络连接失败：端口无效"), UiStatusLevel::Error);
             return;
         }
         const QString ip = netIpEdit->text().trimmed();
         if (ip.isEmpty()) {
-            QMessageBox::warning(this, QStringLiteral("网络设置"), QStringLiteral("IP地址不能为空。"));
+            QMessageBox::warning(this, QStringLiteral("网络设置"), QStringLiteral("IP地址不能为空"));
             updateApplyStatus(QStringLiteral("网络连接失败：IP地址为空"), UiStatusLevel::Error);
             return;
         }
@@ -1131,6 +1321,16 @@ void SettingsDialog::setPulseGeneratorState(bool enabled,
     m_committedPulseCount = pulseCount;
     m_committedPulseDutyPercent = dutyPercent;
     m_committedPulseRemoteControl = remoteControl;
+}
+
+void SettingsDialog::setCommittedConfig(const AppConfig& config)
+{
+    m_committedConfig = config;
+    m_hasCommittedConfig = true;
+    m_committedPulseFrequencyHz = config.pulseGenerator.frequencyHz;
+    m_committedPulseCount = config.pulseGenerator.pulseCount;
+    m_committedPulseDutyPercent = config.pulseGenerator.dutyPercent;
+    m_committedPulseRemoteControl = config.pulseGenerator.remoteControl;
 }
 
 void SettingsDialog::updateApplyStatus(const QString& text, const QString& color)
@@ -1199,20 +1399,20 @@ bool SettingsDialog::applySettings()
     bool ok = false;
     const double exposure = exposureEdit->text().toDouble(&ok);
     if (!ok || exposure <= 0.0) {
-        showInvalid(QStringLiteral("曝光时间必须大于 0。"));
+        showInvalid(QStringLiteral("曝光时间必须大于 0"));
         return false;
     }
 
     const double gain = gainEdit->text().toDouble(&ok);
     if (!ok || gain < 0.0) {
-        showInvalid(QStringLiteral("增益必须大于或等于 0。"));
+        showInvalid(QStringLiteral("增益必须大于或等于 0"));
         return false;
     }
 
     const double continuousFrameRate =
         continuousFrameRateEdit ? continuousFrameRateEdit->text().toDouble(&ok) : 200.0;
     if (!ok || continuousFrameRate < 0.1 || continuousFrameRate > 1000.0) {
-        showInvalid(QStringLiteral("连续采集帧率必须在 0.1 到 1000 fps 之间。"));
+        showInvalid(QStringLiteral("连续采集帧率必须在 0.1 到 1000 fps 之间"));
         return false;
     }
 
@@ -1225,7 +1425,7 @@ bool SettingsDialog::applySettings()
         bool fieldOk = false;
         const double parsed = edit ? edit->text().toDouble(&fieldOk) : 0.0;
         if (!fieldOk || !std::isfinite(parsed)) {
-            showInvalid(QStringLiteral("%1 必须是有效数字。").arg(name));
+            showInvalid(QStringLiteral("%1 必须是有效数字").arg(name));
             return false;
         }
         *value = parsed;
@@ -1235,29 +1435,30 @@ bool SettingsDialog::applySettings()
         bool fieldOk = false;
         const int parsed = edit ? edit->text().toInt(&fieldOk) : 0;
         if (!fieldOk) {
-            showInvalid(QStringLiteral("%1 必须是有效整数。").arg(name));
+            showInvalid(QStringLiteral("%1 必须是有效整数").arg(name));
             return false;
         }
         *value = parsed;
         return true;
     };
 
-    if (!readDoubleField(autoExpTargetPeakLowEdit, QStringLiteral("过暗触发阈值"), &autoExposureConfig.targetPeakLowDn) ||
-        !readDoubleField(autoExpTargetPeakHighEdit, QStringLiteral("过曝触发阈值"), &autoExposureConfig.targetPeakHighDn) ||
+    if (!readDoubleField(autoExpTargetPeakLowEdit, QStringLiteral("过暗触发阈"), &autoExposureConfig.targetPeakLowDn) ||
+        !readDoubleField(autoExpTargetPeakHighEdit, QStringLiteral("过曝触发阈"), &autoExposureConfig.targetPeakHighDn) ||
         !readDoubleField(autoExpExposureHysteresisEdit, QStringLiteral("曝光滞回"), &autoExposureConfig.exposureHysteresisDn) ||
-        !readDoubleField(autoExpHardSaturationEdit, QStringLiteral("硬饱和阈值"), &autoExposureConfig.hardSaturationDn) ||
+        !readDoubleField(autoExpHardSaturationEdit, QStringLiteral("硬饱和阈"), &autoExposureConfig.hardSaturationDn) ||
         !readIntField(autoExpSaturatedPixelCountEdit, QStringLiteral("硬饱和像素数"), &autoExposureConfig.saturatedPixelCount) ||
         !readDoubleField(autoExpDarkSnrWarningEdit, QStringLiteral("偏暗 SNR 报警"), &autoExposureConfig.darkSnrWarning) ||
         !readDoubleField(autoExpDarkSnrCriticalEdit, QStringLiteral("严重偏暗 SNR"), &autoExposureConfig.darkSnrCritical) ||
-        !readDoubleField(autoExpMinValidCentroidRatioEdit, QStringLiteral("最小有效质心比例"), &autoExposureConfig.minValidCentroidRatio) ||
+        !readDoubleField(autoExpMinValidCentroidRatioEdit, QStringLiteral("最小有效质心比"), &autoExposureConfig.minValidCentroidRatio) ||
         !readDoubleField(autoExpStarLostValidRatioEdit, QStringLiteral("丢星有效质心比例"), &autoExposureConfig.starLostValidRatio) ||
-        !readDoubleField(autoExpBrightFrameRatioEdit, QStringLiteral("过亮帧比例阈值"), &autoExposureConfig.brightFrameRatioThreshold) ||
-        !readDoubleField(autoExpDarkFrameRatioEdit, QStringLiteral("过暗帧比例阈值"), &autoExposureConfig.darkFrameRatioThreshold) ||
-        !readDoubleField(autoExpStableFrameRatioEdit, QStringLiteral("稳定帧比例阈值"), &autoExposureConfig.stableFrameRatioThreshold) ||
+        !readDoubleField(autoExpBrightFrameRatioEdit, QStringLiteral("过亮帧比例阈"), &autoExposureConfig.brightFrameRatioThreshold) ||
+        !readDoubleField(autoExpDarkFrameRatioEdit, QStringLiteral("过暗帧比例阈"), &autoExposureConfig.darkFrameRatioThreshold) ||
+        !readDoubleField(autoExpStableFrameRatioEdit, QStringLiteral("稳定帧比例阈"), &autoExposureConfig.stableFrameRatioThreshold) ||
         !readDoubleField(autoExpHardSaturationFrameRatioEdit, QStringLiteral("硬饱和帧比例阈值"), &autoExposureConfig.hardSaturationFrameRatioThreshold) ||
-        !readIntField(autoExpSampleWindowSecEdit, QStringLiteral("统计窗口"), &autoExposureConfig.sampleWindowSec) ||
-        !readIntField(autoExpSampleIntervalMsEdit, QStringLiteral("采样间隔"), &autoExposureConfig.autoExposureSampleIntervalMs) ||
         !readIntField(autoExpMinDecisionSampleCountEdit, QStringLiteral("最小决策样本数"), &autoExposureConfig.minDecisionSampleCount) ||
+        !readDoubleField(autoExpStepUsEdit, QStringLiteral("单步曝光调整"), &autoExposureConfig.autoExposureStepUs) ||
+        !readDoubleField(autoExpInitialExposureUsEdit, QStringLiteral("启动默认曝光"), &autoExposureConfig.initialExposureUs) ||
+        !readIntField(autoExpDecisionCooldownMinEdit, QStringLiteral("稳定后冷却"), &autoExposureConfig.autoExposureDecisionCooldownMin) ||
         !readIntField(autoExpTrendConflictPersistenceSecEdit, QStringLiteral("趋势冲突持续时间"), &autoExposureConfig.trendConflictPersistenceSec) ||
         !readDoubleField(autoExpMinEdit, QStringLiteral("最小曝光"), &autoExposureConfig.minExposureUs) ||
         !readDoubleField(autoExpMaxEdit, QStringLiteral("最大曝光"), &autoExposureConfig.maxExposureUs) ||
@@ -1265,46 +1466,48 @@ bool SettingsDialog::applySettings()
         !readDoubleField(autoExpMaxChangeDownEdit, QStringLiteral("单次调暗比例下限"), &autoExposureConfig.maxExposureChangeRatioDown) ||
         !readDoubleField(autoExpCameraAgreementRatioEdit, QStringLiteral("双相机峰值差异上限"), &autoExposureConfig.cameraAgreementRatio) ||
         !readIntField(autoExpPeakSupportRadiusEdit, QStringLiteral("峰值支持半径"), &autoExposureConfig.peakSupportRadiusPx) ||
-        !readDoubleField(autoExpPeakSupportFractionEdit, QStringLiteral("峰值支持比例"), &autoExposureConfig.peakSupportFraction) ||
+        !readDoubleField(autoExpPeakSupportFractionEdit, QStringLiteral("峰值支持比"), &autoExposureConfig.peakSupportFraction) ||
         !readIntField(autoExpMinPeakSupportPixelsEdit, QStringLiteral("最小支持像素数"), &autoExposureConfig.minPeakSupportPixelCount) ||
         !readDoubleField(autoExpMinNeighborPeakRatioEdit, QStringLiteral("邻域峰值比例下限"), &autoExposureConfig.minNeighborPeakRatio) ||
         !readIntField(autoExpMaxPeakCandidateCountEdit, QStringLiteral("最大峰值候选数"), &autoExposureConfig.maxPeakCandidateCount) ||
         !readDoubleField(autoExpSupportedPeakPercentileEdit, QStringLiteral("支持区域峰值分位"), &autoExposureConfig.supportedPeakPercentile) ||
         !readIntField(autoExpExposureSettleMsEdit, QStringLiteral("曝光稳定等待"), &autoExposureConfig.exposureSettleMs) ||
         !readDoubleField(autoExpMinExposureDeltaEdit, QStringLiteral("最小曝光变化"), &autoExposureConfig.minExposureDeltaUs) ||
-        !readDoubleField(autoExpMinExposureChangeRatioEdit, QStringLiteral("最小曝光变化比例"), &autoExposureConfig.minExposureChangeRatio)) {
+        !readDoubleField(autoExpMinExposureChangeRatioEdit, QStringLiteral("最小曝光变化比"), &autoExposureConfig.minExposureChangeRatio)) {
         return false;
     }
+    autoExposureConfig.sampleWindowSec = 1;
+    autoExposureConfig.autoExposureSampleIntervalMs = 0;
 
     if (!(0.0 <= autoExposureConfig.targetPeakLowDn &&
           autoExposureConfig.targetPeakLowDn < autoExposureConfig.targetPeakHighDn &&
           autoExposureConfig.targetPeakHighDn <= autoExposureConfig.hardSaturationDn &&
           autoExposureConfig.hardSaturationDn <= 4095.0)) {
-        showInvalid(QStringLiteral("自动曝光 DN 阈值必须满足 0 <= 过暗触发阈值 < 过曝触发阈值 <= 硬饱和阈值 <= 4095。"));
+        showInvalid(QStringLiteral("自动曝光 DN 阈值必须满足0 <= 过暗触发阈值 < 过曝触发阈值 <= 硬饱和阈值 <= 4095"));
         return false;
     }
     if (autoExposureConfig.exposureHysteresisDn < 0.0) {
-        showInvalid(QStringLiteral("曝光滞回必须大于或等于 0。"));
+        showInvalid(QStringLiteral("曝光滞回必须大于或等于 0"));
         return false;
     }
     if (!(autoExposureConfig.targetPeakLowDn + autoExposureConfig.exposureHysteresisDn <
           autoExposureConfig.targetPeakHighDn - autoExposureConfig.exposureHysteresisDn)) {
-        showInvalid(QStringLiteral("自动曝光滞回过大，必须满足 过暗触发阈值 + 曝光滞回 < 过曝触发阈值 - 曝光滞回。"));
+        showInvalid(QStringLiteral("自动曝光滞回过大，必须满足过暗触发阈值 + 曝光滞回 < 过曝触发阈值 - 曝光滞回"));
         return false;
     }
     if (autoExposureConfig.saturatedPixelCount < 1) {
-        showInvalid(QStringLiteral("硬饱和像素数必须大于或等于 1。"));
+        showInvalid(QStringLiteral("硬饱和像素数必须大于或等于 1"));
         return false;
     }
     if (!(autoExposureConfig.darkSnrCritical > 0.0 &&
           autoExposureConfig.darkSnrWarning > autoExposureConfig.darkSnrCritical)) {
-        showInvalid(QStringLiteral("偏暗 SNR 报警必须大于严重偏暗 SNR，且严重偏暗 SNR 必须大于 0。"));
+        showInvalid(QStringLiteral("偏暗 SNR 报警必须大于严重偏暗 SNR，且严重偏暗 SNR 必须大于 0"));
         return false;
     }
     if (!(0.0 <= autoExposureConfig.starLostValidRatio &&
           autoExposureConfig.starLostValidRatio <= autoExposureConfig.minValidCentroidRatio &&
           autoExposureConfig.minValidCentroidRatio <= 1.0)) {
-        showInvalid(QStringLiteral("有效质心比例必须满足 0 <= 丢星比例 <= 最小有效比例 <= 1。"));
+        showInvalid(QStringLiteral("有效质心比例必须满足 0 <= 丢星比例 <= 最小有效比例<= 1"));
         return false;
     }
     if (autoExposureConfig.brightFrameRatioThreshold < 0.0 ||
@@ -1315,25 +1518,24 @@ bool SettingsDialog::applySettings()
         autoExposureConfig.stableFrameRatioThreshold > 1.0 ||
         autoExposureConfig.hardSaturationFrameRatioThreshold < 0.0 ||
         autoExposureConfig.hardSaturationFrameRatioThreshold > 1.0) {
-        showInvalid(QStringLiteral("自动曝光帧比例阈值必须在 0 到 1 之间。"));
+        showInvalid(QStringLiteral("自动曝光帧比例阈值必须在 0 到 1 之间"));
         return false;
     }
-    if (autoExposureConfig.sampleWindowSec < 1 ||
-        autoExposureConfig.autoExposureSampleIntervalMs < 200 ||
-        autoExposureConfig.autoExposureSampleIntervalMs > 10000 ||
-        autoExposureConfig.minDecisionSampleCount < 1 ||
-        autoExposureConfig.trendConflictPersistenceSec < 1) {
-        showInvalid(QStringLiteral("自动曝光时间窗口、采样间隔和持续时间不满足约束。"));
-        return false;
-    }
-    if ((autoExposureConfig.sampleWindowSec * 1000) / autoExposureConfig.autoExposureSampleIntervalMs <
-        autoExposureConfig.minDecisionSampleCount) {
-        showInvalid(QStringLiteral("统计窗口内可获得的样本数必须大于或等于最小决策样本数。"));
+    if (autoExposureConfig.minDecisionSampleCount < 1 ||
+        autoExposureConfig.trendConflictPersistenceSec < 1 ||
+        autoExposureConfig.autoExposureDecisionCooldownMin < 0) {
+        showInvalid(QStringLiteral("自动曝光样本数、冷却时间和趋势持续时间不满足约束。"));
         return false;
     }
     if (autoExposureConfig.minExposureUs <= 0.0 ||
         autoExposureConfig.maxExposureUs < autoExposureConfig.minExposureUs) {
-        showInvalid(QStringLiteral("自动曝光范围必须满足最小曝光 > 0 且最大曝光 >= 最小曝光。"));
+        showInvalid(QStringLiteral("自动曝光范围必须满足最小曝光 > 0 且最大曝光 >= 最小曝光"));
+        return false;
+    }
+    if (autoExposureConfig.autoExposureStepUs <= 0.0 ||
+        autoExposureConfig.initialExposureUs < autoExposureConfig.minExposureUs ||
+        autoExposureConfig.initialExposureUs > autoExposureConfig.maxExposureUs) {
+        showInvalid(QString::fromUtf8("\xe8\x87\xaa\xe5\x8a\xa8\xe6\x9b\x9d\xe5\x85\x89\xe5\x8d\x95\xe6\xad\xa5\xe8\xb0\x83\xe6\x95\xb4\xe5\xbf\x85\xe9\xa1\xbb\xe5\xa4\xa7\xe4\xba\x8e\x20\x30\xef\xbc\x8c\xe5\x90\xaf\xe5\x8a\xa8\xe9\xbb\x98\xe8\xae\xa4\xe6\x9b\x9d\xe5\x85\x89\xe5\xbf\x85\xe9\xa1\xbb\xe4\xbd\x8d\xe4\xba\x8e\xe6\x9b\x9d\xe5\x85\x89\xe8\x8c\x83\xe5\x9b\xb4\xe5\x86\x85\xe3\x80\x82"));
         return false;
     }
     if (autoExposureConfig.maxExposureChangeRatioUp < 1.0 ||
@@ -1352,7 +1554,7 @@ bool SettingsDialog::applySettings()
         autoExposureConfig.exposureSettleMs < 0 ||
         autoExposureConfig.minExposureDeltaUs < 0.0 ||
         autoExposureConfig.minExposureChangeRatio < 0.0) {
-        showInvalid(QStringLiteral("自动曝光调整限制参数不满足约束。"));
+        showInvalid(QStringLiteral("自动曝光调整限制参数不满足约束"));
         return false;
     }
     autoExposureConfig.lowThreshold = autoExposureConfig.targetPeakLowDn;
@@ -1362,95 +1564,95 @@ bool SettingsDialog::applySettings()
 
     const int kernelSize = procKernelSize->text().toInt(&ok);
     if (!ok || kernelSize <= 0) {
-        showInvalid(QStringLiteral("背景核大小必须为正整数。"));
+        showInvalid(QStringLiteral("背景核大小必须为正整数"));
         return false;
     }
 
     const double sigma = procSigma->text().toDouble(&ok);
     if (!ok || sigma < 0.0) {
-        showInvalid(QStringLiteral("背景标准差倍数必须不小于 0。"));
+        showInvalid(QStringLiteral("背景标准差倍数必须不小于 0"));
         return false;
     }
 
     const int centroidMode = centroidModeCombo ? centroidModeCombo->currentData().toInt() : 0;
-    const int peakKernelMethod = peakKernelMethodCombo ? peakKernelMethodCombo->currentData().toInt() : 1;
-    if (centroidMode < 0 || centroidMode > 1 || peakKernelMethod < 0 || peakKernelMethod > 1) {
-        showInvalid(QStringLiteral("质心模式参数无效，请重新选择。"));
+    if (centroidMode < 0 || centroidMode > 1) {
+        showInvalid(QStringLiteral("质心模式参数无效，请重新选择"));
         return false;
     }
 
     const int peakKernelRadius = peakKernelRadiusEdit ? peakKernelRadiusEdit->text().toInt(&ok) : 3;
     if (!ok || peakKernelRadius < 1 || peakKernelRadius > 20) {
-        showInvalid(QStringLiteral("小核半径必须在 1 到 20 像素之间。"));
+        showInvalid(QStringLiteral("小核半径必须在 1 到 20 像素之间"));
         return false;
     }
 
     const double strongHotPixelExcess =
         strongHotPixelExcessEdit ? strongHotPixelExcessEdit->text().toDouble(&ok) : 100.0;
     if (!ok || strongHotPixelExcess <= 0.0 || strongHotPixelExcess > 4095.0) {
-        showInvalid(QStringLiteral("强固定热像素阈值必须大于 0 且不超过 4095 DN。"));
+        showInvalid(QStringLiteral("强固定热像素阈值必须大于 0 且不超过 4095 DN"));
+        return false;
+    }
+    const int r0HistoryWindowFrames =
+        r0HistoryWindowFramesEdit ? r0HistoryWindowFramesEdit->text().toInt(&ok) : 5000;
+    if (!ok || r0HistoryWindowFrames < 50 || r0HistoryWindowFrames > 60000) {
+        showInvalid(QStringLiteral("r0 计算窗口必须在 50 到 60000 帧之间"));
         return false;
     }
 
     const double roiRecenterThreshold = roiRecenterThresholdEdit->text().toDouble(&ok);
     if (!ok || roiRecenterThreshold < 1.0 || roiRecenterThreshold > 31.0) {
-        showInvalid(QStringLiteral("ROI 距边缘重居中阈值必须在 1 到 31 px 之间。"));
+        showInvalid(QStringLiteral("ROI 距边缘重居中阈值必须在 1 到 31 px 之间"));
         return false;
     }
 
     const int roiRecenterRequiredFrames = roiRecenterRequiredFramesEdit->text().toInt(&ok);
     if (!ok || roiRecenterRequiredFrames < 1 || roiRecenterRequiredFrames > 100) {
-        showInvalid(QStringLiteral("ROI 重居中连续帧数必须在 1 到 100 之间。"));
+        showInvalid(QStringLiteral("ROI 重居中连续帧数必须在 1 到 100 之间"));
         return false;
     }
 
     const int roiRecenterCooldownMs = roiRecenterCooldownMsEdit->text().toInt(&ok);
     if (!ok || roiRecenterCooldownMs < 0 || roiRecenterCooldownMs > 60000) {
-        showInvalid(QStringLiteral("ROI 重居中冷却时间必须在 0 到 60000 ms 之间。"));
+        showInvalid(QStringLiteral("ROI 重居中冷却时间必须在 0 到 60000 ms 之间"));
         return false;
     }
 
     const double roiRecenterMinimumShift = roiRecenterMinimumShiftEdit->text().toDouble(&ok);
     if (!ok || roiRecenterMinimumShift < 0.0 || roiRecenterMinimumShift > 31.0) {
-        showInvalid(QStringLiteral("ROI 重居中最小位移必须在 0 到 31 px 之间。"));
+        showInvalid(QStringLiteral("ROI 重居中最小位移必须在 0 到 31 px 之间"));
         return false;
     }
-
-    const double starThresholdAbsolute = starThresholdAbsoluteEdit->text().toDouble(&ok);
-    if (!ok ||
-        !(qFuzzyCompare(starThresholdAbsolute, -1.0) ||
-          (starThresholdAbsolute >= 0.0 && starThresholdAbsolute <= 4095.0))) {
-        showInvalid(QStringLiteral("全画幅找星绝对阈值必须为 -1 或 0 到 4095 之间的数值。"));
-        return false;
-    }
-
     const double starSigmaThreshold = starSigmaThresholdEdit->text().toDouble(&ok);
     if (!ok || starSigmaThreshold < 0.0 || starSigmaThreshold > 20.0) {
-        showInvalid(QStringLiteral("全画幅找星背景倍数必须在 0 到 20 之间。"));
+        showInvalid(QStringLiteral("全画幅找星背景倍数必须在 0 到 20 之间"));
         return false;
     }
 
     const double starPeakFraction = starPeakFractionEdit->text().toDouble(&ok);
     if (!ok || starPeakFraction < 0.01 || starPeakFraction > 0.95) {
-        showInvalid(QStringLiteral("全画幅找星峰值比例必须在 0.01 到 0.95 之间。"));
+        showInvalid(QStringLiteral("全画幅找星峰值比例必须在 0.01 到 0.95 之间"));
         return false;
     }
-
-    const double starMinimumIntensity = starMinimumIntensityEdit->text().toDouble(&ok);
-    if (!ok || starMinimumIntensity < 0.0 || starMinimumIntensity > 4095.0) {
-        showInvalid(QStringLiteral("全画幅找星最低亮度必须在 0 到 4095 之间。"));
-        return false;
-    }
-
     const int starMinArea = starMinAreaEdit->text().toInt(&ok);
     if (!ok || starMinArea < 1 || starMinArea > 100000) {
-        showInvalid(QStringLiteral("全画幅找星最小面积必须为正整数。"));
+        showInvalid(QStringLiteral("全画幅找星最小面积必须为正整数"));
         return false;
     }
 
     const int starMaxArea = starMaxAreaEdit->text().toInt(&ok);
     if (!ok || starMaxArea < starMinArea || starMaxArea > 100000) {
-        showInvalid(QStringLiteral("全画幅找星最大面积必须大于或等于最小面积。"));
+        showInvalid(QStringLiteral("全画幅找星最大面积必须大于或等于最小面积"));
+        return false;
+    }
+
+    bool starConnectivityOk = true;
+    const int starConnectivity = starConnectivityCombo
+                                     ? starConnectivityCombo->currentData().toInt(&starConnectivityOk)
+                                     : ConnectedDomain::kDefaultConnectivity;
+    if (!starConnectivityOk ||
+        (starConnectivity != ConnectedDomain::kFourConnectivity &&
+         starConnectivity != ConnectedDomain::kEightConnectivity)) {
+        showInvalid(QStringLiteral("连通域模式只能选择 4 连通或 8 连通"));
         return false;
     }
 
@@ -1462,13 +1664,13 @@ bool SettingsDialog::applySettings()
     const int hotTemplateWidth =
         hotPixelTemplateWidthEdit ? hotPixelTemplateWidthEdit->text().toInt(&ok) : 0;
     if (hotPixelEnabled && (!ok || hotTemplateWidth <= 0)) {
-        showInvalid(QStringLiteral("启用热像素修正时，模板宽度必须为正整数。"));
+        showInvalid(QStringLiteral("启用热像素修正时，模板宽度必须为正整数"));
         return false;
     }
     const int hotTemplateHeight =
         hotPixelTemplateHeightEdit ? hotPixelTemplateHeightEdit->text().toInt(&ok) : 0;
     if (hotPixelEnabled && (!ok || hotTemplateHeight <= 0)) {
-        showInvalid(QStringLiteral("启用热像素修正时，模板高度必须为正整数。"));
+        showInvalid(QStringLiteral("启用热像素修正时，模板高度必须为正整数"));
         return false;
     }
     if (hotPixelEnabled) {
@@ -1481,7 +1683,7 @@ bool SettingsDialog::applySettings()
         };
         for (int i = 0; i < hotPixelFiles.size(); ++i) {
             if (hotPixelFiles[i].isEmpty()) {
-                showInvalid(QStringLiteral("%1 文件不能为空。").arg(hotPixelNames[i]));
+                showInvalid(QStringLiteral("%1 文件不能为空").arg(hotPixelNames[i]));
                 return false;
             }
             const QString resolvedHotPixelFile = PathUtils::resolvePathFromAppDir(hotPixelFiles[i]);
@@ -1494,57 +1696,57 @@ bool SettingsDialog::applySettings()
 
     const double diameter = opticsD->text().toDouble(&ok);
     if (!ok || diameter <= 0.0) {
-        showInvalid(QStringLiteral("口径 D 必须大于 0。"));
+        showInvalid(QStringLiteral("口径 D 必须大于 0"));
         return false;
     }
 
     const double baseline = opticsBaseline->text().toDouble(&ok);
     if (!ok || baseline <= diameter) {
-        showInvalid(QStringLiteral("中心间距 d 必须大于子孔径直径 D。"));
+        showInvalid(QStringLiteral("中心间距 d 必须大于子孔径直径 D"));
         return false;
     }
 
     const double baselineAngle = opticsBaselineAngle->text().toDouble(&ok);
     if (!ok || !std::isfinite(baselineAngle) || baselineAngle < -360.0 || baselineAngle > 360.0) {
-        showInvalid(QStringLiteral("基线方向角必须在 -360 到 360 度之间。"));
+        showInvalid(QStringLiteral("基线方向角必须在 -360 到 360 度之间"));
         return false;
     }
 
     const double focal = opticsF->text().toDouble(&ok);
     if (!ok || focal <= 0.0) {
-        showInvalid(QStringLiteral("焦距 f 必须大于 0。"));
+        showInvalid(QStringLiteral("焦距 f 必须大于 0"));
         return false;
     }
 
     const double zenithAngle = opticsZenith->text().toDouble(&ok);
     if (!ok || zenithAngle < 0.0 || zenithAngle >= 90.0) {
-        showInvalid(QStringLiteral("天顶角 Z 必须在 0 到 90 度之间。"));
+        showInvalid(QStringLiteral("天顶角 Z 必须在 0 到 90 度之间"));
         return false;
     }
 
     const double wavelength = detectorWavelength->text().toDouble(&ok);
     if (!ok || wavelength <= 0.0) {
-        showInvalid(QStringLiteral("对比波长必须大于 0。"));
+        showInvalid(QStringLiteral("对比波长必须大于 0"));
         return false;
     }
 
     const double pixelSize = detectorPixelSize->text().toDouble(&ok);
     if (!ok || pixelSize <= 0.0) {
-        showInvalid(QStringLiteral("像素尺寸必须大于 0。"));
+        showInvalid(QStringLiteral("像素尺寸必须大于 0"));
         return false;
     }
 
     const double alignmentFocalLength =
         alignmentFocalLengthEdit ? alignmentFocalLengthEdit->text().toDouble(&ok) : 269.0;
     if (!ok || alignmentFocalLength <= 0.0) {
-        showInvalid(QStringLiteral("对准焦距必须大于 0。"));
+        showInvalid(QStringLiteral("对准焦距必须大于 0"));
         return false;
     }
 
     const double alignmentPixelSize =
         alignmentPixelSizeEdit ? alignmentPixelSizeEdit->text().toDouble(&ok) : 2.5;
     if (!ok || alignmentPixelSize <= 0.0) {
-        showInvalid(QStringLiteral("对准像元尺寸必须大于 0。"));
+        showInvalid(QStringLiteral("对准像元尺寸必须大于 0"));
         return false;
     }
 
@@ -1552,85 +1754,85 @@ bool SettingsDialog::applySettings()
         alignmentPolarDistanceEdit ? alignmentPolarDistanceEdit->text().toDouble(&ok)
                                    : kAlignmentDefaultPolarisPolarDistanceArcmin;
     if (!ok || alignmentPolarDistance <= 0.0) {
-        showInvalid(QStringLiteral("北极星极距必须大于 0。"));
+        showInvalid(QStringLiteral("北极星极距必须大于 0"));
         return false;
     }
 
     const double alignmentRadiusAdjust =
         alignmentRadiusAdjustEdit ? alignmentRadiusAdjustEdit->text().toDouble(&ok) : 0.0;
     if (!ok) {
-        showInvalid(QStringLiteral("轨道半径微调必须是有效数字。"));
+        showInvalid(QStringLiteral("轨道半径微调必须是有效数字"));
         return false;
     }
 
     const double alignmentPreviewRate =
         alignmentPreviewRateEdit ? alignmentPreviewRateEdit->text().toDouble(&ok) : 1.0;
     if (!ok || alignmentPreviewRate <= 0.0 || alignmentPreviewRate > 10.0) {
-        showInvalid(QStringLiteral("对准预览频率必须在 0 到 10 Hz 之间。"));
+        showInvalid(QStringLiteral("对准预览频率必须在 0 到 10 Hz 之间"));
         return false;
     }
 
     const int alignmentMaxDetectedStars =
         alignmentMaxDetectedStarsEdit ? alignmentMaxDetectedStarsEdit->text().toInt(&ok) : 20;
     if (!ok || alignmentMaxDetectedStars < 6 || alignmentMaxDetectedStars > 40) {
-        showInvalid(QStringLiteral("最大参与匹配星数必须在 6 到 40 之间。"));
+        showInvalid(QStringLiteral("最大参与匹配星数必须在 6 到 40 之间"));
         return false;
     }
 
     const int alignmentMinMatchedStars =
         alignmentMinMatchedStarsEdit ? alignmentMinMatchedStarsEdit->text().toInt(&ok) : 5;
     if (!ok || alignmentMinMatchedStars < 4 || alignmentMinMatchedStars > alignmentMaxDetectedStars) {
-        showInvalid(QStringLiteral("最少匹配星数必须在 4 到最大参与匹配星数之间。"));
+        showInvalid(QStringLiteral("最少匹配星数必须在 4 到最大参与匹配星数之间"));
         return false;
     }
 
     const double alignmentMaxRms =
         alignmentMaxRmsEdit ? alignmentMaxRmsEdit->text().toDouble(&ok) : 3.0;
     if (!ok || alignmentMaxRms < 0.5 || alignmentMaxRms > 10.0) {
-        showInvalid(QStringLiteral("最大匹配 RMS 必须在 0.5 到 10 px 之间。"));
+        showInvalid(QStringLiteral("最大匹配 RMS 必须在 0.5 到 10 px 之间"));
         return false;
     }
 
     const double alignmentRetryIntervalSeconds =
         alignmentRetryIntervalEdit ? alignmentRetryIntervalEdit->text().toDouble(&ok) : 3.0;
     if (!ok || alignmentRetryIntervalSeconds < 1.0 || alignmentRetryIntervalSeconds > 30.0) {
-        showInvalid(QStringLiteral("自动重试间隔必须在 1 到 30 秒之间。"));
+        showInvalid(QStringLiteral("自动重试间隔必须在 1 到 30 秒之间"));
         return false;
     }
 
     const double alignmentMinSpatialSpread =
         alignmentMinSpatialSpreadEdit ? alignmentMinSpatialSpreadEdit->text().toDouble(&ok) : 50.0;
     if (!ok || alignmentMinSpatialSpread < 0.0 || alignmentMinSpatialSpread > 1000.0) {
-        showInvalid(QStringLiteral("最小空间跨度必须在 0 到 1000 px 之间。"));
+        showInvalid(QStringLiteral("最小空间跨度必须在 0 到 1000 px 之间"));
         return false;
     }
 
     const double alignmentMinPolarisSnr =
         alignmentMinPolarisSnrEdit ? alignmentMinPolarisSnrEdit->text().toDouble(&ok) : 5.0;
     if (!ok || alignmentMinPolarisSnr < 0.0 || alignmentMinPolarisSnr > 100.0) {
-        showInvalid(QStringLiteral("北极星最小 SNR 必须在 0 到 100 之间。"));
+        showInvalid(QStringLiteral("北极星最小 SNR 必须在 0 到 100 之间"));
         return false;
     }
 
     const int interval = saveIntervalEdit->text().toInt(&ok);
     if (!ok || interval <= 0) {
-        showInvalid(QStringLiteral("保存间隔必须为正整数。"));
+        showInvalid(QStringLiteral("保存间隔必须为正整数"));
         return false;
     }
 
     const quint16 port = netPortEdit->text().toUShort(&ok);
     if (!ok || port == 0) {
-        showInvalid(QStringLiteral("端口必须在 1 到 65535 之间。"));
+        showInvalid(QStringLiteral("端口必须在 1 到 65535 之间"));
         return false;
     }
 
     if (netIpEdit->text().trimmed().isEmpty()) {
-        showInvalid(QStringLiteral("IP地址不能为空。"));
+        showInvalid(QStringLiteral("IP地址不能为空"));
         return false;
     }
 
     if (storagePathEdit->text().trimmed().isEmpty()) {
-        showInvalid(QStringLiteral("存储路径不能为空。"));
+        showInvalid(QStringLiteral("存储路径不能为空"));
         return false;
     }
 
@@ -1638,24 +1840,24 @@ bool SettingsDialog::applySettings()
     environmentSensorConfig.enabled = envSensorEnableCheck && envSensorEnableCheck->isChecked();
     environmentSensorConfig.portName = envSensorPortEdit ? envSensorPortEdit->text().trimmed() : QString();
     if (environmentSensorConfig.enabled && environmentSensorConfig.portName.isEmpty()) {
-        showInvalid(QStringLiteral("温湿压传感器串口不能为空。"));
+        showInvalid(QStringLiteral("温湿压传感器串口不能为空"));
         return false;
     }
     environmentSensorConfig.baudRate = envSensorBaudCombo ? envSensorBaudCombo->currentText().toInt(&ok) : 9600;
     if (!ok || environmentSensorConfig.baudRate <= 0) {
-        showInvalid(QStringLiteral("温湿压传感器波特率无效。"));
+        showInvalid(QStringLiteral("温湿压传感器波特率无效"));
         return false;
     }
     environmentSensorConfig.deviceAddress =
         envSensorAddressEdit ? envSensorAddressEdit->text().toInt(&ok) : 1;
     if (!ok || environmentSensorConfig.deviceAddress < 1 || environmentSensorConfig.deviceAddress > 255) {
-        showInvalid(QStringLiteral("温湿压传感器设备地址必须在 1 到 255 之间。"));
+        showInvalid(QStringLiteral("温湿压传感器设备地址必须在 1 到 255 之间"));
         return false;
     }
     environmentSensorConfig.pollIntervalMs =
         envSensorPollIntervalEdit ? envSensorPollIntervalEdit->text().toInt(&ok) : 1000;
     if (!ok || environmentSensorConfig.pollIntervalMs < 200 || environmentSensorConfig.pollIntervalMs > 60000) {
-        showInvalid(QStringLiteral("温湿压传感器轮询间隔必须在 200 到 60000 ms 之间。"));
+        showInvalid(QStringLiteral("温湿压传感器轮询间隔必须在 200 到 60000 ms 之间"));
         return false;
     }
 
@@ -1667,14 +1869,14 @@ bool SettingsDialog::applySettings()
     autoAcquisitionConfig.latitudeDeg =
         autoAcquisitionLatitudeEdit ? autoAcquisitionLatitudeEdit->text().toDouble(&ok) : 0.0;
     if (!ok || autoAcquisitionConfig.latitudeDeg < -90.0 || autoAcquisitionConfig.latitudeDeg > 90.0) {
-        showInvalid(QStringLiteral("纬度必须在 -90 到 90 之间。"));
+        showInvalid(QStringLiteral("纬度必须在 -90 到 90 之间"));
         return false;
     }
 
     autoAcquisitionConfig.longitudeDeg =
         autoAcquisitionLongitudeEdit ? autoAcquisitionLongitudeEdit->text().toDouble(&ok) : 0.0;
     if (!ok || autoAcquisitionConfig.longitudeDeg < -180.0 || autoAcquisitionConfig.longitudeDeg > 180.0) {
-        showInvalid(QStringLiteral("经度必须在 -180 到 180 之间。"));
+        showInvalid(QStringLiteral("经度必须在 -180 到 180 之间"));
         return false;
     }
 
@@ -1682,7 +1884,7 @@ bool SettingsDialog::applySettings()
         autoAcquisitionStartOffsetEdit ? autoAcquisitionStartOffsetEdit->text().toInt(&ok) : 30;
     if (!ok || autoAcquisitionConfig.startOffsetMinutesAfterSunset < 0 ||
         autoAcquisitionConfig.startOffsetMinutesAfterSunset > 240) {
-        showInvalid(QStringLiteral("日落后启动偏移必须在 0 到 240 分钟之间。"));
+        showInvalid(QStringLiteral("日落后启动偏移必须在 0 到 240 分钟之间"));
         return false;
     }
 
@@ -1690,21 +1892,32 @@ bool SettingsDialog::applySettings()
         autoAcquisitionStopOffsetEdit ? autoAcquisitionStopOffsetEdit->text().toInt(&ok) : 30;
     if (!ok || autoAcquisitionConfig.stopOffsetMinutesBeforeSunrise < 0 ||
         autoAcquisitionConfig.stopOffsetMinutesBeforeSunrise > 240) {
-        showInvalid(QStringLiteral("日出前停止偏移必须在 0 到 240 分钟之间。"));
+        showInvalid(QStringLiteral("日出前停止偏移必须在 0 到 240 分钟之间"));
+        return false;
+    }
+
+    autoAcquisitionConfig.recoveryScanIntervalMinutes =
+        autoAcquisitionRecoveryScanIntervalEdit
+            ? autoAcquisitionRecoveryScanIntervalEdit->text().toInt(&ok)
+            : 20;
+    if (!ok ||
+        autoAcquisitionConfig.recoveryScanIntervalMinutes < 1 ||
+        autoAcquisitionConfig.recoveryScanIntervalMinutes > 120) {
+        showInvalid(QStringLiteral("丢星/无星扫描间隔必须在 1 到 120 分钟之间"));
         return false;
     }
 
     autoAcquisitionConfig.testStartTime =
         QTime::fromString(autoAcquisitionTestStartEdit->text().trimmed(), QStringLiteral("HH:mm"));
     if (!autoAcquisitionConfig.testStartTime.isValid()) {
-        showInvalid(QStringLiteral("测试开始时间格式必须为 HH:mm。"));
+        showInvalid(QStringLiteral("测试开始时间格式必须为 HH:mm"));
         return false;
     }
 
     autoAcquisitionConfig.testStopTime =
         QTime::fromString(autoAcquisitionTestStopEdit->text().trimmed(), QStringLiteral("HH:mm"));
     if (!autoAcquisitionConfig.testStopTime.isValid()) {
-        showInvalid(QStringLiteral("测试停止时间格式必须为 HH:mm。"));
+        showInvalid(QStringLiteral("测试停止时间格式必须为 HH:mm"));
         return false;
     }
 
@@ -1720,9 +1933,9 @@ bool SettingsDialog::applySettings()
         kernelSize,
         sigma,
         centroidMode,
-        peakKernelMethod,
         peakKernelRadius,
-        strongHotPixelExcess
+        strongHotPixelExcess,
+        r0HistoryWindowFrames
     };
     const RoiRecenteringConfig roiRecenteringConfig{
         roiRecenterThreshold,
@@ -1731,12 +1944,11 @@ bool SettingsDialog::applySettings()
         roiRecenterMinimumShift
     };
     const StarDetectionConfig starDetectionConfig{
-        starThresholdAbsolute,
         starSigmaThreshold,
         starPeakFraction,
-        starMinimumIntensity,
         starMinArea,
-        starMaxArea
+        starMaxArea,
+        starConnectivity
     };
     const HotPixelConfig hotPixelConfig{
         hotPixelEnabled,
@@ -1805,50 +2017,26 @@ bool SettingsDialog::applySettings()
     appConfig.autoAcquisition = autoAcquisitionConfig;
     appConfig.network = networkConfig;
 
-    ConfigApplicationCallbacks configCallbacks;
-    configCallbacks.applyCamera = onApplyCamera;
-    configCallbacks.applyAutoExposure = onApplyAutoExposure;
-    configCallbacks.applyTriggerMode = onApplyTriggerMode;
-    if (!triggerContinuous || !triggerHardware) {
-        configCallbacks.applyTriggerMode = nullptr;
-    }
-    configCallbacks.applyProcessing = onApplyProcessing;
-    if (!centroidModeCombo || !peakKernelMethodCombo || !procKernelSize || !procSigma ||
-        !peakKernelRadiusEdit || !strongHotPixelExcessEdit) {
-        configCallbacks.applyProcessing = nullptr;
-    }
-    configCallbacks.applyRoiRecentering = onApplyRoiRecentering;
-    configCallbacks.applyFullFrameStarDetection = onApplyFullFrameStarDetection;
-    configCallbacks.applyHotPixelTemplates = onApplyHotPixelTemplates;
-    configCallbacks.applyOptics = onApplyOptics;
-    configCallbacks.applyAlignment = onApplyAlignment;
-    configCallbacks.applyPolarisSolver = onApplyPolarisSolver;
-    configCallbacks.applyStorage = onApplyStorage;
-    configCallbacks.applyEnvironmentSensor = onApplyEnvironmentSensor;
-    configCallbacks.applyAutoAcquisition = onApplyAutoAcquisition;
-    configCallbacks.applyNetwork = onApplyNetwork;
-
-    ConfigApplicationController::applyPreValidationConfig(appConfig, configCallbacks);
     if (pulseEnableCheck->isChecked() && pulsePortEdit->text().trimmed().isEmpty()) {
-        showInvalid(QStringLiteral("启用脉冲板时，串口不能为空。"));
+        showInvalid(QStringLiteral("启用脉冲板时，串口不能为空"));
         return false;
     }
 
     const double pulseFrequency = pulseFreqEdit->text().toDouble(&ok);
     if (!ok || pulseFrequency <= 0.0) {
-        showInvalid(QStringLiteral("输出频率必须大于 0。"));
+        showInvalid(QStringLiteral("输出频率必须大于 0"));
         return false;
     }
 
     const quint32 pulseCount = pulseCountEdit->text().toUInt(&ok);
     if (!ok || pulseCount == 0U) {
-        showInvalid(QStringLiteral("脉冲个数必须为正整数。"));
+        showInvalid(QStringLiteral("脉冲个数必须为正整数"));
         return false;
     }
 
     const double pulseDuty = pulseDutyEdit->text().toDouble(&ok);
     if (!ok || pulseDuty <= 0.0 || pulseDuty >= 100.0) {
-        showInvalid(QStringLiteral("占空比必须在 0 到 100 之间。"));
+        showInvalid(QStringLiteral("占空比必须在 0 到 100 之间"));
         return false;
     }
 
@@ -1864,6 +2052,38 @@ bool SettingsDialog::applySettings()
     };
     appConfig.pulseGenerator = pulseGeneratorConfig;
 
+    ConfigChangeSet changes =
+        m_hasCommittedConfig ? changedSections(m_committedConfig, appConfig)
+                             : ConfigChangeSet::all();
+
+    ConfigApplicationCallbacks configCallbacks;
+    configCallbacks.applyCamera = onApplyCamera;
+    configCallbacks.applyAutoExposure = onApplyAutoExposure;
+    configCallbacks.applyTriggerMode = onApplyTriggerMode;
+    if (!triggerContinuous || !triggerHardware) {
+        configCallbacks.applyTriggerMode = nullptr;
+    }
+    configCallbacks.applyProcessing = onApplyProcessing;
+    if (!centroidModeCombo || !procKernelSize || !procSigma ||
+        !peakKernelRadiusEdit || !strongHotPixelExcessEdit ||
+        !r0HistoryWindowFramesEdit) {
+        configCallbacks.applyProcessing = nullptr;
+    }
+    configCallbacks.applyRoiRecentering = onApplyRoiRecentering;
+    configCallbacks.applyFullFrameStarDetection = onApplyFullFrameStarDetection;
+    configCallbacks.applyHotPixelTemplates = onApplyHotPixelTemplates;
+    configCallbacks.applyOptics = onApplyOptics;
+    configCallbacks.applyAlignment = onApplyAlignment;
+    configCallbacks.applyPolarisSolver = onApplyPolarisSolver;
+    configCallbacks.applyStorage = onApplyStorage;
+    configCallbacks.applyEnvironmentSensor = onApplyEnvironmentSensor;
+    configCallbacks.applyAutoAcquisition = onApplyAutoAcquisition;
+    configCallbacks.applyNetwork = onApplyNetwork;
+    configCallbacks =
+        ConfigApplicationController::callbacksForChanges(configCallbacks, changes);
+
+    ConfigApplicationController::applyPreValidationConfig(appConfig, configCallbacks);
+
     const AppConfigDraft configDraft{appConfig};
     const ConfigValidationResult validation =
         ConfigValidator::acceptValidatedConfig(configDraft);
@@ -1878,20 +2098,23 @@ bool SettingsDialog::applySettings()
     m_committedPulseDutyPercent = appConfig.pulseGenerator.dutyPercent;
     m_committedPulseRemoteControl = appConfig.pulseGenerator.remoteControl;
 
-    if (!applyCommittedPulseSettings(true)) {
+    if (changes.pulseGenerator &&
+        SettingsApplyPolicy::shouldSendPulseGeneratorHardwareFromMainApply(changes) &&
+        !applyCommittedPulseSettings(true)) {
         const QString pulseMessage =
             (applyStatusLabel && !applyStatusLabel->text().trimmed().isEmpty())
                 ? applyStatusLabel->text().trimmed()
-                : QStringLiteral("触发设置存在未完成提交或参数无效。");
+                : QStringLiteral("触发设置存在未完成提交或参数无效");
         QMessageBox::warning(this, QStringLiteral("参数错误"), pulseMessage);
         return false;
     }
     ConfigApplicationController::applyValidatedConfig(appConfig, configCallbacks);
-    if (onAfterApply) {
-        onAfterApply();
+    if (changes.any() && onAfterApply) {
+        onAfterApply(appConfig, changes);
     } else if (applyStatusLabel) {
         applyStatusLabel->setText(QStringLiteral("设置已应用到当前配置"));
         applyStatusLabel->setStyleSheet(statusLabelStyle(UiStatusLevel::Success));
     }
+    setCommittedConfig(appConfig);
     return true;
 }

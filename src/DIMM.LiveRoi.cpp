@@ -5,6 +5,7 @@
 #include "DimmRuntimeHelpers.h"
 #include "FullFrameStarDetector.h"
 #include "ImageProcessor.h"
+#include "LivePreviewPolicy.h"
 #include "PathUtils.h"
 #include "PolarisDetectionPipeline.h"
 #include "PulseGeneratorManager.h"
@@ -20,6 +21,39 @@
 using PolarisDetectionPipeline::InitialStarCandidate;
 using PolarisDetectionPipeline::InitialStarSelection;
 
+namespace {
+
+LivePreviewPolicy::StartupPhase livePreviewStartupPhase(DIMM::LiveStartupPhase phase)
+{
+    switch (phase) {
+    case DIMM::LiveStartupPhase::LocatePair:
+        return LivePreviewPolicy::StartupPhase::LocatePair;
+    case DIMM::LiveStartupPhase::Tracking:
+        return LivePreviewPolicy::StartupPhase::Tracking;
+    case DIMM::LiveStartupPhase::None:
+    default:
+        return LivePreviewPolicy::StartupPhase::None;
+    }
+}
+
+} // namespace
+
+QVector<InitialStarCandidate> DIMM::stabilizeInitialCandidates(
+    int cameraIndex,
+    const QVector<InitialStarCandidate>& candidates)
+{
+    if (!isValidCameraIndex(cameraIndex)) {
+        return candidates;
+    }
+    return m_stableCandidateTrackers[cameraIndex].update(candidates);
+}
+
+void DIMM::clearStableCandidateTrackers()
+{
+    for (int cameraIndex = 0; cameraIndex < kCameraCount; ++cameraIndex) {
+        m_stableCandidateTrackers[cameraIndex].clear();
+    }
+}
 
 bool DIMM::isCentroidNearCurrentRoiEdge(int cameraIndex, double x, double y) const
 {
@@ -109,8 +143,21 @@ void DIMM::requestLiveFullFrameRelocalization(const QString& reason)
     resetLiveFrameAcceptanceGates();
     QString switchReason;
     const bool fullFrameReady = applyLiveFullFrameForRelocalization(&switchReason);
-    // Keep lastTargetPosition across relocalization; it is the identity hint used to
-    // choose the nearest full-frame candidate instead of the brightest unrelated star.
+
+    if (!fullFrameReady &&
+        m_configTriggerMode != 0) {
+        const QString detail =
+            switchReason.isEmpty()
+                ? QStringLiteral(
+                      "切回全画幅重定位失败")
+                : switchReason;
+
+        handleHardwareTriggerStartupFailure(
+            detail);
+
+        return;
+    }
+
     for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
         runtime.hasValidCentroid[cameraIndex] = false;
         runtime.lostCentroidFrameCount[cameraIndex] = 0;
@@ -118,6 +165,8 @@ void DIMM::requestLiveFullFrameRelocalization(const QString& reason)
         runtime.initialRoiConfirmed[cameraIndex] = false;
         runtime.pendingInitialRoi[cameraIndex] = RoiRect();
         runtime.pendingInitialRoiReady[cameraIndex] = false;
+        runtime.lastTargetPosition[cameraIndex] = QPointF();
+        runtime.hasLastTargetPosition[cameraIndex] = false;
         runtime.lastLivePreviewUpdateMs[cameraIndex] = -1;
         runtime.liveRelocalizationPreviewFrame[cameraIndex].release();
     }
@@ -133,7 +182,7 @@ void DIMM::requestLiveFullFrameRelocalization(const QString& reason)
     if (ui->lblCam2ROICoord) {
         ui->lblCam2ROICoord->setText(QStringLiteral("(0.0, 0.0)"));
     }
-    ui->lblROITimeCurrent->setText(QStringLiteral("全画幅重定位。"));
+    ui->lblROITimeCurrent->setText(QStringLiteral("全画幅重定位"));
     ui->lblROITimeNext->setText(QStringLiteral("等待两路重新锁定 ROI"));
 
     m_liveHardwareRoiActive = false;
@@ -163,6 +212,15 @@ void DIMM::handleLiveRoiCentroidLoss(int cameraIndex)
 
     auto& runtime = activeRuntime();
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (isAutoExposureRoiRelocalizationGraceActive(nowMs)) {
+        if (cameraIndex >= 0 && cameraIndex < 2) {
+            runtime.lostCentroidFrameCount[cameraIndex] = 0;
+            runtime.lostCentroidSinceMs[cameraIndex] = -1;
+        }
+        setStatusMessage(QStringLiteral("自动曝光调整后等待 ROI 亮度稳定，暂缓全画幅重定位"),
+                         UiStatusLevel::Warning);
+        return;
+    }
     if (runtime.lostCentroidFrameCount[cameraIndex] == 0 ||
         runtime.lostCentroidSinceMs[cameraIndex] < 0) {
         runtime.lostCentroidSinceMs[cameraIndex] = nowMs;
@@ -172,6 +230,13 @@ void DIMM::handleLiveRoiCentroidLoss(int cameraIndex)
         return;
     }
 
+    if (m_imageProcessor) {
+        m_imageProcessor->finalizeActiveAtmosphereWindow(
+            QStringLiteral("相机%1星点丢失，未达到完整 r0 计算窗口").arg(cameraIndex + 1));
+    }
+    if (m_liveStartupOrigin == LiveStartupOrigin::AutoAcquisition) {
+        m_autoAcquisitionRecovery.noteStarLost(nowMs);
+    }
     requestLiveFullFrameRelocalization(
         QStringLiteral("状态: 相机%1星点离开 ROI，已切回全画幅重新定位")
             .arg(cameraIndex + 1));
@@ -268,21 +333,9 @@ void DIMM::applyRoiSummary(const RoiRect& roi, const QString& cameraLabel)
                                 .arg(roi.h));
 }
 
-void DIMM::recordLiveRoiUpdate(const RoiRect rois[2], const QString& reason)
-{
-    Q_UNUSED(rois);
-    if (m_captureState != CaptureState::Live) {
-        return;
-    }
-
-    ++m_roiUpdateCount;
-    m_lastRoiUpdateMs = QDateTime::currentMSecsSinceEpoch();
-    m_lastRoiUpdateReason = reason;
-}
-
 QString DIMM::roiRuleDescription() const
 {
-    return QStringLiteral("ROI 固定为 64x64；启动后两台相机分别全画幅定位，并切换到各自独立 ROI 跟踪。");
+    return QStringLiteral("ROI 固定为 64x64；启动后两台相机分别全画幅定位，并切换到各自独立 ROI 跟踪");
 }
 
 bool DIMM::validateAndCacheLiveRoiCapabilities(QString* reason)
@@ -293,7 +346,7 @@ bool DIMM::validateAndCacheLiveRoiCapabilities(QString* reason)
                                               kFixedRoiSize,
                                               &m_liveRoiCapabilities[cameraIndex])) {
             if (reason) {
-                *reason = QStringLiteral("相机%1固定 ROI 能力探测失败。").arg(cameraIndex + 1);
+                *reason = QStringLiteral("相机%1固定 ROI 能力探测失败").arg(cameraIndex + 1);
             }
             m_liveRoiCapabilitiesValid = false;
             return false;
@@ -313,7 +366,7 @@ bool DIMM::readLivePairRoiPosition(RoiPosition positions[2], QString* reason)
     for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
         if (!m_cameraManager->readRoiPosition(cameraIndex, &positions[cameraIndex])) {
             if (reason) {
-                *reason = QStringLiteral("读取相机%1当前 ROI 位置失败。").arg(cameraIndex + 1);
+                *reason = QStringLiteral("读取相机%1当前 ROI 位置失败").arg(cameraIndex + 1);
             }
             return false;
         }
@@ -356,7 +409,7 @@ bool DIMM::configureLiveCameras(QString* reason)
 
         if (!m_cameraManager->prepareFullFrame(cameraIndex)) {
             if (reason) {
-                *reason = QStringLiteral("相机%1切换到全画幅失败。").arg(cameraIndex + 1);
+                *reason = QStringLiteral("相机%1切换到全画幅失败").arg(cameraIndex + 1);
             }
             return false;
         }
@@ -364,7 +417,7 @@ bool DIMM::configureLiveCameras(QString* reason)
         if (!m_cameraManager->setExposure(cameraIndex, m_cameraExposureUs[cameraIndex]) ||
             !m_cameraManager->setGain(cameraIndex, m_configGainDb)) {
             if (reason) {
-                *reason = QStringLiteral("相机%1曝光或增益设置失败。").arg(cameraIndex + 1);
+                *reason = QStringLiteral("相机%1曝光或增益设置失败").arg(cameraIndex + 1);
             }
             return false;
         }
@@ -377,7 +430,7 @@ bool DIMM::configureLiveCameras(QString* reason)
     for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
         if (!m_cameraManager->prepareFullFrame(cameraIndex)) {
             if (reason) {
-                *reason = QStringLiteral("相机%1校验独立 ROI 后恢复全画幅失败。").arg(cameraIndex + 1);
+                *reason = QStringLiteral("相机%1校验独立 ROI 后恢复全画幅失败").arg(cameraIndex + 1);
             }
             return false;
         }
@@ -392,7 +445,7 @@ bool DIMM::configureLiveCameras(QString* reason)
                                      : m_cameraManager->configureExternalTrigger(cameraIndex);
         if (!triggerConfigured) {
             if (reason) {
-                *reason = QStringLiteral("相机%1触发模式配置失败。").arg(cameraIndex + 1);
+                *reason = QStringLiteral("相机%1触发模式配置失败").arg(cameraIndex + 1);
             }
             return false;
         }
@@ -416,7 +469,7 @@ bool DIMM::applyContinuousCameraFrameRate(QString* reason)
     if (restartLiveContinuousCapture) {
         if (!m_cameraManager->stopAll()) {
             if (reason) {
-                *reason = QStringLiteral("暂停连续采集以设置帧率失败。");
+                *reason = QStringLiteral("暂停连续采集以设置帧率失败");
             }
             return false;
         }
@@ -448,7 +501,7 @@ bool DIMM::applyContinuousCameraFrameRate(QString* reason)
             continue;
         }
         if (!m_cameraManager->setFrameRate(cameraIndex, m_configContinuousFrameRateHz)) {
-            return failWithRestart(QStringLiteral("相机%1连续采集帧率设置失败。").arg(cameraIndex + 1));
+            return failWithRestart(QStringLiteral("相机%1连续采集帧率设置失败").arg(cameraIndex + 1));
         }
 
         const double actualFrameRate = m_cameraManager->getFrameRate(cameraIndex);
@@ -465,7 +518,7 @@ bool DIMM::applyContinuousCameraFrameRate(QString* reason)
 
     if (!restartLiveCapture()) {
         if (reason) {
-            *reason = QStringLiteral("设置连续采集帧率后恢复采集失败。");
+            *reason = QStringLiteral("设置连续采集帧率后恢复采集失败");
         }
         return false;
     }
@@ -490,6 +543,8 @@ void DIMM::resetLiveFrameAcceptanceGates()
     m_liveFrameAcceptAfterMs = QDateTime::currentMSecsSinceEpoch();
     m_lastAcceptedLiveFrameId[0] = 0;
     m_lastAcceptedLiveFrameId[1] = 0;
+    m_lastAcceptedLiveFrameMs[0] = -1;
+    m_lastAcceptedLiveFrameMs[1] = -1;
     m_lastAcceptedContinuousFrameMs[0] = -1;
     m_lastAcceptedContinuousFrameMs[1] = -1;
 }
@@ -498,14 +553,14 @@ bool DIMM::startDualCameraLocalization(QString* reason)
 {
     if (!m_cameraManager) {
         if (reason) {
-            *reason = QStringLiteral("相机管理器未初始化。");
+            *reason = QStringLiteral("相机管理器未初始化");
         }
         return false;
     }
 
     if (!m_cameraManager->startAll()) {
         if (reason) {
-            *reason = QStringLiteral("双相机全画幅定位启动失败。");
+            *reason = QStringLiteral("双相机全画幅定位启动失败");
         }
         return false;
     }
@@ -518,13 +573,13 @@ bool DIMM::applyLiveHardwareRois(const RoiRect rois[2], QString* reason, RoiRect
 {
     if (!m_liveRoiCapabilitiesValid) {
         if (reason) {
-            *reason = QStringLiteral("独立 ROI 能力尚未准备完成。");
+            *reason = QStringLiteral("独立 ROI 能力尚未准备完成");
         }
         return false;
     }
     if (!rois) {
         if (reason) {
-            *reason = QStringLiteral("独立 ROI 参数无效。");
+            *reason = QStringLiteral("独立 ROI 参数无效");
         }
         return false;
     }
@@ -564,14 +619,14 @@ bool DIMM::applyLiveHardwareRois(const RoiRect rois[2], QString* reason, RoiRect
         for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
             if (!m_cameraManager->prepareTriggerInputLine(cameraIndex, QString::fromLatin1(kRoiUpdateGateLine))) {
                 if (reason) {
-                    *reason = QStringLiteral("准备相机%1 ROI 更新门控触发线失败。").arg(cameraIndex + 1);
+                    *reason = QStringLiteral("准备相机%1 ROI 更新门控触发线失败").arg(cameraIndex + 1);
                 }
                 return false;
             }
         }
         if (!m_cameraManager->setPairTriggerSource(QString::fromLatin1(kRoiUpdateGateLine))) {
             if (reason) {
-                *reason = QStringLiteral("切换到 ROI 更新门控触发线失败。");
+                *reason = QStringLiteral("切换到 ROI 更新门控触发线失败");
             }
             return false;
         }
@@ -581,7 +636,7 @@ bool DIMM::applyLiveHardwareRois(const RoiRect rois[2], QString* reason, RoiRect
     RoiUpdatePauseState pauseState[2];
     if (!m_cameraManager->pausePairForRoiUpdate(pauseState)) {
         if (reason) {
-            *reason = QStringLiteral("暂停采集以更新硬件 ROI 失败。");
+            *reason = QStringLiteral("暂停采集以更新硬件 ROI 失败");
         }
         if (triggerGated) {
             m_cameraManager->setPairTriggerSource(QString::fromLatin1(kHardwareTriggerLine));
@@ -595,7 +650,7 @@ bool DIMM::applyLiveHardwareRois(const RoiRect rois[2], QString* reason, RoiRect
                   m_cameraManager->moveRoi(cameraIndex, targetPositions[cameraIndex]);
         if (!success) {
             if (reason) {
-                *reason = QStringLiteral("相机%1硬件 ROI 更新失败。").arg(cameraIndex + 1);
+                *reason = QStringLiteral("相机%1硬件 ROI 更新失败").arg(cameraIndex + 1);
             }
             break;
         }
@@ -603,7 +658,7 @@ bool DIMM::applyLiveHardwareRois(const RoiRect rois[2], QString* reason, RoiRect
 
     const bool resumed = m_cameraManager->resumePairAfterRoiUpdate(pauseState);
     if (!resumed && reason && success) {
-        *reason = QStringLiteral("硬件 ROI 更新后恢复采集失败。");
+        *reason = QStringLiteral("硬件 ROI 更新后恢复采集失败");
     }
 
     if (resumed) {
@@ -613,7 +668,7 @@ bool DIMM::applyLiveHardwareRois(const RoiRect rois[2], QString* reason, RoiRect
     if (triggerGated &&
         !m_cameraManager->setPairTriggerSource(QString::fromLatin1(kHardwareTriggerLine)) &&
         reason && success && resumed) {
-        *reason = QStringLiteral("硬件 ROI 更新后恢复 Line0 触发源失败。");
+        *reason = QStringLiteral("硬件 ROI 更新后恢复 Line0 触发源失败");
         success = false;
     }
 
@@ -632,7 +687,7 @@ bool DIMM::applyLiveHardwareRois(const RoiRect rois[2], QString* reason, RoiRect
         if (verifiedPositions[cameraIndex].x != targetPositions[cameraIndex].x ||
             verifiedPositions[cameraIndex].y != targetPositions[cameraIndex].y) {
             if (reason) {
-                *reason = QStringLiteral("相机%1硬件 ROI 更新后偏移校验失败。").arg(cameraIndex + 1);
+                *reason = QStringLiteral("相机%1硬件 ROI 更新后偏移校验失败").arg(cameraIndex + 1);
             }
             return false;
         }
@@ -653,7 +708,7 @@ bool DIMM::applyLiveFullFrameForRelocalization(QString* reason)
 {
     if (!m_cameraManager) {
         if (reason) {
-            *reason = QStringLiteral("相机管理器未初始化。");
+            *reason = QStringLiteral("相机管理器未初始化");
         }
         return false;
     }
@@ -664,14 +719,14 @@ bool DIMM::applyLiveFullFrameForRelocalization(QString* reason)
         for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
             if (!m_cameraManager->prepareTriggerInputLine(cameraIndex, QString::fromLatin1(kRoiUpdateGateLine))) {
                 if (reason) {
-                    *reason = QStringLiteral("准备相机%1全画幅重定位门控触发线失败。").arg(cameraIndex + 1);
+                    *reason = QStringLiteral("准备相机%1全画幅重定位门控触发线失败").arg(cameraIndex + 1);
                 }
                 return false;
             }
         }
         if (!m_cameraManager->setPairTriggerSource(QString::fromLatin1(kRoiUpdateGateLine))) {
             if (reason) {
-                *reason = QStringLiteral("切换到全画幅重定位门控触发线失败。");
+                *reason = QStringLiteral("切换到全画幅重定位门控触发线失败");
             }
             return false;
         }
@@ -681,7 +736,7 @@ bool DIMM::applyLiveFullFrameForRelocalization(QString* reason)
     RoiUpdatePauseState pauseState[2];
     if (!m_cameraManager->pausePairForRoiUpdate(pauseState)) {
         if (reason) {
-            *reason = QStringLiteral("暂停采集以切换全画幅失败。");
+            *reason = QStringLiteral("暂停采集以切换全画幅失败");
         }
         if (triggerGated) {
             m_cameraManager->setPairTriggerSource(QString::fromLatin1(kHardwareTriggerLine));
@@ -694,7 +749,7 @@ bool DIMM::applyLiveFullFrameForRelocalization(QString* reason)
         if (!m_cameraManager->prepareFullFrame(cameraIndex)) {
             success = false;
             if (reason) {
-                *reason = QStringLiteral("相机%1切换全画幅失败。").arg(cameraIndex + 1);
+                *reason = QStringLiteral("相机%1切换全画幅失败").arg(cameraIndex + 1);
             }
             break;
         }
@@ -702,7 +757,7 @@ bool DIMM::applyLiveFullFrameForRelocalization(QString* reason)
 
     const bool resumed = m_cameraManager->resumePairAfterRoiUpdate(pauseState);
     if (!resumed && reason && success) {
-        *reason = QStringLiteral("切换全画幅后恢复采集失败。");
+        *reason = QStringLiteral("切换全画幅后恢复采集失败");
     }
     if (resumed) {
         m_cameraManager->flushPairQueues();
@@ -711,7 +766,7 @@ bool DIMM::applyLiveFullFrameForRelocalization(QString* reason)
     if (triggerGated &&
         !m_cameraManager->setPairTriggerSource(QString::fromLatin1(kHardwareTriggerLine)) &&
         reason && success && resumed) {
-        *reason = QStringLiteral("全画幅重定位后恢复 Line0 触发源失败。");
+        *reason = QStringLiteral("全画幅重定位后恢复 Line0 触发源失败");
         success = false;
     }
 
@@ -722,64 +777,143 @@ bool DIMM::applyLiveFullFrameForRelocalization(QString* reason)
         return false;
     }
 
-    advanceLiveAcquisitionGeneration();
     if (m_configTriggerMode != 0) {
-        return startFullFrameLocalizationPulse(reason);
+        QString pulseReason;
+
+        const bool pulseStarted =
+            startFullFrameLocalizationPulse(&pulseReason);
+
+        if (!pulseStarted) {
+            if (!isPulseBoardResponseTimeout(pulseReason)) {
+                if (reason) {
+                    *reason =
+                        pulseReason.isEmpty()
+                            ? QStringLiteral(
+                                  "全画幅重定位低频触发启动失败。")
+                            : pulseReason;
+                }
+
+                return false;
+            }
+
+            m_pulseBoardResponseTimedOut = true;
+
+            setPulseBoardResponseTimeoutStatus(
+                QStringLiteral(
+                    "状态: 全画幅重定位脉冲板应答超时，继续等待双相机新的全画幅图像确认触发是否生效"));
+        }
+
+        beginHardwareTriggerStartupStage(
+            HardwareTriggerStartupStage::WaitingFullFramePair);
+
+        if (reason) {
+            reason->clear();
+        }
+
+        return true;
     }
     for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
         if (m_cameraManager->isOpen(cameraIndex) &&
             !m_cameraManager->setFrameRate(cameraIndex, kFullFrameLocalizationPulseHz)) {
             if (reason) {
-                *reason = QStringLiteral("相机%1全画幅重定位帧率设置失败。").arg(cameraIndex + 1);
+                *reason = QStringLiteral("相机%1全画幅重定位帧率设置失败").arg(cameraIndex + 1);
             }
             return false;
         }
     }
     return true;
 }
-bool DIMM::selectLiveRelocalizationCentroid(int cameraIndex,
-                                            const cv::Mat& fullFrame,
-                                            QPointF* centroid,
-                                            double* peakValue)
+bool DIMM::selectLiveRelocalizationCentroid(
+    int cameraIndex,
+    const cv::Mat& fullFrame,
+    QPointF* centroid,
+    double* peakValue,
+    QString* selectionSource,
+    QString* failureReason)
 {
-    if (cameraIndex < 0 || cameraIndex >= 2 || fullFrame.empty() || !centroid) {
+    if (selectionSource) {
+        selectionSource->clear();
+    }
+    if (failureReason) {
+        failureReason->clear();
+    }
+
+    if (cameraIndex < 0 ||
+        cameraIndex >= 2 ||
+        fullFrame.empty() ||
+        !centroid) {
+        if (failureReason) {
+            *failureReason =
+                QStringLiteral("全画幅目标选择参数无效");
+        }
         return false;
     }
 
-    QVector<InitialStarCandidate> candidates = detectInitialStarCandidates(fullFrame, peakValue);
+    double actualThreshold = 0.0;
+    double otsuThreshold = 0.0;
+    QVector<InitialStarCandidate> candidates =
+        detectInitialStarCandidates(fullFrame, peakValue, &actualThreshold, &otsuThreshold);
+    candidates = stabilizeInitialCandidates(cameraIndex, candidates);
+    setFullFrameThresholdDisplay(cameraIndex, otsuThreshold, actualThreshold);
     if (candidates.isEmpty()) {
+        if (failureReason) {
+            *failureReason =
+                QStringLiteral("相机%1全画幅未检测到有效候选星")
+                    .arg(cameraIndex + 1);
+        }
         return false;
     }
 
     auto& runtime = activeRuntime();
-    if (runtime.hasLastTargetPosition[cameraIndex]) {
-        const InitialStarSelection selection =
-            PolarisDetectionPipeline::selectInitialStarCandidate(candidates,
-                                                                 true,
-                                                                 runtime.lastTargetPosition[cameraIndex],
-                                                                 0);
-        if (!selection.selected) {
-            return false;
+    FullFrameCanvas* targetCanvas =
+        cameraIndex == 0 ? m_fullFrameCanvas1 : m_fullFrameCanvas2;
+    const int previousSelectedIndex = runtime.selectedInitialCandidateIndex[cameraIndex];
+    InitialStarSelection selection =
+        PolarisDetectionPipeline::selectFullFrameStarCandidate(
+            candidates,
+            previousSelectedIndex,
+            previousSelectedIndex > 0);
+
+    if (!selection.selected && selection.requiresUserSelection) {
+        runtime.pendingInitialCandidateSelectionRequired[cameraIndex] = true;
+        if (targetCanvas) {
+            targetCanvas->setStarCandidateOverlays(
+                PolarisDetectionPipeline::buildCandidateOverlays(
+                    candidates,
+                    previousSelectedIndex));
         }
-        *centroid = selection.candidate.center;
-        if (peakValue) {
-            *peakValue = selection.candidate.peak;
-        }
-        return true;
     }
 
-    InitialStarCandidate selectedCandidate;
-    const InitialStarCandidate strongestCandidate = candidates.first();
-    if (!PolarisDetectionPipeline::chooseAutomaticInitialStarCandidate(candidates,
-                                                                       strongestCandidate,
-                                                                       &selectedCandidate,
-                                                                       nullptr)) {
+    if (!selection.selected) {
+        if (failureReason) {
+            *failureReason = selection.requiresUserSelection
+                                 ? QStringLiteral("相机%1检测到多个候选星，请在对准模式中选择星点")
+                                       .arg(cameraIndex + 1)
+                                 : selection.reason;
+        }
         return false;
     }
-    *centroid = selectedCandidate.center;
+
+    *centroid = selection.candidate.center;
     if (peakValue) {
-        *peakValue = selectedCandidate.peak;
+        *peakValue = selection.candidate.peak;
     }
+    if (selectionSource) {
+        *selectionSource = previousSelectedIndex > 0
+                               ? QStringLiteral("人工确认全画幅候选星")
+                               : (candidates.size() == 1
+                                      ? QStringLiteral("全画幅单候选星")
+                                      : QStringLiteral("人工确认全画幅候选星"));
+    }
+    if (targetCanvas) {
+        targetCanvas->setStarCandidateOverlays(
+            PolarisDetectionPipeline::buildCandidateOverlays(
+                candidates,
+                selection.candidate.index));
+    }
+    runtime.pendingInitialCandidateSelectionRequired[cameraIndex] = false;
+    runtime.selectedInitialCandidateIndex[cameraIndex] = -1;
+    runtime.lastInitialCandidatePromptMs[cameraIndex] = -1;
     return true;
 }
 
@@ -816,39 +950,79 @@ bool DIMM::maybeSeedRoiFromFrame(int cameraIndex, const cv::Mat& frame)
         cv::cvtColor(frame, grayscale, cv::COLOR_BGR2GRAY);
     }
 
-    const int camIdx = cameraIndex;
     FullFrameCanvas* targetCanvas = cameraIndex == 0 ? m_fullFrameCanvas1 : m_fullFrameCanvas2;
+    if (targetCanvas &&
+        LivePreviewPolicy::shouldShowLocalizationFrameBeforeStarSelection(
+            livePreviewStartupPhase(m_liveStartupPhase),
+            false)) {
+        targetCanvas->setImage(grayscale);
+        runtime.lastLivePreviewUpdateMs[cameraIndex] = QDateTime::currentMSecsSinceEpoch();
+        updateFullFrameRoiOverlay(cameraIndex);
+    }
+
     QPointF centroid;
     double peakValue = 0.0;
     if (liveLocatePhase) {
-        if (!selectLiveRelocalizationCentroid(cameraIndex, grayscale, &centroid, &peakValue)) {
-            if (targetCanvas) {
+        QString selectionSource;
+        QString selectionFailureReason;
+
+        if (!selectLiveRelocalizationCentroid(
+                cameraIndex,
+                grayscale,
+                &centroid,
+                &peakValue,
+                &selectionSource,
+                &selectionFailureReason)) {
+            if (targetCanvas &&
+                !runtime.pendingInitialCandidateSelectionRequired[cameraIndex]) {
                 targetCanvas->clearStarCandidateOverlays();
             }
-            setStatusMessage(QStringLiteral("状态: 相机%1 全画幅SDK 连通域找星未找到有效星点，等待下一帧")
-                                 .arg(cameraIndex + 1),
-                             UiStatusLevel::Warning);
+
+            setStatusMessage(
+                selectionFailureReason.isEmpty()
+                    ? QStringLiteral(
+                          "状态: 相机%1全画幅找星未找到有效目标，"
+                          "等待下一帧。")
+                          .arg(cameraIndex + 1)
+                    : QStringLiteral("状态: %1")
+                          .arg(selectionFailureReason),
+                UiStatusLevel::Warning);
             return false;
         }
-        runtime.liveRelocalizationPreviewFrame[cameraIndex] = frame.clone();
-        runtime.pendingInitialCandidateSelectionRequired[cameraIndex] = false;
-        setStatusMessage(QStringLiteral("状态: 相机%1全画幅重定位找到星点 (%2, %3)，峰值%4，第 %5 帧")
-                             .arg(cameraIndex + 1)
-                             .arg(centroid.x(), 0, 'f', 1)
-                             .arg(centroid.y(), 0, 'f', 1)
-                             .arg(peakValue, 0, 'f', 1)
-                             .arg(runtime.frameCountPerCamera[cameraIndex]),
-                         UiStatusLevel::Info);
+
+        runtime.lastTargetPosition[cameraIndex] = centroid;
+        runtime.hasLastTargetPosition[cameraIndex] = true;
+
+        if (runtime.hasConfirmedPolarisPosition[cameraIndex]) {
+            runtime.confirmedPolarisPosition[cameraIndex] =
+                centroid;
+        }
+
+        runtime.liveRelocalizationPreviewFrame[cameraIndex] =
+            frame.clone();
+        runtime.pendingInitialCandidateSelectionRequired[cameraIndex] =
+            false;
+
+        setStatusMessage(
+            QStringLiteral(
+                "状态: 相机%1全画幅定位找到星点 "
+                "(%2, %3)，峰值 %4，来源 %5，第 %6 帧")
+                .arg(cameraIndex + 1)
+                .arg(centroid.x(), 0, 'f', 1)
+                .arg(centroid.y(), 0, 'f', 1)
+                .arg(peakValue, 0, 'f', 1)
+                .arg(selectionSource.isEmpty()
+                         ? QStringLiteral("未知")
+                         : selectionSource)
+                .arg(runtime.frameCountPerCamera[cameraIndex]),
+            UiStatusLevel::Info);
     } else {
-        QVector<InitialStarCandidate> candidates = detectInitialStarCandidates(grayscale, &peakValue);
-        const bool hasTrackedTargetPreference = runtime.hasLastTargetPosition[camIdx];
-        const bool hasAlignmentPolarisPreference = runtime.hasConfirmedPolarisPosition[camIdx];
-        const bool hasPreferredInitialTarget = hasTrackedTargetPreference ||
-                                               hasAlignmentPolarisPreference;
-        const bool usePreferenceGate = !liveLocatePhase && hasPreferredInitialTarget;
-        const QPointF preferredInitialTarget = hasTrackedTargetPreference
-                                                   ? runtime.lastTargetPosition[camIdx]
-                                                   : runtime.confirmedPolarisPosition[camIdx];
+        double actualThreshold = 0.0;
+        double otsuThreshold = 0.0;
+        QVector<InitialStarCandidate> candidates =
+            detectInitialStarCandidates(grayscale, &peakValue, &actualThreshold, &otsuThreshold);
+        candidates = stabilizeInitialCandidates(cameraIndex, candidates);
+        setFullFrameThresholdDisplay(cameraIndex, otsuThreshold, actualThreshold);
         if (candidates.isEmpty()) {
             if (runtime.pendingInitialCandidateSelectionRequired[cameraIndex]) {
                 if (targetCanvas) {
@@ -863,7 +1037,7 @@ bool DIMM::maybeSeedRoiFromFrame(int cameraIndex, const cv::Mat& frame)
                 targetCanvas->clearStarCandidateOverlays();
             }
             runtime.pendingInitialCandidateSelectionRequired[cameraIndex] = false;
-            setStatusMessage(QStringLiteral("状态: 相机%1 全画幅SDK 连通域找星未找到有效星点，未初始化 ROI")
+            setStatusMessage(QStringLiteral("状态: 相机%1 全画幅 SDK 连通域找星未找到有效星点，未初始化 ROI")
                                  .arg(cameraIndex + 1),
                              UiStatusLevel::Warning);
             return false;
@@ -876,47 +1050,19 @@ bool DIMM::maybeSeedRoiFromFrame(int cameraIndex, const cv::Mat& frame)
             }
 
             InitialStarSelection selection =
-                PolarisDetectionPipeline::selectInitialStarCandidate(
+                PolarisDetectionPipeline::selectFullFrameStarCandidate(
                     candidates,
-                    usePreferenceGate,
-                    preferredInitialTarget,
-                    runtime.selectedInitialCandidateIndex[cameraIndex]);
+                    runtime.selectedInitialCandidateIndex[cameraIndex],
+                    false);
             runtime.pendingInitialCandidateSelectionRequired[cameraIndex] =
                 selection.requiresUserSelection;
             if (!selection.selected) {
-                if (usePreferenceGate) {
-                    setStatusMessage(QStringLiteral("状态: 相机%1候选星点距离上次位置过远，本帧不更新初始 ROI")
-                                         .arg(cameraIndex + 1),
-                                     UiStatusLevel::Warning);
-                    return false;
-                }
-
-                const InitialStarCandidate strongestCandidate = candidates.first();
-                QString automaticRejectReason;
-                if (!PolarisDetectionPipeline::chooseAutomaticInitialStarCandidate(
-                        candidates,
-                        strongestCandidate,
-                        &selection.candidate,
-                        &automaticRejectReason)) {
-                    setStatusMessage(QStringLiteral("状态: 相机%1%2")
-                                         .arg(cameraIndex + 1)
-                                         .arg(automaticRejectReason),
-                                     UiStatusLevel::Warning);
-                    return false;
-                }
-
-                selection.selected = true;
-                selection.requiresUserSelection = false;
-                centroid = selection.candidate.center;
-                setStatusMessage(QStringLiteral("状态: 相机%1未对准确认，自动选择信号最强候选星作为初始 ROI")
+                setStatusMessage(QStringLiteral("状态: 相机%1检测到多个候选星，请完成人工选星")
                                      .arg(cameraIndex + 1),
                                  UiStatusLevel::Warning);
+                return false;
             }
             centroid = selection.candidate.center;
-            if (hasAlignmentPolarisPreference) {
-                runtime.confirmedPolarisPosition[cameraIndex] = centroid;
-                runtime.hasConfirmedPolarisPosition[cameraIndex] = true;
-            }
             if (targetCanvas) {
                 targetCanvas->setStarCandidateOverlays(
                     PolarisDetectionPipeline::buildCandidateOverlays(
@@ -942,7 +1088,7 @@ bool DIMM::maybeSeedRoiFromFrame(int cameraIndex, const cv::Mat& frame)
     if (m_captureState == CaptureState::Live &&
         (!runtime.pendingInitialRoiReady[0] || !runtime.pendingInitialRoiReady[1])) {
         const int waitingCamera = runtime.pendingInitialRoiReady[0] ? 2 : 1;
-        setStatusMessage(QStringLiteral("状态: 相机%1全画幅已找到星点，等待相机2全画幅定位")
+        setStatusMessage(QStringLiteral("状态: 相机%1全画幅已找到星点，等待相机%2全画幅定位")
                              .arg(cameraIndex + 1)
                              .arg(waitingCamera),
                          UiStatusLevel::Info);
@@ -975,6 +1121,24 @@ void DIMM::handleLiveRelocalizationWatchdog(qint64 nowMs)
         return;
     }
 
+    if (m_liveStartupOrigin == LiveStartupOrigin::AutoAcquisition) {
+        const bool noCameraHasPendingRoi =
+            !runtime.pendingInitialRoiReady[0] &&
+            !runtime.pendingInitialRoiReady[1];
+        const bool manualSelectionRequired =
+            runtime.pendingInitialCandidateSelectionRequired[0] ||
+            runtime.pendingInitialCandidateSelectionRequired[1];
+        if (noCameraHasPendingRoi || manualSelectionRequired) {
+            clearPendingLiveRelocalizationRois();
+            stopAutoAcquisitionScanUntilNextInterval(
+                manualSelectionRequired
+                    ? QStringLiteral("自动采集检测到多个候选星，等待人工选择")
+                    : QStringLiteral("自动采集全画幅未找到星点，等待下一次扫描"),
+                manualSelectionRequired);
+            return;
+        }
+    }
+
     clearPendingLiveRelocalizationRois();
     runtime.liveRelocalizationStartedMs = nowMs;
     m_liveStartupPhase = LiveStartupPhase::LocatePair;
@@ -982,6 +1146,21 @@ void DIMM::handleLiveRelocalizationWatchdog(qint64 nowMs)
     resetLiveFrameAcceptanceGates();
     QString switchReason;
     const bool fullFrameReady = applyLiveFullFrameForRelocalization(&switchReason);
+
+    if (!fullFrameReady &&
+        m_configTriggerMode != 0) {
+        const QString detail =
+            switchReason.isEmpty()
+                ? QStringLiteral(
+                      "全画幅重定位超时后重新切换失败。")
+                : switchReason;
+
+        handleHardwareTriggerStartupFailure(
+            detail);
+
+        return;
+    }
+
     if (ui->lblROITimeCurrent) {
         ui->lblROITimeCurrent->setText(fullFrameReady
                                            ? QStringLiteral("全画幅重定位重试中")
@@ -1020,6 +1199,54 @@ void DIMM::updateFullFrameRoiOverlay(int cameraIndex)
 
     targetCanvas->setRoiList(rois);
     targetCanvas->setCurrentRoi(rois.isEmpty() ? -1 : 0);
+    updateActualRoiTrackOverlay(cameraIndex);
+}
+
+void DIMM::appendActualRoiTrackPoint(int cameraIndex, const RoiRect& roi)
+{
+    if (cameraIndex < 0 || cameraIndex >= 2) {
+        return;
+    }
+
+    m_actualRoiTracks[cameraIndex].append(
+        QPointF(roi.x + roi.w * 0.5, roi.y + roi.h * 0.5));
+    updateActualRoiTrackOverlay(cameraIndex);
+}
+
+void DIMM::updateActualRoiTrackOverlay(int cameraIndex)
+{
+    if (cameraIndex < 0 || cameraIndex >= 2) {
+        return;
+    }
+
+    FullFrameCanvas* targetCanvas = cameraIndex == 0 ? m_fullFrameCanvas1 : m_fullFrameCanvas2;
+    if (!targetCanvas) {
+        return;
+    }
+
+    FullFrameCanvas::RoiTrajectoryOverlay overlay;
+    overlay.enabled = true;
+    overlay.points = m_actualRoiTracks[cameraIndex].points();
+    const PolarisTrajectory::RoiTrackFit fit =
+        m_actualRoiTracks[cameraIndex].fitCircle();
+    overlay.hasFittedCircle = fit.valid;
+    overlay.fittedCenter = fit.center;
+    overlay.fittedRadiusPx = fit.radiusPx;
+    overlay.fittedRmsPx = fit.rmsPx;
+    targetCanvas->setRoiTrajectoryOverlay(overlay);
+}
+
+void DIMM::clearActualRoiTracks()
+{
+    for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+        m_actualRoiTracks[cameraIndex].clear();
+    }
+    if (m_fullFrameCanvas1) {
+        m_fullFrameCanvas1->clearRoiTrajectoryOverlay();
+    }
+    if (m_fullFrameCanvas2) {
+        m_fullFrameCanvas2->clearRoiTrajectoryOverlay();
+    }
 }
 
 void DIMM::showDeferredLiveRelocalizationPreview()
@@ -1045,6 +1272,28 @@ void DIMM::clearPendingLiveRelocalizationRois()
         runtime.pendingInitialRoiReady[cameraIndex] = false;
         runtime.liveRelocalizationPreviewFrame[cameraIndex].release();
     }
+}
+
+bool DIMM::isFullFrameLocalizationPulseRunning() const
+{
+    if (m_configTriggerMode == 0 ||
+        !m_pulseGeneratorEnabled ||
+        !m_pulseGenerator ||
+        !m_pulseGenerator->isRunning()) {
+        return false;
+    }
+
+    PulseGeneratorManager::Config pulseConfig;
+    pulseConfig.enabled = true;
+    pulseConfig.portName = m_pulseGeneratorPort;
+    pulseConfig.baudRate = m_pulseGeneratorBaudRate;
+    pulseConfig.terminalId = m_pulseGeneratorTerminalId;
+    pulseConfig.frequencyHz = kFullFrameLocalizationPulseHz;
+    pulseConfig.pulseCount = m_pulseGeneratorPulseCount;
+    pulseConfig.dutyPercent = m_pulseGeneratorDutyPercent;
+    pulseConfig.remoteControl = m_pulseGeneratorRemoteControl;
+
+    return pulseConfigsMatch(m_pulseGenerator->config(), pulseConfig);
 }
 
 bool DIMM::commitPairedInitialRoisIfReady()
@@ -1077,21 +1326,50 @@ bool DIMM::commitPairedInitialRoisIfReady()
                          UiStatusLevel::Warning);
         return false;
     }
-    if (m_captureState == CaptureState::Live && !switchToRoiTrackingPulse(&reason)) {
-        m_liveHardwareRoiActive = false;
-        clearPendingLiveRelocalizationRois();
-        setStatusMessage(reason.isEmpty()
-                             ? QStringLiteral("状态: ROI 高频触发切换失败")
-                             : reason,
-                         UiStatusLevel::Warning);
-        return false;
+
+    bool roiPulseResponseTimeout = false;
+
+    if (m_captureState == CaptureState::Live) {
+        if (!switchToRoiTrackingPulse(&reason)) {
+            if (!isPulseBoardResponseTimeout(reason)) {
+                m_liveHardwareRoiActive = false;
+                clearPendingLiveRelocalizationRois();
+
+                m_hardwareTriggerStartupStage =
+                    HardwareTriggerStartupStage::None;
+
+                if (m_hardwareTriggerStartupTimer) {
+                    m_hardwareTriggerStartupTimer->stop();
+                }
+
+                handleHardwareTriggerStartupFailure(
+                    reason.isEmpty()
+                        ? QStringLiteral("ROI 高频触发切换失败")
+                        : reason);
+
+                return false;
+            }
+
+            roiPulseResponseTimeout = true;
+            m_pulseBoardResponseTimedOut = true;
+        }
+
+        /*
+         * switchToRoiTrackingPulse() 已经返回。
+         * Qt 当前线程中的图像回调尚未处理，因此此时记录帧数基线。
+         */
+        beginHardwareTriggerStartupStage(
+            HardwareTriggerStartupStage::WaitingRoiTrackingPair);
     }
 
-    const QString roiUpdateReason = runtime.liveRelocalizationStartedMs >= 0
-                                        ? QStringLiteral("full_frame_relocalization")
-                                        : QStringLiteral("initial_lock");
     m_imageProcessor->setPairRois(actualRois);
-    recordLiveRoiUpdate(actualRois, roiUpdateReason);
+    appendActualRoiTrackPoint(0, actualRois[0]);
+    appendActualRoiTrackPoint(1, actualRois[1]);
+    ++m_roiUpdateCount;
+    m_lastRoiUpdateMs = QDateTime::currentMSecsSinceEpoch();
+    m_lastRoiUpdateReason = runtime.liveRelocalizationStartedMs >= 0
+                                ? QStringLiteral("full_frame_relocalization")
+                                : QStringLiteral("initial_lock");
     runtime.initialRoiConfirmed[0] = true;
     runtime.initialRoiConfirmed[1] = true;
     runtime.pendingInitialRoiReady[0] = false;
@@ -1109,8 +1387,16 @@ bool DIMM::commitPairedInitialRoisIfReady()
     m_liveStartupPhase = LiveStartupPhase::Tracking;
     applyRoiSummary(actualRois[0], QStringLiteral("相机1"));
     showDeferredLiveRelocalizationPreview();
-    setStatusMessage(QStringLiteral("状态: 双相机全画幅定位完成，已同步切换到 64x64 ROI 跟踪"),
-                     UiStatusLevel::Success);
+    if (roiPulseResponseTimeout) {
+        setPulseBoardResponseTimeoutStatus(
+            QStringLiteral(
+                "状态: ROI 已写入，脉冲板未返回高频切换应答；正在等待双相机新的 ROI 图像确认触发是否生效"));
+    } else {
+        setStatusMessage(
+            QStringLiteral(
+                "状态: ROI 已写入并已发起高频触发，等待双相机新的 ROI 图像确认"),
+            UiStatusLevel::Warning);
+    }
     return true;
 }
 
@@ -1121,7 +1407,7 @@ bool DIMM::startHardwarePulseStage(double frequencyHz, const QString& stageLabel
     }
     if (!m_pulseGenerator) {
         if (reason) {
-            *reason = QStringLiteral("脉冲板控制器未初始化。");
+            *reason = QStringLiteral("脉冲板控制器未初始化");
         }
         return false;
     }
@@ -1148,13 +1434,13 @@ bool DIMM::startHardwarePulseStage(double frequencyHz, const QString& stageLabel
     if (!m_pulseGenerator->configureAndStart(pulseConfig, &errorMessage)) {
         if (reason) {
             *reason = errorMessage.isEmpty()
-                          ? QStringLiteral("%1触发启动失败。").arg(stageLabel)
+                          ? QStringLiteral("%1触发启动失败").arg(stageLabel)
                           : errorMessage;
         }
         return false;
     }
 
-    setStatusMessage(QStringLiteral("状态: %1触发已启用 %2 @ %3 Hz")
+    setStatusMessage(QStringLiteral("状态: %1触发已启用: %2 @ %3 Hz")
                          .arg(stageLabel, m_pulseGeneratorPort)
                          .arg(frequencyHz, 0, 'f', 1),
                      UiStatusLevel::Success);
@@ -1201,8 +1487,12 @@ void DIMM::updateMinuteRoi(bool force)
             actualRoi0 = actualRois[0];
             actualRoi1 = actualRois[1];
             m_liveHardwareRoiActive = true;
-            m_imageProcessor->setPairRois(actualRois);
-            recordLiveRoiUpdate(actualRois, QStringLiteral("centroid_recenter"));
+            m_imageProcessor->setPairRoisPreservingAtmosphereWindow(actualRois);
+            appendActualRoiTrackPoint(0, actualRois[0]);
+            appendActualRoiTrackPoint(1, actualRois[1]);
+            ++m_roiUpdateCount;
+            m_lastRoiUpdateMs = QDateTime::currentMSecsSinceEpoch();
+            m_lastRoiUpdateReason = QStringLiteral("centroid_recenter");
             runtime.roiRecenteringCandidateFrameCount = 0;
             applyRoiSummary(actualRoi0, QStringLiteral("相机1"));
         } else {

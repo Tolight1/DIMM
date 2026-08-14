@@ -8,8 +8,6 @@
 #include <QString>
 #include <QVector>
 
-#include <limits>
-
 namespace PolarisDetectionPipeline {
 struct InitialStarCandidate {
     int index = 0;
@@ -18,7 +16,6 @@ struct InitialStarCandidate {
     double peak = 0.0;
     double signal = 0.0;
     QRect bbox;
-    double distanceToPreference = std::numeric_limits<double>::infinity();
 };
 
 struct InitialStarSelection {
@@ -28,14 +25,10 @@ struct InitialStarSelection {
     QString reason;
 };
 
-InitialStarSelection selectInitialStarCandidate(QVector<InitialStarCandidate> candidates,
-                                                bool hasPreference,
-                                                const QPointF& preference,
-                                                int selectedCandidateIndex);
-bool chooseAutomaticInitialStarCandidate(const QVector<InitialStarCandidate>& candidates,
-                                         const InitialStarCandidate& strongestCandidate,
-                                         InitialStarCandidate* selected,
-                                         QString* reason);
+InitialStarSelection selectFullFrameStarCandidate(
+    const QVector<InitialStarCandidate>& candidates,
+    int selectedCandidateIndex,
+    bool manualSelectionConfirmed);
 QVector<FullFrameCanvas::StarCandidateOverlay> buildCandidateOverlays(
     const QVector<InitialStarCandidate>& candidates,
     int selectedIndex);

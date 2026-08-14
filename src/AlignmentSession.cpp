@@ -152,26 +152,28 @@ QVector<AlignmentSession::InitialStarCandidate> AlignmentSession::collectCandida
 AlignmentSession::InitialStarSelection AlignmentSession::selectInitialCandidate(
     const AlignmentCandidateRuntimeAccess& runtime,
     const QVector<InitialStarCandidate>& candidates,
-    bool manualSelectionRequested,
-    QPointF* preferredTarget)
+    bool manualSelectionRequested)
 {
-    const bool hasConfirmed = runtime.hasConfirmedPolarisPosition &&
-                              *runtime.hasConfirmedPolarisPosition;
-    const bool hasLastTarget = runtime.hasLastTargetPosition &&
-                               *runtime.hasLastTargetPosition;
-    const bool hasPreferredTarget = !manualSelectionRequested && (hasConfirmed || hasLastTarget);
-    const QPointF target = hasConfirmed && runtime.confirmedPolarisPosition
-                               ? *runtime.confirmedPolarisPosition
-                               : (runtime.lastTargetPosition ? *runtime.lastTargetPosition
-                                                             : QPointF());
-    if (preferredTarget) {
-        *preferredTarget = target;
+    if (!manualSelectionRequested) {
+        if (runtime.selectedInitialCandidateIndex &&
+            *runtime.selectedInitialCandidateIndex > 0) {
+            const int selectedIndex = *runtime.selectedInitialCandidateIndex;
+            for (const InitialStarCandidate& candidate : candidates) {
+                if (candidate.index == selectedIndex) {
+                    InitialStarSelection selection;
+                    selection.selected = true;
+                    selection.candidate = candidate;
+                    return selection;
+                }
+            }
+        }
+
     }
-    return PolarisDetectionPipeline::selectInitialStarCandidate(
+
+    return PolarisDetectionPipeline::selectFullFrameStarCandidate(
         candidates,
-        hasPreferredTarget,
-        target,
-        runtime.selectedInitialCandidateIndex ? *runtime.selectedInitialCandidateIndex : -1);
+        -1,
+        false);
 }
 
 void AlignmentSession::recordSelectedCandidate(AlignmentCandidateRuntimeAccess runtime,
@@ -282,17 +284,13 @@ QStringList AlignmentSession::candidatePromptLines(const QVector<InitialStarCand
     QStringList candidateLines;
     candidateLines.reserve(candidates.size());
     for (const InitialStarCandidate& candidate : candidates) {
-        const QString distanceText =
-            std::isfinite(candidate.distanceToPreference)
-                ? QString::number(candidate.distanceToPreference, 'f', 1)
-                : QStringLiteral("--");
-        candidateLines << QStringLiteral("鍊欓€?%1: 涓績=(%2, %3), 闈㈢Н=%4, 宄板€?%5, 璺濈涓婃=%6 px")
+        candidateLines << QStringLiteral("候选 #%1：中心=(%2, %3)，面积=%4，峰值=%5，信号总和=%6")
                               .arg(candidate.index)
                               .arg(candidate.center.x(), 0, 'f', 1)
                               .arg(candidate.center.y(), 0, 'f', 1)
                               .arg(candidate.area)
                               .arg(candidate.peak, 0, 'f', 1)
-                              .arg(distanceText);
+                              .arg(candidate.signal, 0, 'f', 1);
     }
     return candidateLines;
 }

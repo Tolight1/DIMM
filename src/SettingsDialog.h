@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "AppConfig.h"
 
 #include <QDialog>
@@ -33,25 +33,25 @@ public:
                                 quint32 pulseCount,
                                 double dutyPercent,
                                 bool remoteControl);
+    void setCommittedConfig(const AppConfig& config);
 
     std::function<void(double exposure, double gain, double continuousFrameRateHz)> onApplyCamera;
     std::function<void(const AutoExposureConfig& config)> onApplyAutoExposure;
     std::function<void(int backgroundKernelSize,
                        double backgroundSigmaMultiplier,
                        int centroidMode,
-                       int peakKernelMethod,
                        int peakKernelRadiusPx,
-                       double strongHotPixelExcessDn)> onApplyProcessing;
+                       double strongHotPixelExcessDn,
+                       int r0HistoryWindowFrames)> onApplyProcessing;
     std::function<void(double thresholdPx,
                        int requiredFrames,
                        qint64 cooldownMs,
                        double minimumShiftPx)> onApplyRoiRecentering;
-    std::function<void(double thresholdAbsolute,
-                       double sigmaThreshold,
+    std::function<void(double sigmaThreshold,
                        double peakFraction,
-                       double minimumIntensity,
                        int minArea,
-                       int maxArea)> onApplyFullFrameStarDetection;
+                       int maxArea,
+                       int connectivity)> onApplyFullFrameStarDetection;
     std::function<void(bool enabled,
                        QString camera0MaskPath,
                        QString camera0ExcessPath,
@@ -108,7 +108,7 @@ public:
     std::function<bool(QString* errorMessage)> onStopPulseOutput;
     std::function<void(QString ip, quint16 port)> onApplyNetwork;
     std::function<void(QString ip, quint16 port)> onConnectNetwork;
-    std::function<void()> onAfterApply;
+    std::function<void(const AppConfig& config, const ConfigChangeSet& changes)> onAfterApply;
 
     QLineEdit* exposureEdit = nullptr;
     QLineEdit* gainEdit = nullptr;
@@ -133,6 +133,9 @@ public:
     QLineEdit* autoExpSampleWindowSecEdit = nullptr;
     QLineEdit* autoExpSampleIntervalMsEdit = nullptr;
     QLineEdit* autoExpMinDecisionSampleCountEdit = nullptr;
+    QLineEdit* autoExpStepUsEdit = nullptr;
+    QLineEdit* autoExpInitialExposureUsEdit = nullptr;
+    QLineEdit* autoExpDecisionCooldownMinEdit = nullptr;
     QLineEdit* autoExpTrendConflictPersistenceSecEdit = nullptr;
     QLineEdit* autoExpMinEdit = nullptr;
     QLineEdit* autoExpMaxEdit = nullptr;
@@ -160,21 +163,20 @@ public:
     QLineEdit* envSensorAddressEdit = nullptr;
     QLineEdit* envSensorPollIntervalEdit = nullptr;
     QComboBox* centroidModeCombo = nullptr;
-    QComboBox* peakKernelMethodCombo = nullptr;
     QLineEdit* procKernelSize = nullptr;
     QLineEdit* procSigma = nullptr;
     QLineEdit* peakKernelRadiusEdit = nullptr;
     QLineEdit* strongHotPixelExcessEdit = nullptr;
+    QLineEdit* r0HistoryWindowFramesEdit = nullptr;
     QLineEdit* roiRecenterThresholdEdit = nullptr;
     QLineEdit* roiRecenterRequiredFramesEdit = nullptr;
     QLineEdit* roiRecenterCooldownMsEdit = nullptr;
     QLineEdit* roiRecenterMinimumShiftEdit = nullptr;
-    QLineEdit* starThresholdAbsoluteEdit = nullptr;
     QLineEdit* starSigmaThresholdEdit = nullptr;
     QLineEdit* starPeakFractionEdit = nullptr;
-    QLineEdit* starMinimumIntensityEdit = nullptr;
     QLineEdit* starMinAreaEdit = nullptr;
     QLineEdit* starMaxAreaEdit = nullptr;
+    QComboBox* starConnectivityCombo = nullptr;
     QCheckBox* hotPixelEnableCheck = nullptr;
     QLineEdit* hotPixelCam0MaskEdit = nullptr;
     QLineEdit* hotPixelCam0ExcessEdit = nullptr;
@@ -229,11 +231,21 @@ public:
     QLineEdit* autoAcquisitionLongitudeEdit = nullptr;
     QLineEdit* autoAcquisitionStartOffsetEdit = nullptr;
     QLineEdit* autoAcquisitionStopOffsetEdit = nullptr;
+    QLineEdit* autoAcquisitionRecoveryScanIntervalEdit = nullptr;
     QCheckBox* autoAcquisitionTestOverrideCheck = nullptr;
     QLineEdit* autoAcquisitionTestStartEdit = nullptr;
     QLineEdit* autoAcquisitionTestStopEdit = nullptr;
     QLabel* autoAcquisitionNextStartLabel = nullptr;
     QLabel* autoAcquisitionNextStopLabel = nullptr;
+
+    // Keep new public data members appended because several translation units
+    // access SettingsDialog fields directly.
+    std::function<bool(QString portName,
+                       int baudRate,
+                       int terminalId,
+                       bool remoteControl,
+                       QString* errorMessage)> onSetPulseControlSource;
+    QPushButton* pulseApplyConfigBtn = nullptr;
 
 private:
     void updateApplyStatus(const QString& text, const QString& color);
@@ -246,4 +258,6 @@ private:
     quint32 m_committedPulseCount = 2000000U;
     double m_committedPulseDutyPercent = 50.0;
     bool m_committedPulseRemoteControl = true;
+    AppConfig m_committedConfig;
+    bool m_hasCommittedConfig = false;
 };

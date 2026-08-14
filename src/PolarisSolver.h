@@ -49,10 +49,8 @@ struct PolarisSolverConfig {
     double initialMatchTolerancePx = 8.0;
     double refinedMatchTolerancePx = 4.0;
     double observationEpochYear = 2026.5;
-    double starThresholdAbsolute = -1.0;
     double starThresholdSigma = 4.0;
     double starPeakFraction = 0.20;
-    double starMinimumIntensity = 16.0;
     int minStarAreaPx = 1;
     int maxStarAreaPx = 1000;
     int retryIntervalMs = 3000;

@@ -1,6 +1,7 @@
 #include "DIMM.h"
 
 #include "AlignmentCameraCoordinator.h"
+#include "AlignmentCoarseController.h"
 #include "AlignmentController.h"
 #include "AlignmentFrameCoordinator.h"
 #include "AlignmentLocalTracker.h"
@@ -15,9 +16,11 @@
 #include "InitialStarDetectionConfig.h"
 #include "PathUtils.h"
 #include "PolarisDetectionPipeline.h"
+#include "PolarisTrajectory.h"
 #include "PolarisSolver.h"
 #include "PolarisTracker.h"
 #include "SettingsDialog.h"
+#include "StarSegmentation.h"
 
 #include <algorithm>
 #include <cmath>
@@ -142,11 +145,10 @@ void DIMM::requestAlignmentPolarisSelection(int cameraIndex)
             &runtime.lastInitialCandidatePromptMs[cameraIndex],
             chosenCandidateIndex);
         InitialStarSelection selection =
-            PolarisDetectionPipeline::selectInitialStarCandidate(
+            PolarisDetectionPipeline::selectFullFrameStarCandidate(
                 m_alignmentCachedCandidates[cameraIndex],
-                false,
-                QPointF(),
-                chosenCandidateIndex);
+                chosenCandidateIndex,
+                true);
         FullFrameCanvas* targetCanvas =
             cameraIndex == 0 ? m_fullFrameCanvas1 : m_fullFrameCanvas2;
         if (selection.selected) {
@@ -259,14 +261,22 @@ void DIMM::showAlignmentModeStopped()
 
 void DIMM::resetAlignmentRuntimeForStart()
 {
+    m_alignmentCoarseActive = false;
+    resetCoarseAlignmentRuntime();
     m_alignmentSession.camera(0).lastPreviewMs = -1;
     m_alignmentSession.camera(1).lastPreviewMs = -1;
     m_alignmentSession.camera(0).selectionRequested = false;
     m_alignmentSession.camera(1).selectionRequested = false;
     m_alignmentCachedCandidates[0].clear();
     m_alignmentCachedCandidates[1].clear();
+    clearStableCandidateTrackers();
+    clearActualRoiTracks();
     m_alignmentLastCandidateDetectionMs[0] = -1;
     m_alignmentLastCandidateDetectionMs[1] = -1;
+    m_alignmentOtsuThreshold[0] = -1.0;
+    m_alignmentOtsuThreshold[1] = -1.0;
+    m_alignmentActualThreshold[0] = -1.0;
+    m_alignmentActualThreshold[1] = -1.0;
     const quint64 solveGeneration = m_alignmentSession.advanceSolveGeneration();
     if (m_polarisSolverController) {
         m_polarisSolverController->cancelAll(solveGeneration);
@@ -283,6 +293,9 @@ void DIMM::resetAlignmentRuntimeForStart()
             &runtime.pendingInitialCandidateSelectionRequired[i];
         access.lastInitialCandidatePromptMs = &runtime.lastInitialCandidatePromptMs[i];
         m_alignmentSession.resetCameraForStart(i, access, m_alignmentAutoSolveEnabled);
+        runtime.hasConfirmedPolarisPhase[i] = false;
+        runtime.confirmedPolarisPhaseRad[i] = 0.0;
+        runtime.confirmedPolarisTimeUtc[i] = QDateTime();
         const QString solveLabel = m_alignmentAutoSolveEnabled
                                        ? AlignmentUiPresenter::waitingAlignmentLabelText()
                                        : AlignmentUiPresenter::solveStateText(AlignmentSolveState::Disabled);
@@ -294,12 +307,19 @@ void DIMM::resetAlignmentRuntimeForStart()
 
 void DIMM::resetAlignmentRuntimeForStop()
 {
+    m_alignmentCoarseActive = false;
+    resetCoarseAlignmentRuntime();
     m_alignmentSession.camera(0).selectionRequested = false;
     m_alignmentSession.camera(1).selectionRequested = false;
     m_alignmentCachedCandidates[0].clear();
     m_alignmentCachedCandidates[1].clear();
+    clearStableCandidateTrackers();
     m_alignmentLastCandidateDetectionMs[0] = -1;
     m_alignmentLastCandidateDetectionMs[1] = -1;
+    m_alignmentOtsuThreshold[0] = -1.0;
+    m_alignmentOtsuThreshold[1] = -1.0;
+    m_alignmentActualThreshold[0] = -1.0;
+    m_alignmentActualThreshold[1] = -1.0;
     const quint64 solveGeneration = m_alignmentSession.advanceSolveGeneration();
     if (m_polarisSolverController) {
         m_polarisSolverController->cancelAll(solveGeneration);
@@ -312,6 +332,7 @@ void DIMM::resetAlignmentRuntimeForStop()
 
 void DIMM::clearAlignmentCanvasesForStart()
 {
+    clearCoarseAlignmentOverlays();
     if (m_fullFrameCanvas1) {
         m_fullFrameCanvas1->clearAlignmentOverlay();
         m_fullFrameCanvas1->clearStarCandidateOverlays();
@@ -328,12 +349,178 @@ void DIMM::clearAlignmentCanvasesForStart()
 
 void DIMM::clearAlignmentCanvasesForStop()
 {
+    clearCoarseAlignmentOverlays();
     if (m_fullFrameCanvas1) {
         m_fullFrameCanvas1->clearAlignmentOverlay();
     }
     if (m_fullFrameCanvas2) {
         m_fullFrameCanvas2->clearAlignmentOverlay();
     }
+}
+
+void DIMM::onToggleCoarseAlignment()
+{
+    if (m_captureState != CaptureState::Alignment) {
+        setStatusMessage(QStringLiteral("状态: 请先进入对准模式，再启动粗对准"), UiStatusLevel::Warning);
+        return;
+    }
+
+    if (m_alignmentCoarseActive) {
+        m_alignmentCoarseActive = false;
+        resetCoarseAlignmentRuntime();
+        clearCoarseAlignmentOverlays();
+        setStatusMessage(QStringLiteral("状态: 粗对准已停止，可继续自动识别或人工确认"), UiStatusLevel::Info);
+        refreshActionStates();
+        return;
+    }
+
+    m_alignmentCoarseActive = true;
+    resetCoarseAlignmentRuntime();
+    if (m_polarisSolverController) {
+        m_polarisSolverController->cancelAll(m_alignmentSession.solveGeneration());
+    }
+    setAlignmentSolveLabel(0, QStringLiteral("粗对准: 等待星点漂移"), UiStatusLevel::Info);
+    setAlignmentSolveLabel(1, QStringLiteral("粗对准: 等待星点漂移"), UiStatusLevel::Info);
+    setStatusMessage(QStringLiteral("状态: 粗对准已启动，请关闭恒星跟踪并等待 15-30 秒"), UiStatusLevel::Info);
+    refreshActionStates();
+}
+
+void DIMM::resetCoarseAlignmentRuntime()
+{
+    m_alignmentLastCoarseSubmitMs[0] = -1;
+    m_alignmentLastCoarseSubmitMs[1] = -1;
+    m_alignmentCoarseEstimates[0] = CoarseAlignmentEstimate();
+    m_alignmentCoarseEstimates[1] = CoarseAlignmentEstimate();
+    if (m_alignmentCoarseController) {
+        m_alignmentCoarseController->resetAll();
+    }
+}
+
+void DIMM::clearCoarseAlignmentOverlays()
+{
+    if (m_fullFrameCanvas1) {
+        m_fullFrameCanvas1->clearCoarseDriftOverlay();
+    }
+    if (m_fullFrameCanvas2) {
+        m_fullFrameCanvas2->clearCoarseDriftOverlay();
+    }
+}
+
+CoarseAlignmentConfig DIMM::buildCoarseAlignmentConfig() const
+{
+    CoarseAlignmentConfig config;
+    config.maxCandidates = 80;
+    config.maxAssociationDistancePx = 25.0;
+    config.maxStaleTrackSec = 5.0;
+    config.maxTrackPoints = 90;
+    config.minTrackPoints = 5;
+    config.minTrackDurationSec = 15.0;
+    config.minTrackDisplacementPx = 2.0;
+    config.maxTrackFitRmsPx = 3.5;
+    config.minTrackSpeedPxSec = 0.005;
+    config.maxCenterResidualRmsPx = 80.0;
+    config.plateScaleArcsecPx =
+        206265.0 * std::max(0.001, m_alignmentPixelSizeUm / 1000.0) /
+        std::max(1.0, m_alignmentFocalLengthMm);
+    config.siderealArcsecSec = 15.041;
+    config.minTracksForCenter = 2;
+    return config;
+}
+
+void DIMM::submitCoarseAlignmentFrame(int cameraIndex, const CameraFrame& packet, qint64 nowMs)
+{
+    if (!m_alignmentCoarseController || !isValidCameraIndex(cameraIndex)) {
+        return;
+    }
+    if (m_alignmentLastCoarseSubmitMs[cameraIndex] >= 0 &&
+        nowMs - m_alignmentLastCoarseSubmitMs[cameraIndex] < m_alignmentCoarseSubmitIntervalMs) {
+        return;
+    }
+    m_alignmentLastCoarseSubmitMs[cameraIndex] = nowMs;
+
+    m_alignmentCoarseController->submitFrame(cameraIndex,
+                                             packet.image,
+                                             currentInitialStarDetectionConfig(),
+                                             buildCoarseAlignmentConfig(),
+                                             m_alignmentSession.solveGeneration(),
+                                             packet.frameId,
+                                             nowMs);
+}
+
+void DIMM::onCoarseAlignmentEstimateReady(CoarseAlignmentEstimate estimate)
+{
+    if (estimate.generation != m_alignmentSession.solveGeneration() ||
+        !isValidCameraIndex(estimate.cameraIndex) ||
+        m_captureState != CaptureState::Alignment ||
+        !m_alignmentCoarseActive) {
+        return;
+    }
+
+    m_alignmentCoarseEstimates[estimate.cameraIndex] = estimate;
+    updateCoarseAlignmentOverlay(estimate.cameraIndex);
+
+    UiStatusLevel level = UiStatusLevel::Info;
+    if (estimate.valid) {
+        level = UiStatusLevel::Success;
+    } else if (estimate.centerIllConditioned) {
+        level = UiStatusLevel::Warning;
+    }
+
+    setAlignmentSolveLabel(estimate.cameraIndex,
+                           estimate.statusText,
+                           level);
+    setStatusMessage(QStringLiteral("状态: 相机%1 %2")
+                         .arg(estimate.cameraIndex + 1)
+                         .arg(estimate.statusText),
+                     level);
+}
+
+void DIMM::updateCoarseAlignmentOverlay(int cameraIndex)
+{
+    FullFrameCanvas* canvas = cameraIndex == 0 ? m_fullFrameCanvas1 : m_fullFrameCanvas2;
+    if (!canvas || !isValidCameraIndex(cameraIndex)) {
+        return;
+    }
+
+    const CoarseAlignmentEstimate& estimate = m_alignmentCoarseEstimates[cameraIndex];
+    FullFrameCanvas::CoarseDriftOverlay overlay;
+    overlay.enabled = m_alignmentCoarseActive;
+    overlay.valid = estimate.valid;
+    overlay.northCelestialPolePx = estimate.northCelestialPolePx;
+    overlay.frameCenterPx = estimate.frameCenterPx;
+    overlay.adjustmentVectorPx = estimate.adjustmentVectorPx;
+    overlay.offsetPx = estimate.offsetPx;
+    overlay.offsetDeg = estimate.offsetDeg;
+    overlay.medianSpeedPxSec = estimate.medianSpeedPxSec;
+    overlay.medianFittedSpeedPxSec =
+        estimate.medianFittedSpeedPxSec;
+    overlay.centerResidualRmsPx = estimate.centerResidualRmsPx;
+    overlay.detectedCandidateCount =
+        estimate.detectedCandidateCount;
+    overlay.activeTrackCount = estimate.activeTrackCount;
+    overlay.fittedTrackCount = estimate.fittedTrackCount;
+    overlay.usableTrackCount = estimate.usableTrackCount;
+    overlay.requiredTrackCount = estimate.requiredTrackCount;
+    overlay.statusText = estimate.statusText;
+    overlay.diagnosticText = estimate.diagnosticText;
+
+    for (const CoarseAlignmentTrackOverlay& track : estimate.tracks) {
+        FullFrameCanvas::CoarseDriftTrackOverlay drawTrack;
+        drawTrack.pointCount = track.pointCount;
+        drawTrack.startPx = track.startPx;
+        drawTrack.endPx = track.endPx;
+        drawTrack.velocityPxSec = track.velocityPxSec;
+        drawTrack.speedPxSec = track.speedPxSec;
+        drawTrack.durationSec = track.durationSec;
+        drawTrack.displacementPx = track.displacementPx;
+        drawTrack.fitRmsPx = track.fitRmsPx;
+        drawTrack.velocityFitValid = track.velocityFitValid;
+        drawTrack.usedForSolve = track.usedForSolve;
+        drawTrack.rejectionReason = track.rejectionReason;
+        overlay.tracks.append(drawTrack);
+    }
+
+    canvas->setCoarseDriftOverlay(overlay);
 }
 
 double DIMM::fallbackAlignmentOrbitRadiusPx() const
@@ -371,6 +558,12 @@ void DIMM::handleAlignmentFramePacket(int cameraIndex, const CameraFrame& packet
     }
 
     if (!prepareAlignmentFramePreview(cameraIndex, packet)) {
+        return;
+    }
+
+    if (m_alignmentCoarseActive) {
+        submitCoarseAlignmentFrame(cameraIndex, packet, nowMs);
+        finishAlignmentFramePreview(cameraIndex, packet, nowMs);
         return;
     }
 
@@ -547,12 +740,8 @@ PolarisSolverConfig DIMM::buildPolarisSolverConfig() const
     config.minPolarisSnr = m_alignmentMinPolarisSnr;
     config.allowSaturatedPolarisConfirmation = m_alignmentAllowSaturatedPolarisConfirmation;
     const InitialStarDetectionConfig starConfig = currentInitialStarDetectionConfig();
-    config.starThresholdAbsolute = starConfig.thresholdAbsolute >= 0.0
-                                       ? starConfig.thresholdAbsolute
-                                       : -1.0;
     config.starThresholdSigma = starConfig.sigmaThreshold;
     config.starPeakFraction = starConfig.peakFraction;
-    config.starMinimumIntensity = starConfig.minimumIntensity;
     config.minStarAreaPx = starConfig.minArea;
     config.maxStarAreaPx = starConfig.maxArea;
     config.observationEpochYear = decimalYearFromUtc(QDateTime::currentDateTimeUtc());
@@ -595,6 +784,9 @@ void DIMM::onPolarisSolveFinished(PolarisSolveResult result)
         AlignmentController::applyDetectedPolarisSolve(&solveRuntime, result);
         runtime.confirmedPolarisPosition[result.cameraIndex] = result.detectedPolarisPixel;
         runtime.hasConfirmedPolarisPosition[result.cameraIndex] = true;
+        runtime.hasConfirmedPolarisPhase[result.cameraIndex] = false;
+        runtime.confirmedPolarisPhaseRad[result.cameraIndex] = 0.0;
+        runtime.confirmedPolarisTimeUtc[result.cameraIndex] = QDateTime();
         runtime.lastTargetPosition[result.cameraIndex] = result.detectedPolarisPixel;
         runtime.hasLastTargetPosition[result.cameraIndex] = true;
         runtime.pendingInitialCandidateSelectionRequired[result.cameraIndex] = false;
@@ -648,7 +840,9 @@ QVector<InitialStarCandidate> DIMM::collectAlignmentStarCandidates(
     bool hasCurrentSolverResult,
     bool allowGuiCandidateDetection,
     cv::Mat* mono8,
-    double* peakValue) const
+    double* peakValue,
+    double* actualThresholdValue,
+    double* otsuThresholdValue) const
 {
     AlignmentCandidateCollectionInput input;
     input.cameraIndex = cameraIndex;
@@ -658,14 +852,19 @@ QVector<InitialStarCandidate> DIMM::collectAlignmentStarCandidates(
     input.hasCurrentSolverResult = hasCurrentSolverResult;
     input.lastFrameId = m_alignmentSession.camera(cameraIndex).lastFrameId;
     input.allowGuiCandidateDetection = allowGuiCandidateDetection;
-    input.candidateDetector = [mono8](const cv::Mat& grayscale, double* peak) {
+    input.candidateDetector = [mono8, actualThresholdValue, otsuThresholdValue](const cv::Mat& grayscale,
+                                                                                  double* peak) {
         if (mono8) {
-            *mono8 = ImageUtils::normalizeMono8Frame(grayscale);
+            *mono8 = grayscale;
         }
         if (grayscale.empty()) {
             return QVector<InitialStarCandidate>();
         }
-        QVector<InitialStarCandidate> candidates = detectInitialStarCandidates(grayscale, peak);
+        QVector<InitialStarCandidate> candidates =
+            detectInitialStarCandidates(grayscale,
+                                        peak,
+                                        actualThresholdValue,
+                                        otsuThresholdValue);
         if (!candidates.isEmpty()) {
             return candidates;
         }
@@ -702,11 +901,9 @@ bool DIMM::handleAlignmentCandidateSelection(
     const bool manualSelectionRequested = m_alignmentSession.camera(cameraIndex).selectionRequested;
     const bool hadConfirmedPolarisBeforeSelection =
         runtime.hasConfirmedPolarisPosition[cameraIndex];
-    QPointF preferredTarget;
     InitialStarSelection selection = selectAlignmentInitialCandidate(cameraIndex,
                                                                     candidates,
-                                                                    manualSelectionRequested,
-                                                                    &preferredTarget);
+                                                                    manualSelectionRequested);
     runtime.pendingInitialCandidateSelectionRequired[cameraIndex] =
         selection.requiresUserSelection;
     if (!selection.selected && selection.requiresUserSelection && !manualSelectionRequested) {
@@ -719,7 +916,6 @@ bool DIMM::handleAlignmentCandidateSelection(
                                               targetCanvas,
                                               overlay,
                                               candidates,
-                                              preferredTarget,
                                               &selection)) {
         return false;
     }
@@ -785,6 +981,8 @@ void DIMM::updateAlignmentOverlay(int cameraIndex, const CameraFrame& packet)
     const PolarisSolveResult& solved = cameraState.solveResult;
     auto& solveRuntime = cameraState.solveRuntime;
     const bool hasCurrentSolverResult = solved.generation == m_alignmentSession.solveGeneration();
+    auto& runtime = m_liveRuntime;
+    const QDateTime simulationNowUtc = QDateTime::currentDateTimeUtc();
     AlignmentUiPresenter::OverlayBuildInput overlayInput;
     overlayInput.frameSize = QSize(frame.cols, frame.rows);
     overlayInput.fallbackOrbitRadiusPx = alignmentOrbitRadiusPx();
@@ -796,18 +994,75 @@ void DIMM::updateAlignmentOverlay(int cameraIndex, const CameraFrame& packet)
     overlayInput.solveState = solveRuntime.state;
     overlayInput.solved = &solved;
     overlayInput.hasCurrentSolverResult = hasCurrentSolverResult;
+    overlayInput.hasConfirmedPolarisForSimulation =
+        m_captureState == CaptureState::Alignment &&
+        runtime.hasConfirmedPolarisPosition[cameraIndex];
+    overlayInput.confirmedPolarisForSimulation =
+        runtime.confirmedPolarisPosition[cameraIndex];
+    overlayInput.confirmedPolarisTimeUtc =
+        runtime.confirmedPolarisTimeUtc[cameraIndex];
+    overlayInput.hasSimulationPhase =
+        runtime.hasConfirmedPolarisPhase[cameraIndex];
+    overlayInput.simulationPhaseAtConfirmationRad =
+        runtime.confirmedPolarisPhaseRad[cameraIndex];
+    overlayInput.simulationNowUtc = simulationNowUtc;
     FullFrameCanvas::AlignmentOverlay overlay =
         AlignmentUiPresenter::buildAlignmentOverlay(overlayInput);
 
-    auto& runtime = m_liveRuntime;
+    const auto updateCamera2DerivedOrbitCenter = [&]() {
+        if (cameraIndex != 1 ||
+            !runtime.hasConfirmedPolarisPosition[1] ||
+            !runtime.hasConfirmedPolarisPhase[0] ||
+            !runtime.confirmedPolarisTimeUtc[0].isValid() ||
+            overlay.orbitRadiusPx <= 0.0) {
+            return;
+        }
+
+        const double sharedPhase =
+            PolarisTrajectory::advancedPhase(
+                runtime.confirmedPolarisPhaseRad[0],
+                static_cast<double>(runtime.confirmedPolarisTimeUtc[0].secsTo(simulationNowUtc)));
+        overlay.orbitCenter =
+            PolarisTrajectory::deriveCenterFromPhase(
+                runtime.confirmedPolarisPosition[1],
+                overlay.orbitRadiusPx,
+                sharedPhase);
+        overlay.orbitSource = QStringLiteral("相机1相位推导");
+    };
+
+    const auto refreshSimulatedCurrentPolaris = [&]() {
+        if (m_captureState != CaptureState::Alignment ||
+            !runtime.hasConfirmedPolarisPosition[cameraIndex] ||
+            !runtime.hasConfirmedPolarisPhase[cameraIndex] ||
+            !runtime.confirmedPolarisTimeUtc[cameraIndex].isValid() ||
+            overlay.orbitRadiusPx <= 0.0) {
+            overlay.hasSimulatedCurrentPolaris = false;
+            return;
+        }
+
+        const double phase =
+            PolarisTrajectory::advancedPhase(
+                runtime.confirmedPolarisPhaseRad[cameraIndex],
+                static_cast<double>(
+                    runtime.confirmedPolarisTimeUtc[cameraIndex].secsTo(simulationNowUtc)));
+        overlay.hasSimulatedCurrentPolaris = true;
+        overlay.simulatedCurrentPolarisPosition =
+            PolarisTrajectory::clockwisePoint(overlay.orbitCenter,
+                                              overlay.orbitRadiusPx,
+                                              phase);
+        overlay.simulatedCurrentPolarisLabel =
+            simulationNowUtc.toLocalTime().toString(QStringLiteral("HH:mm"));
+    };
+
     QPointF star;
     double peakValue = 0.0;
     cv::Mat mono8;
+    double detectedActualThreshold = -1.0;
+    double detectedOtsuThreshold = -1.0;
     const bool manualSelectionRequested =
         m_alignmentSession.camera(cameraIndex).selectionRequested;
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     const bool shouldRefreshCandidateDetection =
-        manualSelectionRequested ||
         m_alignmentCachedCandidates[cameraIndex].isEmpty() ||
         m_alignmentLastCandidateDetectionMs[cameraIndex] < 0 ||
         nowMs - m_alignmentLastCandidateDetectionMs[cameraIndex] >=
@@ -821,10 +1076,38 @@ void DIMM::updateAlignmentOverlay(int cameraIndex, const CameraFrame& packet)
                                                     hasCurrentSolverResult,
                                                     allowGuiCandidateDetection,
                                                     &mono8,
-                                                    &peakValue);
+                                                    &peakValue,
+                                                    &detectedActualThreshold,
+                                                    &detectedOtsuThreshold);
+        candidates = stabilizeInitialCandidates(cameraIndex, candidates);
         m_alignmentLastCandidateDetectionMs[cameraIndex] = nowMs;
     } else {
         candidates = m_alignmentCachedCandidates[cameraIndex];
+    }
+
+    if (detectedOtsuThreshold >= 0.0) {
+        m_alignmentOtsuThreshold[cameraIndex] = detectedOtsuThreshold;
+        m_alignmentActualThreshold[cameraIndex] = detectedActualThreshold >= 0.0
+                                                       ? detectedActualThreshold
+                                                       : detectedOtsuThreshold;
+    } else if (m_alignmentOtsuThreshold[cameraIndex] < 0.0) {
+        const cv::Mat grayscale = ImageUtils::grayscaleDetectionFrame(frame);
+        const InitialStarDetectionConfig starConfig = currentInitialStarDetectionConfig();
+        const StarSegmentation::ForegroundSegmentation segmentation =
+            StarSegmentation::segmentForegroundOtsu(grayscale,
+                                                     starConfig.sigmaThreshold,
+                                                     starConfig.peakFraction);
+        if (segmentation.valid) {
+            m_alignmentOtsuThreshold[cameraIndex] = segmentation.otsuThreshold;
+            m_alignmentActualThreshold[cameraIndex] = segmentation.actualThreshold;
+        }
+    }
+    if (m_alignmentOtsuThreshold[cameraIndex] >= 0.0) {
+        setFullFrameThresholdDisplay(cameraIndex,
+                                     m_alignmentOtsuThreshold[cameraIndex],
+                                     m_alignmentActualThreshold[cameraIndex] >= 0.0
+                                         ? m_alignmentActualThreshold[cameraIndex]
+                                         : m_alignmentOtsuThreshold[cameraIndex]);
     }
     if (!candidates.isEmpty()) {
         m_alignmentCachedCandidates[cameraIndex] = candidates;
@@ -855,6 +1138,20 @@ void DIMM::updateAlignmentOverlay(int cameraIndex, const CameraFrame& packet)
                                                    &star,
                                                    &peakValue);
     }
+
+    updateCamera2DerivedOrbitCenter();
+
+    if (runtime.hasConfirmedPolarisPosition[cameraIndex] &&
+        !runtime.hasConfirmedPolarisPhase[cameraIndex] &&
+        overlay.orbitRadiusPx > 0.0) {
+        runtime.confirmedPolarisPhaseRad[cameraIndex] =
+            PolarisTrajectory::phaseFromClockwisePoint(
+                overlay.orbitCenter,
+                runtime.confirmedPolarisPosition[cameraIndex]);
+        runtime.hasConfirmedPolarisPhase[cameraIndex] = true;
+        runtime.confirmedPolarisTimeUtc[cameraIndex] = simulationNowUtc;
+    }
+    refreshSimulatedCurrentPolaris();
 
     AlignmentUiPresenter::applyConfirmedPolarisToOverlay(
         runtime.hasConfirmedPolarisPosition[cameraIndex],
