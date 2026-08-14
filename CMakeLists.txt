@@ -26,7 +26,6 @@ list(APPEND srcs
     src/DIMM.Ui.cpp
     src/DIMM.LiveRoi.cpp
     src/DIMM.Alignment.cpp
-    src/DIMM.Simulation.cpp
     src/DIMM.Results.cpp
     src/DIMM.CommCamera.cpp
     src/DIMM.AutoExposure.cpp

@@ -3,7 +3,6 @@
 #include "CameraManager.h"
 
 #include <algorithm>
-#include <limits>
 
 #include <QTime>
 
@@ -19,18 +18,6 @@ double medianOfSamples(QVector<double> samples)
         return samples[middle];
     }
     return (samples[middle - 1] + samples[middle]) * 0.5;
-}
-
-double deterministicUnitNoise(int frameIndex, int salt)
-{
-    quint32 x = static_cast<quint32>(frameIndex) * 1664525U +
-               static_cast<quint32>(salt) * 1013904223U + 0x9e3779b9U;
-    x ^= x >> 16;
-    x *= 2246822519U;
-    x ^= x >> 13;
-    x *= 3266489917U;
-    x ^= x >> 16;
-    return (static_cast<double>(x) / static_cast<double>(std::numeric_limits<quint32>::max())) * 2.0 - 1.0;
 }
 
 double decimalYearFromUtc(const QDateTime& utcDateTime)
