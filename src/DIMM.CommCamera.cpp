@@ -6,6 +6,7 @@
 #include "DimmRuntimeHelpers.h"
 #include "FullFrameStarDetector.h"
 #include "ImageProcessor.h"
+#include "LivePreviewPolicy.h"
 #include "PulseGeneratorManager.h"
 #include "SettingsDialog.h"
 
@@ -17,6 +18,23 @@
 #include <QSize>
 #include <QTimer>
 #include <QVector>
+
+namespace {
+
+LivePreviewPolicy::StartupPhase livePreviewStartupPhase(DIMM::LiveStartupPhase phase)
+{
+    switch (phase) {
+    case DIMM::LiveStartupPhase::LocatePair:
+        return LivePreviewPolicy::StartupPhase::LocatePair;
+    case DIMM::LiveStartupPhase::Tracking:
+        return LivePreviewPolicy::StartupPhase::Tracking;
+    case DIMM::LiveStartupPhase::None:
+    default:
+        return LivePreviewPolicy::StartupPhase::None;
+    }
+}
+
+} // namespace
 
 void DIMM::onConnectAll()
 {
@@ -87,6 +105,15 @@ void DIMM::onCameraConnected(int index, QString serial, QString model)
 void DIMM::onCameraDisconnected(int index)
 {
     Q_UNUSED(index);
+    if (m_captureState == CaptureState::Live &&
+        m_configTriggerMode != 0 &&
+        !m_liveStartupConfirmed) {
+        handleHardwareTriggerStartupFailure(
+            QStringLiteral(
+                "硬件触发启动期间相机%1断开")
+                .arg(index + 1));
+        return;
+    }
     m_connectingCameras = false;
     refreshCameraUi();
     refreshActionStates();
@@ -160,6 +187,10 @@ void DIMM::handleLiveFramePacket(int cameraIndex, const CameraFrame& packet)
         m_lastAcceptedContinuousFrameMs[cameraIndex] = frameReceivedMs;
     }
 
+    if (cameraIndex >= 0 && cameraIndex < 2) {
+        m_lastAcceptedLiveFrameMs[cameraIndex] = frameReceivedMs;
+    }
+
     auto& runtime = activeRuntime();
     const bool frameLooksLikeHardwareRoi =
         frame.cols <= kFixedRoiSize && frame.rows <= kFixedRoiSize;
@@ -177,12 +208,10 @@ void DIMM::handleLiveFramePacket(int cameraIndex, const CameraFrame& packet)
     }
 
     ++runtime.frameCount;
-    if (m_configTriggerMode != 0 &&
-        (m_statusText.contains(QStringLiteral("Timed out waiting for pulse-board response."),
-                               Qt::CaseInsensitive) ||
-         m_statusText.contains(QStringLiteral("脉冲板应答超时")))) {
-        setStatusMessage(QStringLiteral("状态: 已收到硬件触发图像帧，脉冲板未返回串口应答但采集继续"),
-                         UiStatusLevel::Warning);
+    if (m_configTriggerMode != 0) {
+        recordHardwareTriggerStartupFrame(
+            cameraIndex,
+            frameLooksLikeHardwareRoi);
     }
     if (runtime.frameCount == 1 && m_liveStartupPhase == LiveStartupPhase::Tracking) {
         setStatusMessage(QStringLiteral("状态: 实时采集中，已收到图像帧，预览按30秒刷新"),
@@ -205,8 +234,9 @@ void DIMM::handleLiveFramePacket(int cameraIndex, const CameraFrame& packet)
         FullFrameCanvas* targetCanvas = cameraIndex == 0 ? m_fullFrameCanvas1 : m_fullFrameCanvas2;
         const bool canUpdateFullFramePreview =
             m_captureState == CaptureState::Live
-                ? (!frameLooksLikeHardwareRoi &&
-                   m_liveStartupPhase == LiveStartupPhase::Tracking)
+                ? LivePreviewPolicy::shouldUpdateLiveFullFramePreview(
+                      livePreviewStartupPhase(m_liveStartupPhase),
+                      frameLooksLikeHardwareRoi)
                 : true;
         if (targetCanvas && canUpdateFullFramePreview && shouldRefreshPreview) {
             targetCanvas->setImage(frame);
@@ -243,72 +273,250 @@ void DIMM::handleLiveFramePacket(int cameraIndex, const CameraFrame& packet)
     }
 }
 
+void DIMM::beginHardwareTriggerStartupStage(
+    HardwareTriggerStartupStage stage)
+{
+    m_hardwareTriggerStartupStage = stage;
+
+    if (stage ==
+            HardwareTriggerStartupStage::
+                WaitingFullFramePair ||
+        stage ==
+            HardwareTriggerStartupStage::
+                WaitingRoiTrackingPair) {
+        m_liveStartupConfirmed = false;
+    }
+
+    const auto& runtime = activeRuntime();
+
+    for (int cameraIndex = 0;
+         cameraIndex < 2;
+         ++cameraIndex) {
+        m_hardwareTriggerStageBaselineFrameCount[cameraIndex] =
+            runtime.frameCountPerCamera[cameraIndex];
+
+        m_hardwareTriggerStageFrameSeen[cameraIndex] =
+            false;
+    }
+
+    scheduleHardwareTriggerStartupCheck();
+}
+
+void DIMM::recordHardwareTriggerStartupFrame(
+    int cameraIndex,
+    bool frameLooksLikeHardwareRoi)
+{
+    if (cameraIndex < 0 ||
+        cameraIndex >= 2 ||
+        m_captureState != CaptureState::Live ||
+        m_configTriggerMode == 0) {
+        return;
+    }
+
+    const auto stage =
+        m_hardwareTriggerStartupStage;
+
+    if (stage != HardwareTriggerStartupStage::WaitingFullFramePair &&
+        stage != HardwareTriggerStartupStage::WaitingRoiTrackingPair) {
+        return;
+    }
+
+    const auto& runtime = activeRuntime();
+
+    const bool isNewStageFrame =
+        runtime.frameCountPerCamera[cameraIndex] >
+        m_hardwareTriggerStageBaselineFrameCount[cameraIndex];
+
+    if (!isNewStageFrame) {
+        return;
+    }
+
+    if (stage ==
+        HardwareTriggerStartupStage::WaitingFullFramePair) {
+        // 全画幅阶段不能使用 64×64 ROI 帧完成确认。
+        if (frameLooksLikeHardwareRoi) {
+            return;
+        }
+
+        m_hardwareTriggerStageFrameSeen[cameraIndex] = true;
+    } else {
+        // ROI 高频阶段必须收到 64×64 或更小的硬件 ROI 图像。
+        if (!frameLooksLikeHardwareRoi) {
+            return;
+        }
+
+        m_hardwareTriggerStageFrameSeen[cameraIndex] = true;
+    }
+
+    confirmHardwareTriggerStartupIfReady();
+}
+
 void DIMM::scheduleHardwareTriggerStartupCheck()
 {
     if (!m_hardwareTriggerStartupTimer) {
         return;
     }
-    m_hardwareTriggerStartupTimer->start(2500);
+
+    int timeoutMs =
+        kHardwareTriggerFirstFrameTimeoutMs;
+
+    if (m_hardwareTriggerStartupStage ==
+        HardwareTriggerStartupStage::WaitingRoiTrackingPair) {
+        timeoutMs =
+            kRoiTrackingFirstFrameTimeoutMs;
+    }
+
+    m_hardwareTriggerStartupTimer->start(timeoutMs);
+}
+
+void DIMM::confirmHardwareTriggerStartupIfReady()
+{
+    if (m_captureState != CaptureState::Live ||
+        m_configTriggerMode == 0) {
+        return;
+    }
+
+    const auto stage =
+        m_hardwareTriggerStartupStage;
+
+    if (stage != HardwareTriggerStartupStage::WaitingFullFramePair &&
+        stage != HardwareTriggerStartupStage::WaitingRoiTrackingPair) {
+        return;
+    }
+
+    const bool bothReady =
+        m_hardwareTriggerStageFrameSeen[0] &&
+        m_hardwareTriggerStageFrameSeen[1];
+
+    if (!bothReady) {
+        return;
+    }
+
+    if (m_hardwareTriggerStartupTimer) {
+        m_hardwareTriggerStartupTimer->stop();
+    }
+
+    const bool hadPulseBoardTimeout =
+        m_pulseBoardResponseTimedOut;
+
+    m_pulseBoardResponseTimedOut = false;
+    m_lastPulseBoardTimeoutStatusMs = -1;
+
+    if (stage ==
+        HardwareTriggerStartupStage::WaitingFullFramePair) {
+        /*
+         * 这里只确认低频全画幅触发有效。
+         * 不能将整个采集标记为最终启动成功。
+         */
+        m_hardwareTriggerStartupStage =
+            HardwareTriggerStartupStage::None;
+
+        if (hadPulseBoardTimeout) {
+            setStatusMessage(
+                QStringLiteral(
+                    "状态: 脉冲板未返回全画幅触发应答，但双相机已收到新的全画幅图像，继续定位"),
+                UiStatusLevel::Warning);
+        } else {
+            setStatusMessage(
+                QStringLiteral(
+                    "状态: 双相机全画幅低频触发已确认，继续进行星点定位"),
+                UiStatusLevel::Success);
+        }
+
+        return;
+    }
+
+    /*
+     * 只有 ROI 高频阶段双相机都收到新 ROI 帧，
+     * 才算完整启动成功。
+     */
+    m_hardwareTriggerStartupStage =
+        HardwareTriggerStartupStage::Running;
+
+    m_liveStartupConfirmed = true;
+    m_liveStartupRecoveryInProgress = false;
+    m_liveStartupRetryCount = 0;
+
+    if (m_liveStartupRetryTimer) {
+        m_liveStartupRetryTimer->stop();
+    }
+
+    if (m_liveStartupOrigin ==
+        LiveStartupOrigin::AutoAcquisition) {
+        setAutoAcquisitionStatus(
+            QStringLiteral(
+                "自动采集启动成功，双相机 ROI 高频触发已确认"),
+            UiStatusLevel::Success,
+            QStringLiteral("auto-start-confirmed"));
+    }
+
+    if (hadPulseBoardTimeout) {
+        setStatusMessage(
+            QStringLiteral(
+                "状态: 脉冲板未返回 ROI 高频切换应答，但双相机已收到新的 ROI 图像，继续采集"),
+            UiStatusLevel::Warning);
+    } else {
+        setStatusMessage(
+            QStringLiteral(
+                "状态: 双相机 ROI 高频触发确认成功，实时采集已稳定运行"),
+            UiStatusLevel::Success);
+    }
 }
 
 void DIMM::checkHardwareTriggerStartup()
 {
-    if (m_captureState != CaptureState::Live || m_configTriggerMode == 0) {
+    if (m_captureState != CaptureState::Live ||
+        m_configTriggerMode == 0) {
         return;
     }
 
-    const auto& runtime = activeRuntime();
-    const bool cam1Ready = runtime.frameCountPerCamera[0] > 0;
-    const bool cam2Ready = runtime.frameCountPerCamera[1] > 0;
-    if (cam1Ready && cam2Ready) {
+    const auto stage =
+        m_hardwareTriggerStartupStage;
+
+    if (stage != HardwareTriggerStartupStage::WaitingFullFramePair &&
+        stage != HardwareTriggerStartupStage::WaitingRoiTrackingPair) {
+        return;
+    }
+
+    if (m_hardwareTriggerStageFrameSeen[0] &&
+        m_hardwareTriggerStageFrameSeen[1]) {
+        confirmHardwareTriggerStartupIfReady();
         return;
     }
 
     QString detail;
-    if (!cam1Ready && !cam2Ready) {
-        detail = QStringLiteral("两台相机在启动后 2.5 秒内都没有收到首帧。请优先检查触发线、TriggerSource(Line0)、脉冲是否已实际输出，以及脉冲是否发生在相机进入等待态之后");
-    } else if (!cam1Ready) {
-        detail = QStringLiteral("只有相机2收到首帧，相机仍未触发。请检查相机对应的触发接线、网口带宽和硬件触发输入");
+
+    if (stage ==
+        HardwareTriggerStartupStage::WaitingFullFramePair) {
+        if (!m_hardwareTriggerStageFrameSeen[0] &&
+            !m_hardwareTriggerStageFrameSeen[1]) {
+            detail = QStringLiteral(
+                "全画幅低频触发后，两台相机均未收到新的全画幅图像");
+        } else if (!m_hardwareTriggerStageFrameSeen[0]) {
+            detail = QStringLiteral(
+                "全画幅低频触发后，只有相机2收到新图像，相机1未触发");
+        } else {
+            detail = QStringLiteral(
+                "全画幅低频触发后，只有相机1收到新图像，相机2未触发");
+        }
     } else {
-        detail = QStringLiteral("只有相机1收到首帧，相机仍未触发。请检查相机对应的触发接线、网口带宽和硬件触发输入");
+        if (!m_hardwareTriggerStageFrameSeen[0] &&
+            !m_hardwareTriggerStageFrameSeen[1]) {
+            detail = QStringLiteral(
+                "ROI 高频触发切换后，两台相机均未收到新的 64×64 ROI 图像");
+        } else if (!m_hardwareTriggerStageFrameSeen[0]) {
+            detail = QStringLiteral(
+                "ROI 高频触发切换后，只有相机2收到新的 ROI 图像，相机1未触发");
+        } else {
+            detail = QStringLiteral(
+                "ROI 高频触发切换后，只有相机1收到新的 ROI 图像，相机2未触发");
+        }
     }
 
-    setStatusMessage(QStringLiteral("硬件触发首帧超时: %1").arg(detail), UiStatusLevel::Warning);
+    handleHardwareTriggerStartupFailure(detail);
 }
 
 void DIMM::onCommCommand(uint8_t cmd)
 {
-    using namespace CommProtocol;
-
-    switch (cmd) {
-    case CMD_START_REPORT:
-        if (!isLiveCaptureActive()) {
-            m_commManager->sendAck(CMD_START_REPORT, 1);
-            m_reporting = false;
-            if (m_reportTimer) {
-                m_reportTimer->stop();
-            }
-            setStatusMessage(QStringLiteral("当前为模拟空闲模式，已拒绝上报请求"), UiStatusLevel::Warning);
-            refreshStatusUi();
-            return;
-        }
-        m_commManager->sendAck(CMD_START_REPORT, 0);
-        m_reporting = true;
-        m_reportTimer->start();
-        setStatusMessage(QStringLiteral("上位机请求开始上报"), UiStatusLevel::Success);
-        break;
-    case CMD_STOP_REPORT:
-        m_commManager->sendAck(CMD_STOP_REPORT, 0);
-        m_reporting = false;
-        m_reportTimer->stop();
-        setStatusMessage(QStringLiteral("上位机请求停止上报"), UiStatusLevel::Warning);
-        break;
-    case CMD_QUERY_STATUS:
-        reportDeviceStatus();
-        break;
-    default:
-        qDebug() << "[DIMM] Unknown command:" << QString::number(cmd, 16);
-        break;
-    }
-    refreshStatusUi();
+    Q_UNUSED(cmd);
 }

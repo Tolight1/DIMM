@@ -77,8 +77,7 @@ public:
     static InitialStarSelection selectInitialCandidate(
         const AlignmentCandidateRuntimeAccess& runtime,
         const QVector<InitialStarCandidate>& candidates,
-        bool manualSelectionRequested,
-        QPointF* preferredTarget);
+        bool manualSelectionRequested);
     static void recordSelectedCandidate(AlignmentCandidateRuntimeAccess runtime,
                                         const QPointF& star,
                                         int selectedCandidateIndex);

@@ -2,15 +2,127 @@
 
 #include "CameraManager.h"
 #include "CommManager.h"
+#include "CommProtocol.h"
 #include "DimmRuntimeHelpers.h"
 #include "ImageProcessor.h"
 #include "PathUtils.h"
+#include "PulseGeneratorManager.h"
 #include "SettingsDialog.h"
 
 #include <QDateTime>
 #include <QDir>
 #include <QStringList>
 #include <QVector>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+
+namespace {
+
+float finiteFloatOrNaN(double value, bool valid)
+{
+    return valid && std::isfinite(value)
+               ? static_cast<float>(value)
+               : std::numeric_limits<float>::quiet_NaN();
+}
+
+}  // namespace
+
+std::uint32_t DIMM::monitoringDeviceStatus(const CaptureRuntimeContext& runtime,
+                                            qint64 nowMs,
+                                            double frameRateHz,
+                                            bool frameRateValid)
+{
+    std::uint32_t status = CommProtocol::DEVICE_STATUS_NORMAL;
+
+    const double timeoutRateHz = frameRateValid
+                                     ? frameRateHz
+                                     : (m_configTriggerMode == 0
+                                            ? m_configContinuousFrameRateHz
+                                            : m_pulseGeneratorFrequencyHz);
+    const double safeTimeoutRateHz =
+        std::max(0.1, std::isfinite(timeoutRateHz) ? timeoutRateHz : 0.1);
+    const qint64 expectedFrameIntervalMs =
+        std::max<qint64>(1, static_cast<qint64>(std::ceil(1000.0 / safeTimeoutRateHz)));
+    const qint64 frameTimeoutMs = std::max<qint64>(1000, expectedFrameIntervalMs * 3);
+
+    for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+        const bool cameraOpen = m_cameraManager && m_cameraManager->isOpen(cameraIndex);
+        if (!cameraOpen) {
+            status |= cameraIndex == 0 ? CommProtocol::DEVICE_STATUS_CAMERA_A_CONNECTION
+                                       : CommProtocol::DEVICE_STATUS_CAMERA_B_CONNECTION;
+        }
+
+        const bool frameTimedOut =
+            !m_cameraManager ||
+            !m_cameraManager->isStreaming(cameraIndex) ||
+            m_lastAcceptedLiveFrameMs[cameraIndex] < 0 ||
+            nowMs - m_lastAcceptedLiveFrameMs[cameraIndex] > frameTimeoutMs;
+        if (frameTimedOut) {
+            status |= cameraIndex == 0 ? CommProtocol::DEVICE_STATUS_CAMERA_A_CAPTURE
+                                       : CommProtocol::DEVICE_STATUS_CAMERA_B_CAPTURE;
+        }
+
+        const bool noStar = !runtime.hasValidCentroid[cameraIndex];
+        if (noStar) {
+            status |= cameraIndex == 0 ? CommProtocol::DEVICE_STATUS_CAMERA_A_NO_STAR
+                                       : CommProtocol::DEVICE_STATUS_CAMERA_B_NO_STAR;
+        } else if (std::isfinite(runtime.peakBrightness[cameraIndex]) &&
+                   std::isfinite(m_autoExposureConfig.targetPeakLowDn) &&
+                   runtime.peakBrightness[cameraIndex] < m_autoExposureConfig.targetPeakLowDn) {
+            status |= cameraIndex == 0
+                          ? CommProtocol::DEVICE_STATUS_CAMERA_A_LOW_BRIGHTNESS
+                          : CommProtocol::DEVICE_STATUS_CAMERA_B_LOW_BRIGHTNESS;
+        }
+
+        const double requestedExposureUs = m_cameraExposureUs[cameraIndex];
+        bool exposureInvalid = !std::isfinite(requestedExposureUs) || requestedExposureUs <= 0.0;
+        if (cameraOpen && m_cameraManager) {
+            const double actualExposureUs = m_cameraManager->getExposure(cameraIndex);
+            const double exposureToleranceUs =
+                std::max(1.0, std::abs(requestedExposureUs) * 0.10);
+            exposureInvalid = exposureInvalid ||
+                              !std::isfinite(actualExposureUs) ||
+                              actualExposureUs <= 0.0 ||
+                              std::abs(actualExposureUs - requestedExposureUs) >
+                                  exposureToleranceUs;
+        }
+        if (exposureInvalid) {
+            status |= CommProtocol::DEVICE_STATUS_EXPOSURE;
+        }
+    }
+
+    if (m_configTriggerMode != 0 &&
+        (m_pulseBoardResponseTimedOut ||
+         (m_pulseGeneratorEnabled &&
+          (!m_pulseGenerator || !m_pulseGenerator->isRunning())))) {
+        status |= CommProtocol::DEVICE_STATUS_TRIGGER;
+    }
+
+    if (m_environmentSensorConfig.enabled && !m_latestEnvironment.valid) {
+        status |= CommProtocol::DEVICE_STATUS_ENVIRONMENT_SENSOR;
+    }
+
+    if (!frameRateValid) {
+        status |= CommProtocol::DEVICE_STATUS_FRAME_RATE;
+    }
+
+    const qint64 atmosphereAgeMs = runtime.latestAtmosphereTimestampMs > 0
+                                       ? nowMs - static_cast<qint64>(
+                                                     runtime.latestAtmosphereTimestampMs)
+                                       : std::numeric_limits<qint64>::max();
+    if (!runtime.hasValidAtmosphere || atmosphereAgeMs < 0 || atmosphereAgeMs > 5000) {
+        status |= CommProtocol::DEVICE_STATUS_MEASUREMENT;
+    }
+
+    if (!m_resultWriter.isOpen()) {
+        status |= CommProtocol::DEVICE_STATUS_DATA_SAVE;
+    }
+
+    return status;
+}
 
 void DIMM::initResultFile()
 {
@@ -70,11 +182,13 @@ void DIMM::initResultFile()
                        "ae_reason,ae_camera1_reason,ae_camera2_reason,"
                        "ae_sequence_id,ae_target_exposure_us,"
                        "ae_camera1_target_exposure_us,ae_camera2_target_exposure_us,"
-                       "ae_frames_since_adjust,"
-                       "r0_cm,seeing_arcsec,theta0_arcsec,tau0_ms,"
+                       "ae_frames_since_adjust,ae_ui_state,ae_adjust_direction,"
+                       "ae_cooldown_remaining_ms,ae_adjustment_session_active,ae_step_us,"
+                       "r0_cm,seeing_arcsec,theta0_arcsec,tau0_ms,tau0_state,tau0_resolution_ms,"
                        "var_longitudinal_px2,var_transverse_px2,"
                        "sigma_longitudinal_rad2,sigma_transverse_rad2,"
                        "r0_longitudinal_cm,r0_transverse_cm,variance_sample_count,"
+                       "r0_partial_window,r0_risk_flag,r0_target_sample_count,r0_risk_reason,"
                        "sync_residual_us,sync_jitter_us,sync_jitter_avg_us,sync_jitter_max_us,"
                        "env_temperature_c,env_humidity_rh,env_pressure_hpa,env_sensor_valid,"
                        "comm_connected,reporting_enabled")
@@ -136,7 +250,7 @@ void DIMM::initDetailResultFile()
             .arg(pixelUm, 0, 'f', 3);
     QString error;
     if (!m_detailResultWriter.open(config, &error)) {
-        setStatusMessage(QStringLiteral("璐ㄥ績鏄庣粏鏂囦欢鍒涘缓澶辫。"), UiStatusLevel::Error);
+        setStatusMessage(QStringLiteral("质心明细文件创建失败"), UiStatusLevel::Error);
     }
 }
 
@@ -207,6 +321,25 @@ void DIMM::saveResultRow(int frame)
     const qint64 msSinceLastRoiUpdate = m_lastRoiUpdateMs >= 0 ? nowMs - m_lastRoiUpdateMs : -1;
     const QString roiUpdateReason = csvSafeField(m_lastRoiUpdateReason);
 
+    const AtmosphericParams& atmosphere = runtime.latestAtmosphere;
+
+    const QString tau0ValueText =
+        atmosphere.tau0Valid
+            ? QString::number(atmosphere.tau0, 'f', 3)
+            : QString();
+
+    const QString tau0StateText =
+        !atmosphere.tau0Valid
+            ? QStringLiteral("invalid")
+            : (atmosphere.tau0UnderResolved
+                   ? QStringLiteral("under_resolved")
+                   : QStringLiteral("resolved"));
+
+    const QString tau0ResolutionText =
+        atmosphere.tau0Valid
+            ? QString::number(atmosphere.tau0ResolutionMs, 'f', 3)
+            : QString();
+
     const QStringList fields = {
         QDateTime::currentDateTime().toString(Qt::ISODateWithMs),
         captureModeName(),
@@ -250,10 +383,17 @@ void DIMM::saveResultRow(int frame)
         QString::number(m_cameraAutoExposureTargetExposureUs[0]),
         QString::number(m_cameraAutoExposureTargetExposureUs[1]),
         QString::number(m_autoExposureFramesSinceAdjust),
+        csvSafeField(autoExposureUiStatusText()),
+        csvSafeField(autoExposureAdjustDirectionText()),
+        QString::number(m_autoExposureCooldownRemainingMs),
+        m_autoExposureAdjustmentSessionActive ? QStringLiteral("1") : QStringLiteral("0"),
+        QString::number(m_autoExposureConfig.autoExposureStepUs, 'f', 0),
         QString::number(runtime.latestAtmosphere.r0, 'f', 3),
         QString::number(runtime.latestAtmosphere.seeing, 'f', 3),
         QString::number(runtime.latestAtmosphere.theta0, 'f', 3),
-        QString::number(runtime.latestAtmosphere.tau0, 'f', 3),
+        tau0ValueText,
+        tau0StateText,
+        tau0ResolutionText,
         QString::number(runtime.latestAtmosphere.longitudinalVariancePx2, 'g', 12),
         QString::number(runtime.latestAtmosphere.transverseVariancePx2, 'g', 12),
         QString::number(runtime.latestAtmosphere.longitudinalVarianceRad2, 'g', 12),
@@ -261,6 +401,10 @@ void DIMM::saveResultRow(int frame)
         QString::number(runtime.latestAtmosphere.r0LongitudinalCm, 'f', 3),
         QString::number(runtime.latestAtmosphere.r0TransverseCm, 'f', 3),
         QString::number(runtime.latestAtmosphere.sampleCount),
+        runtime.latestAtmosphere.partialWindow ? QStringLiteral("1") : QStringLiteral("0"),
+        runtime.latestAtmosphere.riskFlag ? QStringLiteral("1") : QStringLiteral("0"),
+        QString::number(runtime.latestAtmosphere.targetSampleCount),
+        csvSafeField(runtime.latestAtmosphere.riskReason),
         QString::number(runtime.latestSyncResidualUs, 'f', 3),
         QString::number(runtime.latestSyncJitterUs, 'f', 3),
         QString::number(runtime.averageSyncJitterUs, 'f', 3),
@@ -469,51 +613,68 @@ void DIMM::reportMeasurement()
     }
 
     const auto& runtime = activeRuntime();
-    const RoiRect roi0 = m_imageProcessor ? m_imageProcessor->getCurrentRoi(0) : RoiRect();
-    const RoiRect roi1 = m_imageProcessor ? m_imageProcessor->getCurrentRoi(1) : RoiRect();
-    m_commManager->sendMeasurement(runtime.latestAtmosphere.r0,
-                                   runtime.latestAtmosphere.seeing,
-                                   runtime.latestAtmosphere.theta0,
-                                   runtime.latestAtmosphere.tau0,
-                                   runtime.centroidX[0],
-                                   runtime.centroidY[0],
-                                   runtime.centroidX[1],
-                                   runtime.centroidY[1],
-                                   runtime.peakBrightness[0],
-                                   runtime.peakBrightness[1],
-                                   roi0.x,
-                                   roi0.y,
-                                   roi0.w,
-                                   roi0.h,
-                                   roi1.x,
-                                   roi1.y,
-                                   roi1.w,
-                                   roi1.h,
-                                   static_cast<uint32_t>(runtime.frameCount));
-}
-
-void DIMM::reportDeviceStatus()
-{
-    if (!m_commConnected || !isLiveCaptureActive()) {
-        return;
+    const float temperature = finiteFloatOrNaN(m_latestEnvironment.temperatureC,
+                                               m_latestEnvironment.valid);
+    const float humidity = finiteFloatOrNaN(m_latestEnvironment.humidityRh,
+                                            m_latestEnvironment.valid);
+    const float pressure = finiteFloatOrNaN(m_latestEnvironment.pressureHpa,
+                                            m_latestEnvironment.valid);
+    const bool atmosphereValid = runtime.hasValidAtmosphere;
+    const float r0 = finiteFloatOrNaN(runtime.latestAtmosphere.r0, atmosphereValid);
+    const float seeing = finiteFloatOrNaN(runtime.latestAtmosphere.seeing, atmosphereValid);
+    const float theta0 = finiteFloatOrNaN(runtime.latestAtmosphere.theta0, atmosphereValid);
+    const float tau0 = finiteFloatOrNaN(
+        runtime.latestAtmosphere.tau0,
+        atmosphereValid && runtime.latestAtmosphere.tau0Valid &&
+            !runtime.latestAtmosphere.tau0UnderResolved);
+    const float peakBrightnessCameraA = finiteFloatOrNaN(
+        runtime.peakBrightness[0],
+        runtime.hasValidCentroid[0]);
+    const float peakBrightnessCameraB = finiteFloatOrNaN(
+        runtime.peakBrightness[1],
+        runtime.hasValidCentroid[1]);
+    double frameRateHz = std::numeric_limits<double>::quiet_NaN();
+    bool frameRateValid = false;
+    if (m_configTriggerMode == 0) {
+        const double cameraAFrameRate = m_lastContinuousFrameRateReadback[0];
+        const double cameraBFrameRate = m_lastContinuousFrameRateReadback[1];
+        const double frameRateTolerance =
+            std::max(0.05, std::abs(m_configContinuousFrameRateHz) * 0.05);
+        frameRateValid = std::isfinite(cameraAFrameRate) && cameraAFrameRate > 0.0 &&
+                         std::isfinite(cameraBFrameRate) && cameraBFrameRate > 0.0 &&
+                         std::abs(cameraAFrameRate - cameraBFrameRate) <= frameRateTolerance;
+        if (frameRateValid) {
+            frameRateHz = (cameraAFrameRate + cameraBFrameRate) * 0.5;
+        }
+    } else {
+        frameRateHz = m_pulseGeneratorFrequencyHz;
+        frameRateValid = std::isfinite(frameRateHz) && frameRateHz > 0.0;
     }
-
-    float temp = 0.0f;
-    float fps = 0.0f;
-    const bool cam0Connected = m_cameraManager->isOpen(0);
-    const bool cam1Connected = m_cameraManager->isOpen(1);
-    if (m_latestEnvironment.valid) {
-        temp = static_cast<float>(m_latestEnvironment.temperatureC);
-    }
-    if (cam0Connected) {
-        fps = static_cast<float>(m_cameraManager->getFrameRate(0));
-    }
-
-    const uint32_t uptimeMs = static_cast<uint32_t>(QDateTime::currentMSecsSinceEpoch()) - m_startTimeMs;
-    m_commManager->sendDeviceStatus(temp,
-                                    fps,
-                                    cam0Connected,
-                                    cam1Connected,
-                                    hasActiveCapture(),
-                                    uptimeMs);
+    const float exposureTimeCameraAUs = finiteFloatOrNaN(
+        m_cameraExposureUs[0],
+        std::isfinite(m_cameraExposureUs[0]) && m_cameraExposureUs[0] > 0.0);
+    const float exposureTimeCameraBUs = finiteFloatOrNaN(
+        m_cameraExposureUs[1],
+        std::isfinite(m_cameraExposureUs[1]) && m_cameraExposureUs[1] > 0.0);
+    const float reportedFrameRateHz = finiteFloatOrNaN(frameRateHz, frameRateValid);
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    const std::uint32_t deviceStatus =
+        monitoringDeviceStatus(runtime, nowMs, frameRateHz, frameRateValid);
+    const quint64 timestampMs = runtime.latestAtmosphereTimestampMs != 0
+                                    ? runtime.latestAtmosphereTimestampMs
+                                    : static_cast<quint64>(nowMs);
+    m_commManager->sendMonitoringFrame(temperature,
+                                       humidity,
+                                       pressure,
+                                       r0,
+                                       seeing,
+                                       theta0,
+                                       tau0,
+                                       peakBrightnessCameraA,
+                                       peakBrightnessCameraB,
+                                       exposureTimeCameraAUs,
+                                       exposureTimeCameraBUs,
+                                       reportedFrameRateHz,
+                                       deviceStatus,
+                                       timestampMs);
 }

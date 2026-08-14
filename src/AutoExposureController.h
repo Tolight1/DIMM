@@ -18,6 +18,7 @@ enum class AutoExposureState {
     BrightAdjusting,
     DarkWarning,
     DarkAdjusting,
+    Fluctuating,
     Cooldown,
     StarLost,
     TrendConflict
@@ -39,6 +40,7 @@ struct AutoExposureFrameSample {
     bool spotHardSaturated = false;
     bool centroidValid = false;
     bool measurementUsable = false;
+    bool decisionSample = false;
     quint64 frameId = 0;
     qint64 timestampMs = 0;
 };
@@ -99,6 +101,8 @@ struct AutoExposureDecision {
     AutoExposureCameraDecision camera[2];
     bool hasCameraDecision[2] = {false, false};
     bool synchronous = false;
+    bool adjustmentSessionActive = true;
+    qint64 cooldownRemainingMs = 0;
 };
 
 class AutoExposureController {
@@ -116,6 +120,8 @@ public:
             m_samples[i].clear();
             m_ignoreSamplesBeforeMs[i] = -1;
         }
+        m_adjustmentSessionActive = true;
+        m_nextSessionAllowedMs = -1;
         m_latestSnapshot = AutoExposureTrendSnapshot();
         m_latestReason.clear();
         m_conflictSinceMs = -1;
@@ -133,6 +139,20 @@ public:
             return decision;
         }
 
+        updateAdjustmentSession(nowMs);
+        decision.adjustmentSessionActive = m_adjustmentSessionActive;
+        decision.cooldownRemainingMs = cooldownRemainingMs(nowMs);
+
+        if (!m_adjustmentSessionActive) {
+            for (int i = 0; i < 2; ++i) {
+                m_state[i] = AutoExposureState::Cooldown;
+            }
+            decision.state = AutoExposureState::Cooldown;
+            decision.reason = QStringLiteral("COOLDOWN_HOLD");
+            decision.snapshot = m_latestSnapshot;
+            return decision;
+        }
+
         if (sample.timestampMs >= m_ignoreSamplesBeforeMs[sample.cameraIndex]) {
             m_samples[sample.cameraIndex].enqueue(sample);
         }
@@ -144,6 +164,14 @@ public:
             evaluateSynchronous(currentExposureUs, nowMs, &decision);
         } else {
             evaluateIndependent(sample.cameraIndex, currentExposureUs[sample.cameraIndex], &decision);
+        }
+
+        if (hasReason(decision, QStringLiteral("STABLE_HOLD"))) {
+            enterCooldown(nowMs);
+            decision.adjustmentSessionActive = false;
+            decision.cooldownRemainingMs = cooldownRemainingMs(nowMs);
+        } else if (hasReason(decision, QStringLiteral("UNSTABLE_HOLD"))) {
+            clearDecisionWindows();
         }
 
         decision.state = aggregateState();
@@ -167,12 +195,22 @@ public:
         return cameraIndex >= 0 && cameraIndex < 2 ? m_state[cameraIndex] : aggregateState();
     }
     AutoExposureTrendSnapshot latestSnapshot() const { return m_latestSnapshot; }
+    bool adjustmentSessionActive() const { return m_adjustmentSessionActive; }
+    qint64 cooldownRemainingMs(qint64 nowMs) const
+    {
+        if (m_adjustmentSessionActive || m_nextSessionAllowedMs < 0 || nowMs >= m_nextSessionAllowedMs) {
+            return 0;
+        }
+        return m_nextSessionAllowedMs - nowMs;
+    }
 
 private:
     AutoExposureConfig m_config;
     AutoExposureState m_state[2] = {AutoExposureState::Normal, AutoExposureState::Normal};
     QQueue<AutoExposureFrameSample> m_samples[2];
     qint64 m_ignoreSamplesBeforeMs[2] = {-1, -1};
+    bool m_adjustmentSessionActive = true;
+    qint64 m_nextSessionAllowedMs = -1;
     AutoExposureTrendSnapshot m_latestSnapshot;
     QString m_latestReason;
     qint64 m_conflictSinceMs = -1;
@@ -189,6 +227,7 @@ private:
         config.stableFrameRatioThreshold = m_config.stableFrameRatioThreshold;
         config.hardSaturationFrameRatioThreshold = m_config.hardSaturationFrameRatioThreshold;
         config.minDecisionSampleCount = m_config.minDecisionSampleCount;
+        config.autoExposureStepUs = m_config.autoExposureStepUs;
         config.minExposureUs = m_config.minExposureUs;
         config.maxExposureUs = m_config.maxExposureUs;
         config.maxExposureChangeRatioUp = m_config.maxExposureChangeRatioUp;
@@ -196,6 +235,54 @@ private:
         config.minExposureDeltaUs = m_config.minExposureDeltaUs;
         config.minExposureChangeRatio = m_config.minExposureChangeRatio;
         return config;
+    }
+
+    void clearDecisionWindows()
+    {
+        for (auto& queue : m_samples) {
+            queue.clear();
+        }
+    }
+
+    void updateAdjustmentSession(qint64 nowMs)
+    {
+        if (m_adjustmentSessionActive ||
+            m_nextSessionAllowedMs < 0 ||
+            nowMs < m_nextSessionAllowedMs) {
+            return;
+        }
+        clearDecisionWindows();
+        for (int i = 0; i < 2; ++i) {
+            m_state[i] = AutoExposureState::Normal;
+        }
+        m_adjustmentSessionActive = true;
+        m_nextSessionAllowedMs = -1;
+        m_latestReason.clear();
+    }
+
+    void enterCooldown(qint64 nowMs)
+    {
+        clearDecisionWindows();
+        for (int i = 0; i < 2; ++i) {
+            m_state[i] = AutoExposureState::Cooldown;
+        }
+        m_adjustmentSessionActive = false;
+        const qint64 cooldownMs =
+            qint64(std::max(0, m_config.autoExposureDecisionCooldownMin)) * 60 * 1000;
+        m_nextSessionAllowedMs = nowMs + cooldownMs;
+    }
+
+    static bool hasReason(const AutoExposureDecision& decision, const QString& reason)
+    {
+        if (decision.reason == reason) {
+            return true;
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (decision.hasCameraDecision[i] && decision.camera[i].reason == reason) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static AutoExposureAdjustDirection activeDirectionForState(AutoExposureState state)
@@ -235,6 +322,12 @@ private:
         if (action.reason == "MAX_EXPOSURE_DARK_HOLD") {
             return AutoExposureState::StarLost;
         }
+        if (action.reason == "STABLE_HOLD") {
+            return AutoExposureState::Cooldown;
+        }
+        if (action.reason == "UNSTABLE_HOLD") {
+            return AutoExposureState::Fluctuating;
+        }
         return AutoExposureState::Normal;
     }
 
@@ -247,10 +340,11 @@ private:
     {
         AutoExposureSpotResult result;
         result.quality = sample.peakQuality;
-        result.decisionSample = true;
+        result.decisionSample = sample.decisionSample;
         result.validSpotPeak =
-            sample.peakQuality == AutoExposurePeakQuality::ValidSpotPeak ||
-            sample.peakQuality == AutoExposurePeakQuality::SpotSaturated;
+            sample.decisionSample &&
+            (sample.peakQuality == AutoExposurePeakQuality::ValidSpotPeak ||
+             sample.peakQuality == AutoExposurePeakQuality::SpotSaturated);
         result.spotHardSaturated = sample.spotHardSaturated;
         result.peakDn = sample.peakDn;
         result.supportedPeakDn = sample.supportedPeakDn > 0.0 ? sample.supportedPeakDn : sample.peakDn;
@@ -265,9 +359,10 @@ private:
 
     void prune(qint64 nowMs)
     {
-        const qint64 windowMs = qint64(std::max(1, m_config.sampleWindowSec)) * 1000;
+        Q_UNUSED(nowMs);
+        const int maxSamples = std::max(1, m_config.minDecisionSampleCount);
         for (auto& queue : m_samples) {
-            while (!queue.isEmpty() && nowMs - queue.head().timestampMs > windowMs) {
+            while (queue.size() > maxSamples) {
                 queue.dequeue();
             }
         }
@@ -501,7 +596,9 @@ private:
             if (state == AutoExposureState::TrendConflict ||
                 state == AutoExposureState::StarLost ||
                 state == AutoExposureState::BrightAdjusting ||
-                state == AutoExposureState::DarkAdjusting) {
+                state == AutoExposureState::DarkAdjusting ||
+                state == AutoExposureState::Cooldown ||
+                state == AutoExposureState::Fluctuating) {
                 return state;
             }
         }

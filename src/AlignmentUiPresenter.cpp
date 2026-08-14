@@ -1,5 +1,7 @@
 #include "AlignmentUiPresenter.h"
 
+#include "PolarisTrajectory.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -256,7 +258,31 @@ FullFrameCanvas::AlignmentOverlay AlignmentUiPresenter::buildAlignmentOverlay(
     overlay.orbitSource = QStringLiteral("理论回退");
     overlay.solveStateText = solveStateText(input.solveState);
 
+    const auto applySimulatedCurrentPolaris = [&]() {
+        if (!input.hasConfirmedPolarisForSimulation ||
+            !input.hasSimulationPhase ||
+            !input.confirmedPolarisTimeUtc.isValid() ||
+            !input.simulationNowUtc.isValid() ||
+            overlay.orbitRadiusPx <= 0.0) {
+            return;
+        }
+
+        const double elapsedSeconds =
+            static_cast<double>(input.confirmedPolarisTimeUtc.secsTo(input.simulationNowUtc));
+        const double phase =
+            PolarisTrajectory::advancedPhase(input.simulationPhaseAtConfirmationRad,
+                                             elapsedSeconds);
+        overlay.hasSimulatedCurrentPolaris = true;
+        overlay.simulatedCurrentPolarisPosition =
+            PolarisTrajectory::clockwisePoint(overlay.orbitCenter,
+                                              overlay.orbitRadiusPx,
+                                              phase);
+        overlay.simulatedCurrentPolarisLabel =
+            input.simulationNowUtc.toLocalTime().toString(QStringLiteral("HH:mm"));
+    };
+
     if (!input.solved) {
+        applySimulatedCurrentPolaris();
         return overlay;
     }
 
@@ -269,6 +295,7 @@ FullFrameCanvas::AlignmentOverlay AlignmentUiPresenter::buildAlignmentOverlay(
     if (!solved.valid ||
         !input.hasCurrentSolverResult ||
         !solved.hasNorthCelestialPolePixel) {
+        applySimulatedCurrentPolaris();
         return overlay;
     }
 
@@ -331,6 +358,7 @@ FullFrameCanvas::AlignmentOverlay AlignmentUiPresenter::buildAlignmentOverlay(
         overlay.polarisNcpDistanceArcmin =
             overlay.polarisNcpDistancePx * overlay.plateScaleArcsecPx / 60.0;
     }
+    applySimulatedCurrentPolaris();
     return overlay;
 }
 
@@ -346,6 +374,8 @@ void AlignmentUiPresenter::applyConfirmedPolarisToOverlay(
     if (hasConfirmedPolarisPosition) {
         const QPointF orbitDelta = confirmedPolarisPosition - overlay->orbitCenter;
         const double orbitDistance = std::hypot(orbitDelta.x(), orbitDelta.y());
+        overlay->hasConfirmedPolaris = true;
+        overlay->confirmedPolarisPosition = confirmedPolarisPosition;
         overlay->hasStar = true;
         overlay->starPosition = confirmedPolarisPosition;
         overlay->deviationPx = std::abs(orbitDistance - overlay->orbitRadiusPx);

@@ -28,6 +28,8 @@ void DIMM::handleAutoExposureSample(const AutoExposureFrameSample& sample)
 
     m_autoExposureState = decision.state;
     m_autoExposureReason = decision.reason;
+    m_autoExposureAdjustmentSessionActive = decision.adjustmentSessionActive;
+    m_autoExposureCooldownRemainingMs = decision.cooldownRemainingMs;
     m_latestAutoExposureTrend = decision.snapshot;
     for (int i = 0; i < 2; ++i) {
         m_latestAutoExposurePeakDn[i] = decision.snapshot.camera[i].latestPeakDn;
@@ -38,6 +40,11 @@ void DIMM::handleAutoExposureSample(const AutoExposureFrameSample& sample)
             m_cameraAutoExposureState[i] = decision.camera[i].state;
             m_cameraAutoExposureReason[i] = decision.camera[i].reason;
             m_cameraAutoExposureTargetExposureUs[i] = decision.camera[i].targetExposureUs;
+        }
+    }
+    if (!decision.hasCameraDecision[0] && !decision.hasCameraDecision[1]) {
+        for (int i = 0; i < 2; ++i) {
+            m_cameraAutoExposureState[i] = decision.state;
         }
     }
     if (m_autoExposureFramesSinceAdjust < std::numeric_limits<quint64>::max()) {
@@ -91,7 +98,7 @@ void DIMM::handleAutoExposureSample(const AutoExposureFrameSample& sample)
     }
 }
 
-void DIMM::resetAutoExposureState()
+void DIMM::resetAutoExposureState(bool applyInitialExposure)
 {
     m_autoExposureController.configure(m_autoExposureConfig);
     m_latestAutoExposureTrend = AutoExposureTrendSnapshot();
@@ -100,6 +107,8 @@ void DIMM::resetAutoExposureState()
     m_autoExposureTargetExposureUs = 0;
     m_lastAutoExposureAdjustMs = -1;
     m_autoExposureFramesSinceAdjust = 0;
+    m_autoExposureAdjustmentSessionActive = m_autoExposureController.adjustmentSessionActive();
+    m_autoExposureCooldownRemainingMs = 0;
     for (int i = 0; i < 2; ++i) {
         m_cameraAutoExposureState[i] = AutoExposureState::Normal;
         m_cameraAutoExposureReason[i].clear();
@@ -109,6 +118,38 @@ void DIMM::resetAutoExposureState()
         m_latestAutoExposureValidRatio[i] = 0.0;
         m_latestAutoExposureUsableRatio[i] = 0.0;
     }
+    if (!applyInitialExposure ||
+        !shouldApplyAutoExposureInitialExposure(m_autoAcquisitionConfig.enabled,
+                                                 m_autoExposureConfig.enabled)) {
+        return;
+    }
+
+    if (m_autoExposureConfig.enabled) {
+        const int initialExposureUs =
+            static_cast<int>(std::lround(std::clamp(m_autoExposureConfig.initialExposureUs,
+                                                    m_autoExposureConfig.minExposureUs,
+                                                    m_autoExposureConfig.maxExposureUs)));
+        QString reason;
+        if (!applyExposureAndHotPixelTemplate(initialExposureUs, &reason)) {
+            m_autoExposureReason = reason;
+            setStatusMessage(reason.isEmpty()
+                                 ? QStringLiteral("自动曝光: 启动默认曝光应用失败")
+                                 : reason,
+                             UiStatusLevel::Warning);
+        }
+    }
+}
+
+bool DIMM::isAutoExposureRoiRelocalizationGraceActive(qint64 nowMs) const
+{
+    if (!m_autoExposureConfig.enabled ||
+        m_lastAutoExposureAdjustMs < 0 ||
+        nowMs < m_lastAutoExposureAdjustMs) {
+        return false;
+    }
+
+    return (nowMs - m_lastAutoExposureAdjustMs) <
+           kAutoExposureRoiRelocalizationGraceMs;
 }
 
 QString DIMM::autoExposureStateName(AutoExposureState state) const
@@ -122,6 +163,8 @@ QString DIMM::autoExposureStateName(AutoExposureState state) const
         return QStringLiteral("DARK_WARNING");
     case AutoExposureState::DarkAdjusting:
         return QStringLiteral("DARK_ADJUSTING");
+    case AutoExposureState::Fluctuating:
+        return QStringLiteral("FLUCTUATING");
     case AutoExposureState::Cooldown:
         return QStringLiteral("COOLDOWN");
     case AutoExposureState::StarLost:
@@ -138,22 +181,24 @@ QString DIMM::autoExposureStateShortText(AutoExposureState state) const
 {
     switch (state) {
     case AutoExposureState::BrightWarning:
-        return QStringLiteral("亮警");
+        return QStringLiteral("调整: 采样中");
     case AutoExposureState::BrightAdjusting:
-        return QStringLiteral("降曝");
+        return QStringLiteral("调整: 减曝光");
     case AutoExposureState::DarkWarning:
-        return QStringLiteral("暗警");
+        return QStringLiteral("调整: 采样中");
     case AutoExposureState::DarkAdjusting:
-        return QStringLiteral("增曝");
+        return QStringLiteral("调整: 增曝光");
+    case AutoExposureState::Fluctuating:
+        return QStringLiteral("波动");
     case AutoExposureState::Cooldown:
         return QStringLiteral("冷却");
     case AutoExposureState::StarLost:
-        return QStringLiteral("丢星");
+        return QStringLiteral("波动");
     case AutoExposureState::TrendConflict:
-        return QStringLiteral("冲突");
+        return QStringLiteral("波动");
     case AutoExposureState::Normal:
     default:
-        return QStringLiteral("正常");
+        return QStringLiteral("调整: 采样中");
     }
 }
 
@@ -162,10 +207,26 @@ QString DIMM::autoExposureUiStatusText() const
     if (!m_autoExposureConfig.enabled) {
         return QStringLiteral("关闭");
     }
-    const QString cam0State = autoExposureStateShortText(m_cameraAutoExposureState[0]);
-    const QString cam1State = autoExposureStateShortText(m_cameraAutoExposureState[1]);
-    if (cam0State == cam1State) {
-        return cam0State;
-    }
-    return QStringLiteral("C1%1/C2%2").arg(cam0State, cam1State);
+    return autoExposureStateShortText(m_autoExposureState);
 }
+
+QString DIMM::autoExposureAdjustDirectionText() const
+{
+    if (!m_autoExposureConfig.enabled) {
+        return QStringLiteral("OFF");
+    }
+    switch (m_autoExposureState) {
+    case AutoExposureState::BrightAdjusting:
+        return QStringLiteral("DECREASE");
+    case AutoExposureState::DarkAdjusting:
+        return QStringLiteral("INCREASE");
+    case AutoExposureState::Normal:
+    case AutoExposureState::BrightWarning:
+    case AutoExposureState::DarkWarning:
+        return m_autoExposureAdjustmentSessionActive ? QStringLiteral("SAMPLING")
+                                                     : QStringLiteral("HOLD");
+    default:
+        return QStringLiteral("HOLD");
+    }
+}
+

@@ -77,6 +77,23 @@ void FullFrameCanvas::clearAlignmentOverlay()
     update();
 }
 
+void FullFrameCanvas::setRoiTrajectoryOverlay(const RoiTrajectoryOverlay& overlay)
+{
+    m_roiTrajectoryOverlay = overlay;
+    update();
+}
+
+void FullFrameCanvas::clearRoiTrajectoryOverlay()
+{
+    if (!m_roiTrajectoryOverlay.enabled &&
+        m_roiTrajectoryOverlay.points.isEmpty() &&
+        !m_roiTrajectoryOverlay.hasFittedCircle) {
+        return;
+    }
+    m_roiTrajectoryOverlay = RoiTrajectoryOverlay();
+    update();
+}
+
 void FullFrameCanvas::setStarCandidateOverlays(const QVector<StarCandidateOverlay>& candidates)
 {
     m_starCandidateOverlays = candidates;
@@ -92,6 +109,18 @@ void FullFrameCanvas::clearStarCandidateOverlays()
     update();
 }
 
+void FullFrameCanvas::setCoarseDriftOverlay(const CoarseDriftOverlay& overlay)
+{
+    m_coarseDriftOverlay = overlay;
+    update();
+}
+
+void FullFrameCanvas::clearCoarseDriftOverlay()
+{
+    m_coarseDriftOverlay = CoarseDriftOverlay();
+    update();
+}
+
 void FullFrameCanvas::clear()
 {
     m_image = cv::Mat();
@@ -100,7 +129,9 @@ void FullFrameCanvas::clear()
     m_rois.clear();
     m_currentRoiIndex = -1;
     m_alignmentOverlay = AlignmentOverlay();
+    m_roiTrajectoryOverlay = RoiTrajectoryOverlay();
     m_starCandidateOverlays.clear();
+    m_coarseDriftOverlay = CoarseDriftOverlay();
     m_scale = 1.0;
     m_offset = QPointF();
     m_hasViewTransform = false;
@@ -149,6 +180,8 @@ void FullFrameCanvas::paintEvent(QPaintEvent*)
 
     drawImage(painter);
     drawAlignmentOverlay(painter);
+    drawCoarseDriftOverlay(painter);
+    drawRoiTrajectoryOverlay(painter);
     drawRoiOverlays(painter);
     drawStarCandidateOverlays(painter);
     drawScaleBar(painter);
@@ -249,6 +282,40 @@ void FullFrameCanvas::drawRoiOverlays(QPainter& painter)
     }
 }
 
+void FullFrameCanvas::drawRoiTrajectoryOverlay(QPainter& painter)
+{
+    if (!m_roiTrajectoryOverlay.enabled || m_image.empty() || m_scale <= 0.0) {
+        return;
+    }
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    painter.setPen(QPen(QColor(90, 220, 255, 210), 1.4));
+    for (int i = 1; i < m_roiTrajectoryOverlay.points.size(); ++i) {
+        painter.drawLine(imageToWidget(m_roiTrajectoryOverlay.points[i - 1]),
+                         imageToWidget(m_roiTrajectoryOverlay.points[i]));
+    }
+
+    painter.setBrush(QColor(90, 220, 255, 140));
+    painter.setPen(QPen(QColor(190, 245, 255, 220), 1.0));
+    for (const QPointF& point : m_roiTrajectoryOverlay.points) {
+        const QPointF widgetPoint = imageToWidget(point);
+        painter.drawEllipse(widgetPoint, 2.8, 2.8);
+    }
+    painter.setBrush(Qt::NoBrush);
+
+    if (m_roiTrajectoryOverlay.hasFittedCircle &&
+        m_roiTrajectoryOverlay.fittedRadiusPx > 0.0) {
+        const QPointF center = imageToWidget(m_roiTrajectoryOverlay.fittedCenter);
+        const double radius = m_roiTrajectoryOverlay.fittedRadiusPx * m_scale;
+        painter.setPen(QPen(QColor(120, 255, 160, 220), 1.6, Qt::DashLine));
+        painter.drawEllipse(center, radius, radius);
+    }
+
+    painter.restore();
+}
+
 void FullFrameCanvas::drawStarCandidateOverlays(QPainter& painter)
 {
     if (m_starCandidateOverlays.isEmpty() || m_image.empty()) {
@@ -326,6 +393,21 @@ void FullFrameCanvas::drawAlignmentOverlay(QPainter& painter)
         painter.drawEllipse(center, radius, radius);
     }
 
+    if (m_alignmentOverlay.hasSimulatedCurrentPolaris) {
+        const QPointF simulated =
+            imageToWidget(m_alignmentOverlay.simulatedCurrentPolarisPosition);
+        painter.setPen(QPen(QColor(120, 255, 160), 2.0));
+        painter.drawEllipse(simulated, 8.0, 8.0);
+        painter.drawLine(simulated + QPointF(-12.0, 0.0),
+                         simulated + QPointF(12.0, 0.0));
+        painter.drawLine(simulated + QPointF(0.0, -12.0),
+                         simulated + QPointF(0.0, 12.0));
+        if (!m_alignmentOverlay.simulatedCurrentPolarisLabel.isEmpty()) {
+            painter.drawText(simulated + QPointF(10.0, 16.0),
+                             m_alignmentOverlay.simulatedCurrentPolarisLabel);
+        }
+    }
+
     painter.setFont(QFont("Microsoft YaHei", 9));
     if (m_alignmentOverlay.hasPredictedPolaris || m_alignmentOverlay.hasDetectedPolaris) {
         const QPointF polarisForLine =
@@ -350,6 +432,12 @@ void FullFrameCanvas::drawAlignmentOverlay(QPainter& painter)
         painter.drawEllipse(detected, 7.0, 7.0);
         painter.drawLine(detected + QPointF(-10.0, 0.0), detected + QPointF(10.0, 0.0));
         painter.drawLine(detected + QPointF(0.0, -10.0), detected + QPointF(0.0, 10.0));
+    }
+
+    if (m_alignmentOverlay.hasConfirmedPolaris) {
+        const QPointF confirmed = imageToWidget(m_alignmentOverlay.confirmedPolarisPosition);
+        painter.setPen(QPen(QColor(90, 220, 255, 220), 1.5, Qt::DotLine));
+        painter.drawEllipse(confirmed, 6.0, 6.0);
     }
 
     if (m_alignmentOverlay.hasPredictedPolaris && m_alignmentOverlay.hasDetectedPolaris) {
@@ -421,6 +509,126 @@ void FullFrameCanvas::drawAlignmentOverlay(QPainter& painter)
         painter.drawText(imageRect.adjusted(12.0, 46.0, -12.0, -12.0).topLeft(),
                          detailLines.join(QLatin1String(" | ")));
     }
+
+    painter.restore();
+}
+
+void FullFrameCanvas::drawCoarseDriftOverlay(QPainter& painter)
+{
+    if (!m_coarseDriftOverlay.enabled || m_image.empty() || m_scale <= 0.0) {
+        return;
+    }
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    const QRectF imageRect(m_offset.x(),
+                           m_offset.y(),
+                           m_qimage.width() * m_scale,
+                           m_qimage.height() * m_scale);
+
+    for (const CoarseDriftTrackOverlay& track : m_coarseDriftOverlay.tracks) {
+        const QPointF start = imageToWidget(track.startPx);
+        const QPointF end = imageToWidget(track.endPx);
+        painter.setPen(track.usedForSolve
+                           ? QPen(QColor(120, 235, 190, 210), 1.6)
+                           : QPen(QColor(150, 150, 150, 120), 1.0));
+        painter.drawLine(start, end);
+        painter.drawEllipse(end, track.usedForSolve ? 3.5 : 2.0, track.usedForSolve ? 3.5 : 2.0);
+        if (!track.usedForSolve && track.velocityFitValid) {
+            painter.setFont(QFont("Consolas", 7));
+            painter.drawText(end + QPointF(4.0, -4.0),
+                             QStringLiteral("%1点 %2s")
+                                 .arg(track.pointCount)
+                                 .arg(track.durationSec, 0, 'f', 0));
+        }
+    }
+
+    if (m_coarseDriftOverlay.valid) {
+        const QPointF center = imageToWidget(m_coarseDriftOverlay.northCelestialPolePx);
+        const QPointF frameCenter = imageToWidget(m_coarseDriftOverlay.frameCenterPx);
+        painter.setPen(QPen(QColor(120, 255, 160), 2.0));
+        painter.drawEllipse(center, 8.0, 8.0);
+        painter.drawLine(center + QPointF(-14.0, 0.0), center + QPointF(14.0, 0.0));
+        painter.drawLine(center + QPointF(0.0, -14.0), center + QPointF(0.0, 14.0));
+
+        painter.setPen(QPen(QColor(255, 220, 90), 2.0, Qt::DashLine));
+        QPointF arrowEnd = center;
+        if (!imageRect.contains(center)) {
+            // adjustmentVectorPx points from the frame center to the estimated NCP
+            // in image pixels; clamp the arrow endpoint to the image rect edge when
+            // the estimated NCP lies offscreen.
+            const double length =
+                std::sqrt(m_coarseDriftOverlay.adjustmentVectorPx.x() *
+                              m_coarseDriftOverlay.adjustmentVectorPx.x() +
+                          m_coarseDriftOverlay.adjustmentVectorPx.y() *
+                              m_coarseDriftOverlay.adjustmentVectorPx.y());
+            if (length > 1e-6) {
+                const QPointF unit(m_coarseDriftOverlay.adjustmentVectorPx.x() / length,
+                                   m_coarseDriftOverlay.adjustmentVectorPx.y() / length);
+                double t = std::numeric_limits<double>::max();
+                if (std::abs(unit.x()) > 1e-9) {
+                    t = std::min(t, (unit.x() > 0.0 ? imageRect.right() - frameCenter.x()
+                                                    : imageRect.left() - frameCenter.x()) /
+                                        unit.x());
+                }
+                if (std::abs(unit.y()) > 1e-9) {
+                    t = std::min(t, (unit.y() > 0.0 ? imageRect.bottom() - frameCenter.y()
+                                                    : imageRect.top() - frameCenter.y()) /
+                                        unit.y());
+                }
+                arrowEnd = frameCenter + unit * std::max(0.0, t);
+            }
+        }
+        painter.drawLine(frameCenter, arrowEnd);
+    }
+
+    QStringList lines;
+
+    if (!m_coarseDriftOverlay.statusText.isEmpty()) {
+        lines << m_coarseDriftOverlay.statusText;
+    }
+
+    lines << QStringLiteral(
+                 "候选 %1 | 活动轨迹 %2 | 已拟合 %3 | 可用轨迹 %4/%5")
+                 .arg(m_coarseDriftOverlay.detectedCandidateCount)
+                 .arg(m_coarseDriftOverlay.activeTrackCount)
+                 .arg(m_coarseDriftOverlay.fittedTrackCount)
+                 .arg(m_coarseDriftOverlay.usableTrackCount)
+                 .arg(m_coarseDriftOverlay.requiredTrackCount);
+
+    lines << QStringLiteral(
+                 "拟合速度 %1 px/s | 求解速度 %2 px/s | 圆心RMS %3 px")
+                 .arg(m_coarseDriftOverlay.medianFittedSpeedPxSec,
+                      0,
+                      'f',
+                      4)
+                 .arg(m_coarseDriftOverlay.medianSpeedPxSec,
+                      0,
+                      'f',
+                      4)
+                 .arg(m_coarseDriftOverlay.centerResidualRmsPx,
+                      0,
+                      'f',
+                      1);
+
+    if (!m_coarseDriftOverlay.diagnosticText.isEmpty()) {
+        lines << m_coarseDriftOverlay.diagnosticText;
+    }
+
+    painter.setFont(QFont("Microsoft YaHei", 9));
+    painter.setPen(m_coarseDriftOverlay.valid
+                       ? QColor(170, 255, 190)
+                       : QColor(255, 210, 90));
+
+    const QRectF textRect =
+        imageRect.adjusted(12.0, 70.0, -12.0, -12.0);
+
+    painter.drawText(textRect,
+                     Qt::AlignLeft |
+                         Qt::AlignTop |
+                         Qt::TextWordWrap,
+                     lines.join(QLatin1Char('\n')));
 
     painter.restore();
 }

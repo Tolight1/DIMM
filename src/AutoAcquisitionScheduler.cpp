@@ -30,10 +30,11 @@ QDateTime localDateTimeForTime(const QDate& date, const QTime& time)
     return QDateTime(date, time, Qt::LocalTime);
 }
 
-QString windowIdForDates(const QDateTime& start, const QDateTime& stop)
+QString windowIdForRange(const QDateTime& start, const QDateTime& stop)
 {
     return QStringLiteral("%1/%2")
-        .arg(start.date().toString(Qt::ISODate), stop.date().toString(Qt::ISODate));
+        .arg(start.toMSecsSinceEpoch())
+        .arg(stop.toMSecsSinceEpoch());
 }
 
 bool calculateSunEvent(const QDate& date,
@@ -129,7 +130,7 @@ AutoAcquisitionWindow AutoAcquisitionScheduler::resolveTestWindow(const AutoAcqu
     window.valid = config.testStartTime.isValid() && config.testStopTime.isValid();
     window.start = start;
     window.stop = stop;
-    window.windowId = windowIdForDates(start, stop);
+    window.windowId = windowIdForRange(start, stop);
     if (!window.valid) {
         window.errorMessage = QStringLiteral("Invalid test auto-acquisition time");
     }
@@ -184,6 +185,6 @@ AutoAcquisitionWindow AutoAcquisitionScheduler::resolveSunWindow(const AutoAcqui
         return window;
     }
     window.valid = true;
-    window.windowId = windowIdForDates(window.start, window.stop);
+    window.windowId = windowIdForRange(window.start, window.stop);
     return window;
 }

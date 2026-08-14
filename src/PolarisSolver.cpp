@@ -1,8 +1,11 @@
 #include "PolarisSolver.h"
 
 #include "AstronomyTransform.h"
+#include "ConnectedDomain.h"
 #include "ImageUtils.h"
+#include "InitialStarDetectionConfig.h"
 #include "StarPatternMatcher.h"
+#include "StarSegmentation.h"
 
 #include <QtMath>
 
@@ -311,22 +314,21 @@ QVector<DetectedStar> detectStarsFromFrame(const cv::Mat& frame,
 
     const double background = mean[0];
     const double noise = std::max(1.0, stddev[0]);
-    const double dynamicThreshold =
-        std::max({config.starMinimumIntensity,
-                  background + config.starThresholdSigma * noise,
-                  background + (maxValue - background) * config.starPeakFraction});
-    const double threshold = config.starThresholdAbsolute >= 0.0
-                                 ? std::min(config.starThresholdAbsolute, dynamicThreshold)
-                                 : dynamicThreshold;
-    if (maxValue <= threshold) {
+    const StarSegmentation::ForegroundSegmentation segmentation =
+        StarSegmentation::segmentForegroundOtsu(grayscale,
+                                                 config.starThresholdSigma,
+                                                 config.starPeakFraction);
+    if (!segmentation.valid) {
+        return detections;
+    }
+    if (maxValue <= segmentation.actualThreshold) {
         return detections;
     }
 
-    cv::Mat binary;
     if (isSolveCancelled(cancelled)) {
         return detections;
     }
-    cv::compare(grayscale, cv::Scalar(threshold), binary, cv::CMP_GT);
+    cv::Mat binary = segmentation.mask;
 
     cv::Mat labels;
     cv::Mat stats;
@@ -335,7 +337,13 @@ QVector<DetectedStar> detectStarsFromFrame(const cv::Mat& frame,
         return detections;
     }
     const int componentCount =
-        cv::connectedComponentsWithStats(binary, labels, stats, centroids, 8, CV_32S);
+        cv::connectedComponentsWithStats(binary,
+                                         labels,
+                                         stats,
+                                         centroids,
+                                         ConnectedDomain::sanitizeConnectivity(
+                                             currentInitialStarDetectionConfig().connectivity),
+                                         CV_32S);
     if (isSolveCancelled(cancelled)) {
         return detections;
     }
@@ -382,7 +390,7 @@ QVector<DetectedStar> detectStarsFromFrame(const cv::Mat& frame,
                                  left + width >= grayscale.cols ||
                                  top + height >= grayscale.rows;
         if (touchesEdge ||
-            area < config.minStarAreaPx ||
+            area < std::max(ConnectedDomain::kMinimumComponentArea, config.minStarAreaPx) ||
             area > config.maxStarAreaPx ||
             width > 96 ||
             height > 96) {

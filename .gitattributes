@@ -1,0 +1,18 @@
+* text=auto
+
+# Source and project files use LF in the repository.
+*.c text eol=lf
+*.cc text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.ui text eol=lf
+*.cmake text eol=lf
+*CMakeLists.txt text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+
+# Windows launch scripts retain CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf

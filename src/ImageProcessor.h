@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QList>
 #include <QMutex>
+#include <QPointF>
 #include <QString>
 #include <QThread>
 #include <QVector>
@@ -33,27 +34,17 @@ struct CentroidResult {
     quint64 signalPixelCount = 0;
 };
 
-enum class CentroidQuality {
-    Valid,
-    InvalidCamera,
-    EmptyImage,
-    BelowThreshold,
-    LowFlux,
-    TooFewPixels,
-    TooManyPixels,
-    NearRoiEdge,
-    EdgeSignal,
-    OutOfFrame
-};
+struct Tau0Estimate {
+    // 对于正常解析结果，valueMs 是测得的 1/e 相关时间。
+    // 对于欠分辨结果，valueMs 保存当前采样周期上界，
+    // 但必须同时设置 underResolved=true，不能把它解释为精确值。
+    double valueMs = 0.0;
 
-struct CentroidMeasurement {
-    CentroidResult centroid;
-    CentroidQuality quality = CentroidQuality::EmptyImage;
+    // 当前短窗口的时间分辨率，通常接近 1000 / 实际采样频率。
+    double resolutionMs = 0.0;
 
-    bool usable() const
-    {
-        return quality == CentroidQuality::Valid;
-    }
+    bool valid = false;
+    bool underResolved = false;
 };
 
 struct AtmosphericParams {
@@ -61,6 +52,10 @@ struct AtmosphericParams {
     double seeing = 0.0;
     double theta0 = 0.0;
     double tau0 = 0.0;
+    bool tau0Valid = false;
+    bool tau0UnderResolved = false;
+    double tau0ResolutionMs = 0.0;
+
     double longitudinalVariancePx2 = 0.0;
     double transverseVariancePx2 = 0.0;
     double longitudinalVarianceRad2 = 0.0;
@@ -68,7 +63,13 @@ struct AtmosphericParams {
     double r0LongitudinalCm = 0.0;
     double r0TransverseCm = 0.0;
     quint64 sampleCount = 0;
+    bool partialWindow = false;
+    bool riskFlag = false;
+    quint64 targetSampleCount = 0;
+    QString riskReason;
 };
+
+Q_DECLARE_METATYPE(AtmosphericParams)
 
 struct DifferentialSample {
     double longitudinal = 0.0;
@@ -119,13 +120,20 @@ signals:
                          double seeing,
                          double theta0,
                          double tau0,
+                         bool tau0Valid,
+                         bool tau0UnderResolved,
+                         double tau0ResolutionMs,
                          double longitudinalVariancePx2,
                          double transverseVariancePx2,
                          double longitudinalVarianceRad2,
                          double transverseVarianceRad2,
                          double r0LongitudinalCm,
                          double r0TransverseCm,
-                         quint64 sampleCount);
+                         quint64 sampleCount,
+                         bool partialWindow,
+                         bool riskFlag,
+                         quint64 targetSampleCount,
+                         const QString& riskReason);
     void frameProcessed(int cameraIndex, bool centroidValid, double elapsedMs);
     void syncSampleReady(double syncResidualUs);
     void unpairedSampleDropped(int droppedCameraIndex,
@@ -152,13 +160,16 @@ signals:
                                  bool spotHardSaturated,
                                  bool centroidValid,
                                  bool measurementUsable,
+                                 bool decisionSample,
                                  quint64 frameId,
                                  qint64 timestampMs);
+    void roiThresholdReady(int cameraIndex, double otsuThreshold, double actualThreshold);
+    void acquisitionStopRequested(const QString& reason);
 
 public slots:
     void setCentroidMethod(int method);
     void setCentroidMode(int mode);
-    void setPeakKernelCentroidConfig(int method, int radiusPx, double strongHotPixelExcessDn);
+    void setPeakKernelCentroidConfig(int radiusPx, double strongHotPixelExcessDn);
     void setGaussianKernelSize(int size);
     void setGaussianSigma(double sigma);
     void setBackgroundDenoiseKernelSize(int size);
@@ -183,6 +194,7 @@ public slots:
                           double lambdaNm,
                           double pixelSizeUm);
     void setTargetFrameRateHz(double frameRateHz);
+    void setAtmosphereHistoryWindowFrames(int frames);
     void setAutoExposureMetricConfig(bool enabled,
                                      double hardSaturationDn,
                                      int sampleIntervalMs,
@@ -195,8 +207,9 @@ public slots:
                                      int saturatedPixelCount);
     void setCurrentRoi(int cameraIndex, const RoiRect& roi);
     void setPairRois(RoiRect roi0, RoiRect roi1);
+    void setPairRoisPreservingAtmosphereWindow(RoiRect roi0, RoiRect roi1);
+    void finalizeActiveAtmosphereWindow(const QString& reason);
     void advanceAcquisitionGeneration();
-    void resetRunProcessingState();
     void processFrame(int cameraIndex,
                       cv::Mat frame,
                       quint64 frameId = 0,
@@ -205,8 +218,7 @@ public slots:
 
 private:
     mutable QMutex m_mutex;
-    int m_centroidMode = 0;
-    int m_peakKernelMethod = 1;
+    int m_centroidMode = 1;
     int m_peakKernelRadiusPx = 3;
     double m_strongHotPixelExcessDn = 100.0;
     int m_backgroundDenoiseKernelSize = 5;
@@ -218,6 +230,8 @@ private:
     int m_centroidMinimumIntensity = 16;
     int m_centroidMinimumSignalPixels = 3;
     double m_roiThresholdAbsolute = -1.0;
+    QPointF m_lastValidGlobalCentroid[2];
+    bool m_hasLastValidGlobalCentroid[2] = {false, false};
     double m_roiNoiseTrimFraction = 0.10;
     double m_apertureDiameter = 56e-3;
     double m_baselineSeparation = 250e-3;
@@ -227,11 +241,10 @@ private:
     double m_lambda = 500e-9;
     double m_pixelSize = 2.5e-6;
     double m_targetFrameRateHz = 200.0;
+    int m_atmosphereHistoryWindowFrames = 5000;
     bool m_autoExposureMetricsEnabled = false;
     double m_autoExposureHardSaturationDn = 4090.0;
-    int m_autoExposureMetricIntervalMs = 1000;
     AutoExposureSpotConfig m_autoExposureSpotConfig;
-    qint64 m_lastAutoExposureSampleMs[2] = {-1, -1};
     RoiRect m_currentRoi[2];
     std::shared_ptr<std::atomic<quint64>> m_acquisitionGeneration;
     bool m_syncCalibrated = false;
@@ -273,8 +286,12 @@ private:
     HotPixelRoiCache m_hotPixelCaches[2];
     QList<PendingCentroidSample> m_pendingCentroids[2];
 
+    static constexpr double TAU0_HISTORY_WINDOW_SECONDS = 3.0;
+    static constexpr double TAU0_MAX_LAG_MS = 200.0;
+    static constexpr int TAU0_MIN_SAMPLES = 30;
     static constexpr int MIN_HISTORY_WINDOW = 50;
-    static constexpr int MAX_HISTORY_WINDOW = 1000;
+    static constexpr int MAX_HISTORY_WINDOW = 60000;
+    static constexpr int MAX_PENDING_PAIR_QUEUE = 1000;
     static constexpr int MIN_ROI_SIZE = 16;
     static constexpr qint64 ATMOSPHERE_PUBLISH_INTERVAL_MS = 1000;
     static constexpr qint64 ROI_IMAGE_PUBLISH_INTERVAL_MS = 100;
@@ -286,17 +303,26 @@ private:
     CentroidResult calculateCentroid(int cameraIndex, const RoiRect& roi, const cv::Mat& roiImage);
     CentroidResult centerOfGravity(const cv::Mat& image);
     CentroidResult peakKernelCentroid(int cameraIndex, const RoiRect& roi, const cv::Mat& image);
-    bool hasThresholdSignalNearRoiEdge(const cv::Mat& roiImage, double threshold) const;
-    CentroidQuality measurementCentroidQuality(const CentroidResult& centroid,
-                                               const cv::Mat& roiImage) const;
-    bool isMeasurementUsableCentroid(const CentroidResult& centroid, const cv::Mat& roiImage) const;
+    CentroidResult connectedDomainKernelCentroid(int cameraIndex,
+                                                 const RoiRect& roi,
+                                                 const cv::Mat& image);
+    void clearLastValidGlobalCentroid(int cameraIndex);
+    void clearAllLastValidGlobalCentroids();
     AtmosphericParams calculateAtmosphere(const QList<DifferentialSample>& samples);
-    double estimateDifferentialAutocorrelationTimeMs(const QList<DifferentialSample>& samples) const;
-    double estimateScalarAutocorrelationCrossingMs(const QList<DifferentialSample>& samples,
-                                                   bool useLongitudinal) const;
+    QList<DifferentialSample> tau0WindowSamples(
+        const QList<DifferentialSample>& samples) const;
+
+    Tau0Estimate estimateDifferentialAutocorrelationTimeMs(
+        const QList<DifferentialSample>& samples) const;
+
+    Tau0Estimate estimateScalarAutocorrelationCrossingMs(
+        const QList<DifferentialSample>& samples,
+        bool useLongitudinal) const;
     int historyWindowSize() const;
     int minimumAtmosphereSamples() const;
+    int pendingCentroidQueueLimit() const;
     void resetRoiProcessingHistory();
+    void resetPairingState();
     bool appendDifferentialSample();
     void emitRoiImageIfDue(int cameraIndex, const cv::Mat& roiImage, qint64 nowMs, bool force = false);
 };
@@ -309,7 +335,7 @@ public:
 
     void setCentroidMethod(int method);
     void setCentroidMode(int mode);
-    void setPeakKernelCentroidConfig(int method, int radiusPx, double strongHotPixelExcessDn);
+    void setPeakKernelCentroidConfig(int radiusPx, double strongHotPixelExcessDn);
     void setGaussianKernelSize(int size);
     void setGaussianSigma(double sigma);
     void setBackgroundDenoiseKernelSize(int size);
@@ -335,6 +361,7 @@ public:
                           double lambdaNm,
                           double pixelSizeUm);
     void setTargetFrameRateHz(double frameRateHz);
+    void setAtmosphereHistoryWindowFrames(int frames);
     void setAutoExposureMetricConfig(bool enabled,
                                      double hardSaturationDn,
                                      int sampleIntervalMs = 1000,
@@ -347,13 +374,12 @@ public:
                                      int saturatedPixelCount = 1);
     void setCurrentRoi(int cameraIndex, const RoiRect& roi);
     void setPairRois(const RoiRect rois[2]);
+    void setPairRoisPreservingAtmosphereWindow(const RoiRect rois[2]);
+    void finalizeActiveAtmosphereWindow(const QString& reason);
     void advanceAcquisitionGeneration();
-    quint64 currentAcquisitionGeneration() const;
-    void resetProcessingState();
     RoiRect getCurrentRoi(int cameraIndex) const;
     int centroidMethod() const { return m_centroidMode; }
     int centroidMode() const { return m_centroidMode; }
-    int peakKernelMethod() const { return m_peakKernelMethod; }
     int peakKernelRadiusPx() const { return m_peakKernelRadiusPx; }
     double strongHotPixelExcessDn() const { return m_strongHotPixelExcessDn; }
     int gaussianKernelSize() const { return m_backgroundDenoiseKernelSize; }
@@ -367,6 +393,7 @@ public:
     double zenithAngleDeg() const { return m_zenithAngleDeg; }
     double wavelengthNm() const { return m_wavelengthNm; }
     double pixelSizeUm() const { return m_pixelSizeUm; }
+    int atmosphereHistoryWindowFrames() const { return m_atmosphereHistoryWindowFrames; }
 
 public slots:
     void processFrame(int cameraIndex,
@@ -403,13 +430,20 @@ signals:
                          double seeing,
                          double theta0,
                          double tau0,
+                         bool tau0Valid,
+                         bool tau0UnderResolved,
+                         double tau0ResolutionMs,
                          double longitudinalVariancePx2,
                          double transverseVariancePx2,
                          double longitudinalVarianceRad2,
                          double transverseVarianceRad2,
                          double r0LongitudinalCm,
                          double r0TransverseCm,
-                         quint64 sampleCount);
+                         quint64 sampleCount,
+                         bool partialWindow,
+                         bool riskFlag,
+                         quint64 targetSampleCount,
+                         const QString& riskReason);
     void frameProcessed(int cameraIndex, bool centroidValid, double elapsedMs);
     void syncSampleReady(double syncResidualUs);
     void unpairedSampleDropped(int droppedCameraIndex,
@@ -436,8 +470,11 @@ signals:
                                  bool spotHardSaturated,
                                  bool centroidValid,
                                  bool measurementUsable,
+                                 bool decisionSample,
                                  quint64 frameId,
                                  qint64 timestampMs);
+    void roiThresholdReady(int cameraIndex, double otsuThreshold, double actualThreshold);
+    void acquisitionStopRequested(const QString& reason);
 
 private:
     QThread* m_workerThread = nullptr;
@@ -445,8 +482,7 @@ private:
     RoiRect m_currentRoi[2];
     std::shared_ptr<std::atomic<quint64>> m_acquisitionGeneration =
         std::make_shared<std::atomic<quint64>>(1);
-    int m_centroidMode = 0;
-    int m_peakKernelMethod = 1;
+    int m_centroidMode = 1;
     int m_peakKernelRadiusPx = 3;
     double m_strongHotPixelExcessDn = 100.0;
     int m_backgroundDenoiseKernelSize = 5;
@@ -459,4 +495,5 @@ private:
     double m_wavelengthNm = 500.0;
     double m_pixelSizeUm = 2.5;
     double m_targetFrameRateHz = 200.0;
+    int m_atmosphereHistoryWindowFrames = 5000;
 };

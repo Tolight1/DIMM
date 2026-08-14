@@ -4,6 +4,7 @@
 #include "CanvasWidgets.h"
 #include "PolarisSolver.h"
 
+#include <QDateTime>
 #include <QSize>
 #include <QString>
 
@@ -17,6 +18,12 @@ struct OverlayBuildInput {
     AlignmentSolveState solveState = AlignmentSolveState::WaitingFrame;
     const PolarisSolveResult* solved = nullptr;
     bool hasCurrentSolverResult = false;
+    bool hasConfirmedPolarisForSimulation = false;
+    QPointF confirmedPolarisForSimulation;
+    QDateTime confirmedPolarisTimeUtc;
+    double simulationPhaseAtConfirmationRad = 0.0;
+    bool hasSimulationPhase = false;
+    QDateTime simulationNowUtc;
 };
 
 QString solveStateText(AlignmentSolveState state);

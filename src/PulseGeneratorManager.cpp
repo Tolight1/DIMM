@@ -18,6 +18,7 @@
 #include <QEventLoop>
 #include <QMetaObject>
 #include <QObject>
+#include <QScopeGuard>
 #include <QThread>
 
 namespace {
@@ -32,6 +33,9 @@ constexpr unsigned short kOutputTypePulse = 0x0001;
 constexpr unsigned short kControlSourceRemote = 0x0100;
 constexpr unsigned short kControlSourceLocal = 0x0000;
 constexpr unsigned long kPulseWorkerShutdownTimeoutMs = 3000;
+constexpr int kRegisterWriteAttempts = 3;
+constexpr ULONGLONG kRegisterResponseTimeoutMs = 2000;
+constexpr unsigned long kRegisterRetryDelayMs = 50;
 
 QString normalizePortName(const QString& portName)
 {
@@ -65,6 +69,23 @@ void appendCrc(std::vector<unsigned char>& frame)
     const quint16 crc = crc16Modbus(frame);
     frame.push_back(static_cast<unsigned char>(crc & 0x00FFU));
     frame.push_back(static_cast<unsigned char>((crc >> 8U) & 0x00FFU));
+}
+
+QString hexWord(unsigned short value)
+{
+    return QStringLiteral("0x%1").arg(value, 4, 16, QChar('0')).toUpper();
+}
+
+QString hexBytes(const std::vector<unsigned char>& bytes)
+{
+    QString result;
+    for (unsigned char byte : bytes) {
+        if (!result.isEmpty()) {
+            result += QChar(' ');
+        }
+        result += QStringLiteral("%1").arg(byte, 2, 16, QChar('0')).toUpper();
+    }
+    return result;
 }
 
 bool writeAll(HANDLE handle, const std::vector<unsigned char>& bytes, QString* errorMessage)
@@ -101,11 +122,13 @@ bool readExact(HANDLE handle, std::size_t expectedBytes, std::vector<unsigned ch
     result->clear();
     result->reserve(expectedBytes);
     std::array<unsigned char, 64> buffer = {};
-    const ULONGLONG deadline = GetTickCount64() + 1000;
+    const ULONGLONG deadline = GetTickCount64() + kRegisterResponseTimeoutMs;
     while (result->size() < expectedBytes) {
         if (GetTickCount64() >= deadline) {
             if (errorMessage) {
-                *errorMessage = QStringLiteral("Timed out waiting for pulse-board response.");
+                *errorMessage = QStringLiteral("Timed out waiting for pulse-board response (%1/%2 bytes).")
+                                    .arg(result->size())
+                                    .arg(expectedBytes);
             }
             return false;
         }
@@ -201,6 +224,16 @@ bool PulseGeneratorManager::runWorkerOperation(const QString& operationName,
     if (QThread::currentThread() == m_workerThread) {
         return operation(errorMessage);
     }
+
+    if (m_operationInProgress.exchange(true)) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Pulse generator is busy with another operation.");
+        }
+        return false;
+    }
+    const auto clearOperationFlag = qScopeGuard([this]() {
+        m_operationInProgress.store(false);
+    });
 
     bool completed = false;
     bool success = false;
@@ -316,6 +349,25 @@ bool PulseGeneratorManager::configureDevice(const Config& config, bool enableOut
     return success;
 }
 
+bool PulseGeneratorManager::setControlSourceDevice(const Config& config, QString* errorMessage)
+{
+    if (!validateConfig(config, errorMessage)) {
+        return false;
+    }
+
+    void* rawHandle = nullptr;
+    if (!openPort(config.portName, config.baudRate, &rawHandle, errorMessage)) {
+        return false;
+    }
+
+    HANDLE handle = static_cast<HANDLE>(rawHandle);
+    const unsigned short deviceAddress = static_cast<unsigned short>(config.terminalId & 0x00FF);
+    const unsigned short controlSource = config.remoteControl ? kControlSourceRemote : kControlSourceLocal;
+    const bool success = writeRegister16(handle, deviceAddress, kRegControlSource, controlSource, errorMessage);
+    closePort(handle);
+    return success;
+}
+
 bool PulseGeneratorManager::stopDevice(const Config& config, QString* errorMessage)
 {
     if (config.portName.trimmed().isEmpty()) {
@@ -367,6 +419,29 @@ bool PulseGeneratorManager::applyConfig(const Config& config, QString* errorMess
             return configureDevice(requestConfig, false, workerError);
         },
         errorMessage);
+}
+
+bool PulseGeneratorManager::setControlSource(const Config& config,
+                                             bool remoteControl,
+                                             QString* errorMessage)
+{
+    Config requestConfig = config;
+    requestConfig.remoteControl = remoteControl;
+    if (!validateConfig(requestConfig, errorMessage)) {
+        return false;
+    }
+
+    if (!runWorkerOperation(
+            QStringLiteral("setControlSource"),
+            [this, requestConfig](QString* workerError) {
+                return setControlSourceDevice(requestConfig, workerError);
+            },
+            errorMessage)) {
+        return false;
+    }
+
+    m_config = requestConfig;
+    return true;
 }
 
 bool PulseGeneratorManager::configureAndStart(const Config& config, QString* errorMessage)
@@ -432,24 +507,50 @@ bool PulseGeneratorManager::writeRegister16(void* rawHandle,
     appendRegister(request, value);
     appendCrc(request);
 
-    if (!writeAll(handle, request, errorMessage)) {
-        if (errorMessage && errorMessage->isEmpty()) {
-            *errorMessage = QStringLiteral("Failed to write pulse-board register.");
+    QString lastError;
+    std::vector<unsigned char> response;
+    for (int attempt = 1; attempt <= kRegisterWriteAttempts; ++attempt) {
+        response.clear();
+        QString attemptError;
+        PurgeComm(handle, PURGE_RXCLEAR | PURGE_TXCLEAR);
+
+        if (!writeAll(handle, request, &attemptError)) {
+            if (attemptError.isEmpty()) {
+                attemptError = QStringLiteral("Failed to write pulse-board register.");
+            }
+        } else if (!readExact(handle, 8, &response, &attemptError)) {
+            if (attemptError.isEmpty()) {
+                attemptError = QStringLiteral("Failed to read pulse-board register response.");
+            }
+        } else if (!hasValidCrc(response) || response != request) {
+            attemptError = QStringLiteral("Pulse-board response mismatch or CRC failure.");
+        } else {
+            return true;
         }
-        return false;
+
+        lastError = attemptError;
+        qWarning().noquote()
+            << QStringLiteral("Pulse-board register write failed: attempt %1/%2, device %3, reg %4, value %5, tx [%6], rx [%7], error: %8")
+                   .arg(attempt)
+                   .arg(kRegisterWriteAttempts)
+                   .arg(deviceAddress)
+                   .arg(hexWord(reg))
+                   .arg(hexWord(value))
+                   .arg(hexBytes(request))
+                   .arg(hexBytes(response))
+                   .arg(attemptError);
+        PurgeComm(handle, PURGE_RXCLEAR | PURGE_TXCLEAR);
+        if (attempt < kRegisterWriteAttempts) {
+            Sleep(kRegisterRetryDelayMs);
+        }
     }
 
-    std::vector<unsigned char> response;
-    if (!readExact(handle, 8, &response, errorMessage)) {
-        return false;
+    if (errorMessage) {
+        *errorMessage = lastError.isEmpty()
+                            ? QStringLiteral("Pulse-board register write failed.")
+                            : lastError;
     }
-    if (!hasValidCrc(response) || response != request) {
-        if (errorMessage) {
-            *errorMessage = QStringLiteral("Pulse-board response CRC check failed.");
-        }
-        return false;
-    }
-    return true;
+    return false;
 }
 
 bool PulseGeneratorManager::writeRegister32LowWordFirst(void* rawHandle,

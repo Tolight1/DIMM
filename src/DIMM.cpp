@@ -2,6 +2,7 @@
 #include "DimmRuntimeHelpers.h"
 
 #include "AlignmentCameraCoordinator.h"
+#include "AlignmentCoarseController.h"
 #include "AlignmentController.h"
 #include "AlignmentFrameCoordinator.h"
 #include "AlignmentLocalTracker.h"
@@ -77,28 +78,25 @@ DIMM::DIMM(QWidget* parent)
     ui->setupUi(this);
 
     setupServiceManagers();
+    initializeCaptureServices();
     setupStatusBarUi();
     setupMainWindowUi();
     setupRuntimeActions();
-    initializeCaptureServices();
     setupConnections();
     setupPreviewCanvases();
     setupSettingsCallbacks();
     setupCameraConnections();
     setupImageProcessorConnections();
-    setupCanvasMouseStatusConnections();
     setupRuntimeTimers();
     setupCommConnections();
+    setupCanvasMouseStatusConnections();
 
     applyStartupConfig(AppConfigPersistence::load(currentAppConfig()));
-
     setupReportTimer();
-
     hideLegacyRoiScheduleUi();
     updateMinuteRoi(true);
     refreshUi();
     updateCaptureState(m_captureState);
-
 }
 
 void DIMM::registerMetaTypes()
@@ -109,6 +107,7 @@ void DIMM::registerMetaTypes()
     qRegisterMetaType<EafDeviceState>("EafDeviceState");
     qRegisterMetaType<QVector<EafDeviceDescriptor>>("QVector<EafDeviceDescriptor>");
     qRegisterMetaType<EnvironmentSensorData>("EnvironmentSensorData");
+    qRegisterMetaType<CoarseAlignmentEstimate>("CoarseAlignmentEstimate");
 
 }
 
@@ -119,8 +118,8 @@ void DIMM::setupServiceManagers()
     m_focuserManager = new EafFocuserManager(this);
     m_focuserControlWidget = new FocuserControlWidget(m_settingsDialog);
     m_focuserControlWidget->setManager(m_focuserManager);
-    m_settingsDialog->addSettingsPage(m_focuserControlWidget, QStringLiteral("自动调焦"));
     m_focuserManager->initialize();
+    m_settingsDialog->addSettingsPage(m_focuserControlWidget, QStringLiteral("自动调焦"));
     m_environmentSensor = new EnvironmentSensorManager(this);
     connect(m_environmentSensor, &EnvironmentSensorManager::dataUpdated, this, [this](EnvironmentSensorData data) {
         m_latestEnvironment = data;
@@ -159,6 +158,16 @@ void DIMM::setupRuntimeActions()
     }
     if (ui->menuTools) {
         ui->menuTools->insertAction(ui->actionROISchedule, m_actionAlignmentMode);
+    }
+
+    m_actionToggleCoarseAlignment = new QAction(QStringLiteral("开始粗对准"), this);
+    m_actionToggleCoarseAlignment->setObjectName(QStringLiteral("btnToggleCoarseAlignment"));
+    m_actionToggleCoarseAlignment->setCheckable(true);
+    if (ui->toolbar) {
+        ui->toolbar->insertAction(ui->btnSettings, m_actionToggleCoarseAlignment);
+    }
+    if (ui->menuTools) {
+        ui->menuTools->insertAction(ui->actionROISchedule, m_actionToggleCoarseAlignment);
     }
 
     m_actionConfirmCamera1Polaris = new QAction(QStringLiteral("确认相机1的北极星"), this);
@@ -208,6 +217,12 @@ void DIMM::initializeCaptureServices()
             &PolarisSolverController::solveStatusChanged,
             this,
             &DIMM::onPolarisSolveStatusChanged);
+    m_alignmentCoarseController = new AlignmentCoarseController(this);
+    connect(m_alignmentCoarseController,
+            &AlignmentCoarseController::estimateReady,
+            this,
+            &DIMM::onCoarseAlignmentEstimateReady,
+            Qt::QueuedConnection);
     {
         const QString appThresholdPath =
             QDir(QApplication::applicationDirPath()).filePath(QStringLiteral("threshold.txt"));
@@ -265,6 +280,19 @@ void DIMM::setupImageProcessorConnections()
     setupSyncSampleProcessorConnection();
     setupRoiImageProcessorConnection();
     setupAtmosphereProcessorConnection();
+    connect(m_imageProcessor,
+            &ImageProcessor::roiThresholdReady,
+            this,
+            [this](int cameraIndex, double otsuThreshold, double actualThreshold) {
+                setRoiThresholdDisplay(cameraIndex, otsuThreshold, actualThreshold);
+            });
+    connect(m_imageProcessor,
+            &ImageProcessor::acquisitionStopRequested,
+            this,
+            [this](const QString& reason) {
+                setStatusMessage(QStringLiteral("Status: %1").arg(reason), UiStatusLevel::Error);
+                onStopCapture();
+            });
 }
 
 void DIMM::setupCentroidProcessorConnection()
@@ -361,6 +389,7 @@ void DIMM::setupAutoExposureProcessorConnection()
                    bool spotHardSaturated,
                    bool centroidValid,
                    bool measurementUsable,
+                   bool decisionSample,
                    quint64 frameId,
                    qint64 timestampMs) {
         AutoExposureFrameSample sample;
@@ -379,6 +408,7 @@ void DIMM::setupAutoExposureProcessorConnection()
         sample.spotHardSaturated = spotHardSaturated;
         sample.centroidValid = centroidValid;
         sample.measurementUsable = measurementUsable;
+        sample.decisionSample = decisionSample;
         sample.frameId = frameId;
         sample.timestampMs = timestampMs;
         handleAutoExposureSample(sample);
@@ -565,22 +595,34 @@ void DIMM::setupAtmosphereProcessorConnection()
                    double seeing,
                    double theta0,
                    double tau0,
+                   bool tau0Valid,
+                   bool tau0UnderResolved,
+                   double tau0ResolutionMs,
                    double longitudinalVariancePx2,
                    double transverseVariancePx2,
                    double longitudinalVarianceRad2,
                    double transverseVarianceRad2,
                    double r0LongitudinalCm,
                    double r0TransverseCm,
-                   quint64 sampleCount) {
+                   quint64 sampleCount,
+                   bool partialWindow,
+                   bool riskFlag,
+                   quint64 targetSampleCount,
+                   const QString& riskReason) {
         if (!hasActiveCapture()) {
             return;
         }
         auto& runtime = activeRuntime();
         runtime.hasValidAtmosphere = true;
+        runtime.latestAtmosphereTimestampMs =
+            static_cast<quint64>(QDateTime::currentMSecsSinceEpoch());
         runtime.latestAtmosphere.r0 = r0;
         runtime.latestAtmosphere.seeing = seeing;
         runtime.latestAtmosphere.theta0 = theta0;
         runtime.latestAtmosphere.tau0 = tau0;
+        runtime.latestAtmosphere.tau0Valid = tau0Valid;
+        runtime.latestAtmosphere.tau0UnderResolved = tau0UnderResolved;
+        runtime.latestAtmosphere.tau0ResolutionMs = tau0ResolutionMs;
         runtime.latestAtmosphere.longitudinalVariancePx2 = longitudinalVariancePx2;
         runtime.latestAtmosphere.transverseVariancePx2 = transverseVariancePx2;
         runtime.latestAtmosphere.longitudinalVarianceRad2 = longitudinalVarianceRad2;
@@ -588,6 +630,10 @@ void DIMM::setupAtmosphereProcessorConnection()
         runtime.latestAtmosphere.r0LongitudinalCm = r0LongitudinalCm;
         runtime.latestAtmosphere.r0TransverseCm = r0TransverseCm;
         runtime.latestAtmosphere.sampleCount = sampleCount;
+        runtime.latestAtmosphere.partialWindow = partialWindow;
+        runtime.latestAtmosphere.riskFlag = riskFlag;
+        runtime.latestAtmosphere.targetSampleCount = targetSampleCount;
+        runtime.latestAtmosphere.riskReason = riskReason;
         refreshMeasurementUi();
 
         saveResultRow(runtime.frameCount);
@@ -607,6 +653,17 @@ void DIMM::setupRuntimeTimers()
         checkHardwareTriggerStartup();
     });
 
+    m_liveStartupRetryTimer = new QTimer(this);
+    m_liveStartupRetryTimer->setSingleShot(true);
+
+    connect(
+        m_liveStartupRetryTimer,
+        &QTimer::timeout,
+        this,
+        [this]() {
+            retryFailedLiveStartup();
+        });
+
     m_fileFlushTimer = new QTimer(this);
     connect(m_fileFlushTimer, &QTimer::timeout, this, &DIMM::flushPendingWrites);
     m_fileFlushTimer->start(2000);
@@ -619,6 +676,10 @@ void DIMM::setupCommConnections()
     connect(m_commManager, &CommManager::connected, this, [this]() {
         m_commConnecting = false;
         updateCommState(true);
+        m_reporting = isLiveCaptureActive();
+        if (m_reporting && m_reportTimer) {
+            m_reportTimer->start();
+        }
         setStatusMessage(QStringLiteral("上位机已连接"), UiStatusLevel::Success);
     });
     connect(m_commManager, &CommManager::disconnected, this, [this]() {
@@ -639,18 +700,13 @@ void DIMM::setupCommConnections()
         }
         setStatusMessage(QStringLiteral("通信错误: %1").arg(msg), UiStatusLevel::Error);
     });
-    connect(m_commManager, &CommManager::commandReceived, this, &DIMM::onCommCommand);
-
 }
 
 void DIMM::setupReportTimer()
 {
     m_reportTimer = new QTimer(this);
     m_reportTimer->setInterval(1000);
-    connect(m_reportTimer, &QTimer::timeout, this, [this]() {
-        reportMeasurement();
-        reportDeviceStatus();
-    });
+    connect(m_reportTimer, &QTimer::timeout, this, &DIMM::reportMeasurement);
 
     m_startTimeMs = static_cast<uint32_t>(QDateTime::currentMSecsSinceEpoch());
 
@@ -675,6 +731,13 @@ DIMM::~DIMM()
     }
     if (m_simulationTimer) {
         m_simulationTimer->stop();
+    }
+    if (m_hardwareTriggerStartupTimer) {
+        m_hardwareTriggerStartupTimer->stop();
+    }
+
+    if (m_liveStartupRetryTimer) {
+        m_liveStartupRetryTimer->stop();
     }
     if (m_commManager) {
         m_commManager->disconnectFromHost();
@@ -704,6 +767,10 @@ void DIMM::setupConnections()
     connect(ui->btnFullFrame, &QAction::triggered, this, &DIMM::onShowMainPage);
     connect(ui->btnSettings, &QAction::triggered, this, &DIMM::onShowSettings);
     connect(m_actionAlignmentMode, &QAction::triggered, this, &DIMM::onToggleAlignmentMode);
+    connect(m_actionToggleCoarseAlignment,
+            &QAction::triggered,
+            this,
+            &DIMM::onToggleCoarseAlignment);
     connect(m_actionConfirmCamera1Polaris,
             &QAction::triggered,
             this,
@@ -738,7 +805,7 @@ void DIMM::setupConnections()
     connect(ui->actionToggleROIImages, &QAction::triggered, this, &DIMM::onToggleRoiImages);
     connect(ui->actionToggleCharts, &QAction::triggered, this, &DIMM::onToggleCharts);
     connect(ui->actionTrajectoryCalc, &QAction::triggered, this, [this]() {
-        QMessageBox::information(this, QStringLiteral("轨迹计算"), QStringLiteral("轨迹导入与预览功能将在后续版本中补充。"));
+        QMessageBox::information(this, QStringLiteral("轨迹计算"), QStringLiteral("轨迹导入与预览功能将在后续版本中补充"));
     });
     connect(ui->actionAbout, &QAction::triggered, this, &DIMM::onAbout);
 
@@ -764,6 +831,11 @@ void DIMM::setupConnections()
 void DIMM::resetMeasurementState()
 {
     auto& runtime = activeRuntime();
+
+    // Preserve the target confirmed in alignment mode so the next live
+    // full-frame localization can reacquire the same star. In contrast,
+    // lastTargetPosition belongs to the previous live tracking session
+    // and is intentionally reset below.
     const QPointF preservedConfirmedPolarisPosition[2] = {
         runtime.confirmedPolarisPosition[0],
         runtime.confirmedPolarisPosition[1]
@@ -785,6 +857,8 @@ void DIMM::resetMeasurementState()
     runtime.selectedInitialCandidateIndex[1] = -1;
     runtime.pendingInitialCandidateSelectionRequired[0] = false;
     runtime.pendingInitialCandidateSelectionRequired[1] = false;
+    clearStableCandidateTrackers();
+    clearActualRoiTracks();
     if (m_fullFrameCanvas1) {
         m_fullFrameCanvas1->clearStarCandidateOverlays();
     }
@@ -797,17 +871,14 @@ void DIMM::resetMeasurementState()
     m_lastRoiUpdateReason.clear();
     resetSyncDiagnostics();
     resetLiveFrameAcceptanceGates();
-    resetAutoExposureState();
+    resetAutoExposureState(false);
     if (m_r0Chart) {
         m_r0Chart->clear();
     }
     if (m_seeingChart) {
         m_seeingChart->clear();
     }
-    if (m_imageProcessor) {
-        m_imageProcessor->resetProcessingState();
-        m_liveAcquisitionGeneration = m_imageProcessor->currentAcquisitionGeneration();
-    }
+    advanceLiveAcquisitionGeneration();
     ui->lblCam1ROICoord->setText(QStringLiteral("(0.0, 0.0)"));
     ui->lblCam2ROICoord->setText(QStringLiteral("(0.0, 0.0)"));
     refreshMeasurementUi();
@@ -845,7 +916,7 @@ bool DIMM::canStartLiveCapture(QString* reason) const
 {
     if (m_connectingCameras) {
         if (reason) {
-            *reason = QStringLiteral("相机正在连接中，请等待当前连接流程完成。");
+            *reason = QStringLiteral("相机正在连接中，请等待当前连接流程完成");
         }
         return false;
     }
@@ -859,8 +930,8 @@ bool DIMM::canStartLiveCapture(QString* reason) const
     if (cameraCount < 2) {
         if (reason) {
             *reason = cameraCount == 0
-                          ? QStringLiteral("当前未连接相机。\n请先连接两台相机后再开始实时采集")
-                          : QStringLiteral("当前只连接了一台相机。\n请先确保两台相机都已连接后再开始实时采集");
+                          ? QStringLiteral("当前未连接相机。\n请先连接两台相机后再开始实时采集。")
+                          : QStringLiteral("当前只连接了一台相机。\n请先确保两台相机都已连接后再开始实时采集。");
         }
         return false;
     }
@@ -871,13 +942,13 @@ bool DIMM::canConnectOrDisconnectCameras(QString* reason) const
 {
     if (hasActiveCapture()) {
         if (reason) {
-            *reason = QStringLiteral("请先停止或暂停采集，再执行相机连接操作。");
+            *reason = QStringLiteral("请先停止或暂停采集，再执行相机连接操作");
         }
         return false;
     }
     if (m_connectingCameras) {
         if (reason) {
-            *reason = QStringLiteral("相机连接流程仍在进行中，请稍候。");
+            *reason = QStringLiteral("相机连接流程仍在进行中，请稍候");
         }
         return false;
     }
@@ -939,7 +1010,7 @@ bool DIMM::isSimulationCaptureActive() const
 
 bool DIMM::canReportMeasurements() const
 {
-    return m_commConnected && m_reporting && isLiveCaptureActive() && activeRuntime().hasValidAtmosphere;
+    return m_commConnected && m_reporting && isLiveCaptureActive();
 }
 
 QString DIMM::captureModeName() const
@@ -1080,8 +1151,7 @@ void DIMM::onPolarisSolveStatusChanged(int cameraIndex,
 InitialStarSelection DIMM::selectAlignmentInitialCandidate(
     int cameraIndex,
     const QVector<InitialStarCandidate>& candidates,
-    bool manualSelectionRequested,
-    QPointF* preferredTarget)
+    bool manualSelectionRequested)
 {
     auto& runtime = m_liveRuntime;
     AlignmentCandidateRuntimeAccess access;
@@ -1092,8 +1162,7 @@ InitialStarSelection DIMM::selectAlignmentInitialCandidate(
     access.selectedInitialCandidateIndex = &runtime.selectedInitialCandidateIndex[cameraIndex];
     return AlignmentSession::selectInitialCandidate(access,
                                                     candidates,
-                                                    manualSelectionRequested,
-                                                    preferredTarget);
+                                                    manualSelectionRequested);
 }
 
 bool DIMM::handleManualAlignmentCandidatePrompt(
@@ -1101,7 +1170,6 @@ bool DIMM::handleManualAlignmentCandidatePrompt(
     FullFrameCanvas* targetCanvas,
     FullFrameCanvas::AlignmentOverlay* overlay,
     const QVector<InitialStarCandidate>& candidates,
-    const QPointF& preferredTarget,
     InitialStarSelection* selection)
 {
     auto& runtime = m_liveRuntime;
@@ -1135,11 +1203,10 @@ bool DIMM::handleManualAlignmentCandidatePrompt(
             PolarisDetectionPipeline::buildCandidateOverlays(candidates, chosenCandidateIndex));
     }
     if (selection) {
-        *selection = PolarisDetectionPipeline::selectInitialStarCandidate(
+        *selection = PolarisDetectionPipeline::selectFullFrameStarCandidate(
             candidates,
-            false,
-            preferredTarget,
-            runtime.selectedInitialCandidateIndex[cameraIndex]);
+            runtime.selectedInitialCandidateIndex[cameraIndex],
+            true);
         runtime.pendingInitialCandidateSelectionRequired[cameraIndex] =
             selection->requiresUserSelection;
     }
@@ -1171,6 +1238,9 @@ void DIMM::applyAlignmentSelectedCandidate(
     AlignmentSession::recordSelectedCandidate(access,
                                               star,
                                               selection.candidate.index);
+    runtime.hasConfirmedPolarisPhase[cameraIndex] = false;
+    runtime.confirmedPolarisPhaseRad[cameraIndex] = 0.0;
+    runtime.confirmedPolarisTimeUtc[cameraIndex] = QDateTime();
     if (manualSelectionRequested) {
         applyManualAlignmentConfirmation(cameraIndex, star);
     }
@@ -1214,7 +1284,7 @@ void DIMM::updateConfirmedPolarisFromFallbackCentroid(int cameraIndex,
         } else {
             cv::cvtColor(frame, grayscale, cv::COLOR_BGR2GRAY);
         }
-        *mono8 = ImageUtils::normalizeMono8Frame(grayscale);
+        *mono8 = grayscale;
     }
     AlignmentCandidateRuntimeAccess access;
     access.confirmedPolarisPosition = &runtime.confirmedPolarisPosition[cameraIndex];
@@ -1239,6 +1309,7 @@ void DIMM::updateConfirmedPolarisFromFallbackCentroid(int cameraIndex,
 void DIMM::evaluateAutoAcquisitionSchedule()
 {
     if (!m_autoAcquisitionConfig.enabled) {
+        m_autoAcquisitionRecovery.reset();
         return;
     }
 
@@ -1252,7 +1323,13 @@ void DIMM::evaluateAutoAcquisitionSchedule()
         return;
     }
 
+    if (!m_autoAcquisitionSuppressedWindowId.isEmpty() &&
+        m_autoAcquisitionSuppressedWindowId != window.windowId) {
+        m_autoAcquisitionSuppressedWindowId.clear();
+    }
+
     const bool insideWindow = AutoAcquisitionScheduler::contains(window, now);
+    const qint64 nowMs = now.toMSecsSinceEpoch();
     if (!insideWindow) {
         if (m_autoAcquisitionStartedCurrentRun && m_captureState == CaptureState::Live) {
             m_autoAcquisitionCommandInProgress = true;
@@ -1267,6 +1344,18 @@ void DIMM::evaluateAutoAcquisitionSchedule()
         if (m_autoAcquisitionActiveWindowId != window.windowId) {
             m_autoAcquisitionActiveWindowId.clear();
         }
+        m_autoAcquisitionRecovery.leaveWindow();
+        clearStableCandidateTrackers();
+        return;
+    }
+
+    if (m_autoAcquisitionRecovery.windowId() != window.windowId) {
+        clearStableCandidateTrackers();
+        clearActualRoiTracks();
+    }
+    m_autoAcquisitionRecovery.enterWindow(window.windowId, nowMs);
+
+    if (m_captureState == CaptureState::Live) {
         return;
     }
 
@@ -1277,10 +1366,6 @@ void DIMM::evaluateAutoAcquisitionSchedule()
         return;
     }
 
-    if (m_captureState == CaptureState::Live) {
-        return;
-    }
-
     if (m_captureState == CaptureState::Alignment || m_captureState == CaptureState::Simulation) {
         setAutoAcquisitionStatus(QStringLiteral("自动采集等待当前模式结束"),
                                  UiStatusLevel::Warning,
@@ -1288,12 +1373,12 @@ void DIMM::evaluateAutoAcquisitionSchedule()
         return;
     }
 
-    const qint64 nowMs = now.toMSecsSinceEpoch();
-    if (m_lastAutoAcquisitionAttemptMs >= 0 &&
-        nowMs - m_lastAutoAcquisitionAttemptMs < 60000) {
+    if (!m_autoAcquisitionRecovery.shouldAttemptScan(
+            window.windowId,
+            nowMs,
+            m_autoAcquisitionConfig.recoveryScanIntervalMinutes)) {
         return;
     }
-    m_lastAutoAcquisitionAttemptMs = nowMs;
 
     QString reason;
     if (!canStartLiveCapture(&reason)) {
@@ -1305,6 +1390,22 @@ void DIMM::evaluateAutoAcquisitionSchedule()
         return;
     }
 
+    resetAutoExposureState(true);
+
+    m_liveStartupOrigin =
+        LiveStartupOrigin::AutoAcquisition;
+
+    m_liveStartupWindowId =
+        window.windowId;
+
+    m_liveStartupRetryCount = 0;
+    m_liveStartupConfirmed = false;
+    m_liveStartupRecoveryInProgress = false;
+    m_pulseBoardResponseTimedOut = false;
+
+    m_autoAcquisitionRecovery.noteScanStarted(window.windowId, nowMs);
+    m_lastAutoAcquisitionAttemptMs = nowMs;
+
     m_autoAcquisitionCommandInProgress = true;
     onStartCapture();
     m_autoAcquisitionCommandInProgress = false;
@@ -1312,9 +1413,19 @@ void DIMM::evaluateAutoAcquisitionSchedule()
     if (m_captureState == CaptureState::Live) {
         m_autoAcquisitionStartedCurrentRun = true;
         m_autoAcquisitionActiveWindowId = window.windowId;
-        setAutoAcquisitionStatus(QStringLiteral("自动采集已按计划启动"),
-                                 UiStatusLevel::Success,
-                                 QStringLiteral("auto-start"));
+        m_autoAcquisitionRecovery.noteTrackingStarted(window.windowId);
+
+        if (m_configTriggerMode == 0) {
+            setAutoAcquisitionStatus(
+                QStringLiteral("自动采集已按计划启动"),
+                UiStatusLevel::Success,
+                QStringLiteral("auto-start"));
+        } else {
+            setAutoAcquisitionStatus(
+                QStringLiteral("自动采集启动流程已发起，等待全画幅和 ROI 高频触发确认"),
+                UiStatusLevel::Warning,
+                QStringLiteral("auto-start-pending"));
+        }
     }
 }
 
@@ -1334,14 +1445,72 @@ void DIMM::setAutoAcquisitionStatus(const QString& text,
     setStatusMessage(text, level);
 }
 
+void DIMM::stopAutoAcquisitionScanUntilNextInterval(const QString& reason,
+                                                    bool manualSelectionRequired)
+{
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (manualSelectionRequired) {
+        m_autoAcquisitionRecovery.noteManualSelectionRequired(nowMs);
+    } else {
+        m_autoAcquisitionRecovery.noteScanFoundNoStar(nowMs);
+    }
+
+    const bool previousCommandState = m_autoAcquisitionCommandInProgress;
+    m_autoAcquisitionCommandInProgress = true;
+    if (m_captureState == CaptureState::Live) {
+        onStopCapture();
+    }
+    m_autoAcquisitionCommandInProgress = previousCommandState;
+
+    m_autoAcquisitionStartedCurrentRun = false;
+    m_autoAcquisitionActiveWindowId.clear();
+    m_liveStartupOrigin = LiveStartupOrigin::Manual;
+    m_liveStartupWindowId.clear();
+    m_liveStartupConfirmed = false;
+    m_liveStartupRecoveryInProgress = false;
+    m_liveHardwareRoiActive = false;
+    m_liveStartupPhase = LiveStartupPhase::None;
+
+    setAutoAcquisitionStatus(reason,
+                             manualSelectionRequired ? UiStatusLevel::Warning
+                                                     : UiStatusLevel::Info,
+                             manualSelectionRequired
+                                 ? QStringLiteral("auto-manual-selection-hold")
+                                 : QStringLiteral("auto-wait-next-scan"));
+}
+
 void DIMM::noteManualAutoAcquisitionStopIfNeeded()
 {
-    if (m_autoAcquisitionCommandInProgress ||
-        !m_autoAcquisitionStartedCurrentRun ||
-        m_autoAcquisitionActiveWindowId.isEmpty()) {
+    if (m_autoAcquisitionCommandInProgress) {
         return;
     }
-    m_autoAcquisitionSuppressedWindowId = m_autoAcquisitionActiveWindowId;
+
+    QString suppressedWindowId;
+    bool shouldSuppress = false;
+
+    if (m_autoAcquisitionStartedCurrentRun &&
+        !m_autoAcquisitionActiveWindowId.isEmpty()) {
+        suppressedWindowId = m_autoAcquisitionActiveWindowId;
+        shouldSuppress = true;
+    } else if (m_autoAcquisitionConfig.enabled) {
+        const QDateTime now = QDateTime::currentDateTime();
+        const AutoAcquisitionWindow window =
+            AutoAcquisitionScheduler::resolveWindow(
+                m_autoAcquisitionConfig,
+                now);
+        if (window.valid &&
+            AutoAcquisitionScheduler::contains(window, now)) {
+            suppressedWindowId = window.windowId;
+            shouldSuppress = true;
+        }
+    }
+
+    if (!shouldSuppress || suppressedWindowId.isEmpty()) {
+        return;
+    }
+
+    m_autoAcquisitionSuppressedWindowId = suppressedWindowId;
+    m_autoAcquisitionRecovery.noteManualStop();
     m_autoAcquisitionStartedCurrentRun = false;
     m_autoAcquisitionActiveWindowId.clear();
     setAutoAcquisitionStatus(QStringLiteral("自动采集已手动停止，本观测窗口不再自动重启"),
@@ -1349,16 +1518,266 @@ void DIMM::noteManualAutoAcquisitionStopIfNeeded()
                              QStringLiteral("manual-stop-suppression"));
 }
 
+bool DIMM::shouldRetryFailedLiveStartup() const
+{
+    if (m_liveStartupOrigin ==
+        LiveStartupOrigin::Manual) {
+        return true;
+    }
+
+    if (!m_autoAcquisitionConfig.enabled) {
+        return false;
+    }
+
+    const QDateTime now =
+        QDateTime::currentDateTime();
+
+    const AutoAcquisitionWindow window =
+        AutoAcquisitionScheduler::resolveWindow(
+            m_autoAcquisitionConfig,
+            now);
+
+    if (!window.valid ||
+        !AutoAcquisitionScheduler::contains(
+            window,
+            now)) {
+        return false;
+    }
+
+    if (window.windowId !=
+        m_liveStartupWindowId) {
+        return false;
+    }
+
+    if (m_autoAcquisitionSuppressedWindowId ==
+        window.windowId) {
+        return false;
+    }
+
+    return true;
+}
+
+void DIMM::handleHardwareTriggerStartupFailure(
+    const QString& detail)
+{
+    if (m_liveStartupRecoveryInProgress) {
+        return;
+    }
+
+    m_hardwareTriggerStartupStage =
+        HardwareTriggerStartupStage::None;
+
+    for (int cameraIndex = 0;
+         cameraIndex < 2;
+         ++cameraIndex) {
+        m_hardwareTriggerStageFrameSeen[cameraIndex] = false;
+    }
+
+    m_liveStartupRecoveryInProgress = true;
+    m_liveStartupConfirmed = false;
+    m_pulseBoardResponseTimedOut = false;
+
+    if (m_hardwareTriggerStartupTimer) {
+        m_hardwareTriggerStartupTimer->stop();
+    }
+
+    const bool previousCommandState =
+        m_autoAcquisitionCommandInProgress;
+
+    /*
+     * 内部故障恢复不属于用户手动停止。
+     * 临时置为 true，阻止当前观测窗口被标记为人工停止。
+     * noteManualAutoAcquisitionStopIfNeeded()
+     * 写入 suppressedWindowId。
+     */
+    m_autoAcquisitionCommandInProgress = true;
+
+    stopLiveCapture();
+
+    m_reporting = false;
+    if (m_reportTimer) {
+        m_reportTimer->stop();
+    }
+
+    closeResultFile();
+    updateCaptureState(CaptureState::Idle);
+    resetMeasurementState();
+
+    m_autoAcquisitionCommandInProgress =
+        previousCommandState;
+
+    const bool retryAllowed =
+        m_liveStartupRetryCount <
+            kLiveStartupMaxImmediateRetries &&
+        shouldRetryFailedLiveStartup();
+
+    if (!retryAllowed) {
+        m_liveStartupRecoveryInProgress = false;
+
+        if (m_liveStartupOrigin ==
+            LiveStartupOrigin::AutoAcquisition) {
+            /*
+             * 允许现有 1 分钟调度器稍后再次尝试。
+             */
+            m_autoAcquisitionStartedCurrentRun = false;
+            m_autoAcquisitionActiveWindowId.clear();
+            m_lastAutoAcquisitionAttemptMs =
+                QDateTime::currentMSecsSinceEpoch();
+
+            setAutoAcquisitionStatus(
+                QStringLiteral(
+                    "自动采集硬件触发连续启动失败，已安全停止，稍后重新尝试"),
+                UiStatusLevel::Error,
+                QStringLiteral(
+                    "auto-start-retry-exhausted"));
+        } else {
+            setStatusMessage(
+                QStringLiteral(
+                    "硬件触发启动失败，已安全停止: %1")
+                    .arg(detail),
+                UiStatusLevel::Error);
+        }
+
+        return;
+    }
+
+    ++m_liveStartupRetryCount;
+
+    setStatusMessage(
+        QStringLiteral(
+            "硬件触发启动失败，已自动停止。\n"
+            "%1 秒后进行第 %2/%3 次重试。原因: %4")
+            .arg(kLiveStartupRetryDelayMs / 1000)
+            .arg(m_liveStartupRetryCount)
+            .arg(kLiveStartupMaxImmediateRetries)
+            .arg(detail),
+        UiStatusLevel::Warning);
+
+    if (m_liveStartupRetryTimer) {
+        m_liveStartupRetryTimer->start(
+            kLiveStartupRetryDelayMs);
+    } else {
+        m_liveStartupRecoveryInProgress = false;
+    }
+}
+
+void DIMM::retryFailedLiveStartup()
+{
+    if (!m_liveStartupRecoveryInProgress) {
+        return;
+    }
+
+    if (!shouldRetryFailedLiveStartup()) {
+        m_liveStartupRecoveryInProgress = false;
+
+        setStatusMessage(
+            QStringLiteral(
+                "硬件触发自动重试已取消"),
+            UiStatusLevel::Warning);
+
+        return;
+    }
+
+    const LiveStartupOrigin startupOrigin =
+        m_liveStartupOrigin;
+
+    const QString startupWindowId =
+        m_liveStartupWindowId;
+
+    m_liveStartupRecoveryInProgress = false;
+    m_liveStartupConfirmed = false;
+    m_pulseBoardResponseTimedOut = false;
+
+    /*
+     * 防止 onStartCapture() 把自动重试覆盖为手动启动。
+     */
+    const bool automatic =
+        startupOrigin ==
+        LiveStartupOrigin::AutoAcquisition;
+
+    const bool previousAutoCommandState =
+        m_autoAcquisitionCommandInProgress;
+
+    const bool previousInternalRetryState =
+        m_internalLiveStartupRetry;
+
+    m_autoAcquisitionCommandInProgress =
+        automatic;
+
+    m_internalLiveStartupRetry = true;
+
+    m_liveStartupOrigin = startupOrigin;
+    m_liveStartupWindowId = startupWindowId;
+
+    onStartCapture();
+
+    m_internalLiveStartupRetry =
+        previousInternalRetryState;
+
+    m_autoAcquisitionCommandInProgress =
+        previousAutoCommandState;
+
+    /*
+     * onStartCapture() 可能立即失败并回到 Idle。
+     * 此时继续进入统一失败恢复。
+     */
+    if (m_captureState != CaptureState::Live) {
+        handleHardwareTriggerStartupFailure(
+            QStringLiteral(
+                "重新启动采集流程失败"));
+    }
+}
+
+bool DIMM::isPulseBoardResponseTimeout(const QString& reason) const
+{
+    return reason.contains(QStringLiteral("Timed out waiting for pulse-board response."),
+                           Qt::CaseInsensitive);
+}
+
+void DIMM::setPulseBoardResponseTimeoutStatus(const QString& text,
+                                              UiStatusLevel level)
+{
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (m_lastPulseBoardTimeoutStatusMs >= 0 &&
+        nowMs - m_lastPulseBoardTimeoutStatusMs <
+            kPulseBoardTimeoutStatusThrottleMs) {
+        return;
+    }
+
+    m_lastPulseBoardTimeoutStatusMs = nowMs;
+    setStatusMessage(text, level);
+}
+
 void DIMM::onStartCapture()
 {
+    if (!m_autoAcquisitionCommandInProgress &&
+        !m_internalLiveStartupRetry &&
+        !m_liveStartupRecoveryInProgress &&
+        m_captureState != CaptureState::Live) {
+        m_liveStartupOrigin =
+            LiveStartupOrigin::Manual;
+
+        m_liveStartupWindowId.clear();
+        m_liveStartupRetryCount = 0;
+        m_liveStartupConfirmed = false;
+        m_pulseBoardResponseTimedOut = false;
+        m_lastPulseBoardTimeoutStatusMs = -1;
+
+        if (m_liveStartupRetryTimer) {
+            m_liveStartupRetryTimer->stop();
+        }
+    }
+
     if (m_captureState == CaptureState::Alignment) {
-        const QString message = QStringLiteral("请先退出对准模式，再开始正式采集");
+        const QString message = QStringLiteral("请先退出对准模式，再开始正式采集。");
         QMessageBox::warning(this, QStringLiteral("开始采集"), message);
         setStatusMessage(QStringLiteral("状态: 请先退出对准模式"), UiStatusLevel::Warning);
         return;
     }
 
     if (m_captureState == CaptureState::Live) {
+        resetLiveStartupRecoveryState(true);
+
         noteManualAutoAcquisitionStopIfNeeded();
         stopLiveCapture();
         updateCaptureState(CaptureState::Paused);
@@ -1382,6 +1801,14 @@ void DIMM::onStartCapture()
         return;
     }
 
+    m_liveStartupConfirmed = false;
+    m_pulseBoardResponseTimedOut = false;
+    m_lastPulseBoardTimeoutStatusMs = -1;
+
+    if (m_hardwareTriggerStartupTimer) {
+        m_hardwareTriggerStartupTimer->stop();
+    }
+
     closeResultFile();
     resetMeasurementState();
     m_liveHardwareRoiActive = false;
@@ -1400,46 +1827,90 @@ void DIMM::onStartCapture()
 
     if (liveStarted) {
         updateCaptureState(CaptureState::Live);
+        m_reporting = m_commConnected;
+        if (m_reporting && m_reportTimer) {
+            m_reportTimer->start();
+        }
         if (m_configTriggerMode == 0) {
             setStatusMessage(QStringLiteral("状态: 连续采集已启动，正在双相机全画幅定位"),
                              UiStatusLevel::Warning);
         } else {
-            m_liveStartupPhase = LiveStartupPhase::LocatePair;
+            m_liveStartupPhase =
+                LiveStartupPhase::LocatePair;
+
             const bool reuseRunningPulse =
-                m_pulseGeneratorEnabled && m_pulseGenerator && m_pulseGenerator->isRunning();
+                isFullFrameLocalizationPulseRunning();
+
             if (reuseRunningPulse) {
-                setStatusMessage(QStringLiteral("状态: 硬件触发已就绪，复用当前脉冲输出进行双相机全画幅定位"),
-                                 UiStatusLevel::Success);
-            } else {
-                if (!startFullFrameLocalizationPulse(&reason)) {
-                    const bool pulseResponseTimeout =
-                        reason.contains(QStringLiteral("Timed out waiting for pulse-board response."),
-                                        Qt::CaseInsensitive);
-                    if (pulseResponseTimeout) {
-                        setStatusMessage(QStringLiteral("状态: 脉冲板应答超时，但已继续等待首帧确认硬件触发是否生效"),
-                                         UiStatusLevel::Warning);
-                        scheduleHardwareTriggerStartupCheck();
-                        return;
-                    }
-                    m_cameraManager->stopAll();
-                    updateCaptureState(CaptureState::Idle);
-                    setStatusMessage(reason.isEmpty()
-                                         ? QStringLiteral("状态: 全画幅低频触发启动失败")
-                                         : reason,
-                                     UiStatusLevel::Error);
-                    QMessageBox::warning(this,
-                                         QStringLiteral("开始采集"),
-                                         reason.isEmpty()
-                                             ? QStringLiteral("全画幅低频触发启动失败。")
-                                             : reason);
+                beginHardwareTriggerStartupStage(
+                    HardwareTriggerStartupStage::WaitingFullFramePair);
+
+                setStatusMessage(
+                    QStringLiteral(
+                        "状态: 硬件触发已就绪，复用当前脉冲输出并等待双相机新的全画幅图像"),
+                    UiStatusLevel::Success);
+
+                return;
+            }
+
+            if (!startFullFrameLocalizationPulse(&reason)) {
+                if (isPulseBoardResponseTimeout(reason)) {
+                    m_pulseBoardResponseTimedOut = true;
+
+                    beginHardwareTriggerStartupStage(
+                        HardwareTriggerStartupStage::WaitingFullFramePair);
+
+                    setPulseBoardResponseTimeoutStatus(
+                        QStringLiteral(
+                            "状态: 脉冲板全画幅触发应答超时，继续等待双相机新的全画幅图像确认触发是否生效"));
+
                     return;
                 }
-                setStatusMessage(m_pulseGeneratorEnabled
-                                     ? QStringLiteral("状态: 硬件触发已就绪，正在 2Hz 低频脉冲进行双相机全画幅定位")
-                                     : QStringLiteral("状态: 硬件触发已就绪，请输出低频脉冲进行双相机全画幅定位"),
-                                 m_pulseGeneratorEnabled ? UiStatusLevel::Success : UiStatusLevel::Warning);
+
+                m_hardwareTriggerStartupStage =
+                    HardwareTriggerStartupStage::None;
+
+                if (m_hardwareTriggerStartupTimer) {
+                    m_hardwareTriggerStartupTimer->stop();
+                }
+
+                m_liveStartupConfirmed = false;
+                m_pulseBoardResponseTimedOut = false;
+
+                m_cameraManager->stopAll();
+
+                updateCaptureState(CaptureState::Idle);
+
+                setStatusMessage(
+                    reason.isEmpty()
+                        ? QStringLiteral("状态: 全画幅低频触发启动失败")
+                        : reason,
+                    UiStatusLevel::Error);
+
+                QMessageBox::warning(
+                    this,
+                    QStringLiteral("开始采集"),
+                    reason.isEmpty()
+                        ? QStringLiteral("全画幅低频触发启动失败。")
+                        : reason);
+
+                return;
             }
-            scheduleHardwareTriggerStartupCheck();
+
+            beginHardwareTriggerStartupStage(
+                HardwareTriggerStartupStage::WaitingFullFramePair);
+
+            setStatusMessage(
+                m_pulseGeneratorEnabled
+                    ? QStringLiteral(
+                          "状态: 全画幅低频触发已发起，等待双相机新的全画幅图像")
+                    : QStringLiteral(
+                          "状态: 请输出低频脉冲，等待双相机新的全画幅图像"),
+                m_pulseGeneratorEnabled
+                    ? UiStatusLevel::Success
+                    : UiStatusLevel::Warning);
+
+            return;
         }
         return;
     }
@@ -1454,6 +1925,8 @@ void DIMM::onStopCapture()
         stopAlignmentMode();
         return;
     }
+
+    resetLiveStartupRecoveryState(true);
 
     noteManualAutoAcquisitionStopIfNeeded();
 
@@ -1496,7 +1969,7 @@ void DIMM::onShowSettings()
     if (!isSettingsApplyAllowed()) {
         QMessageBox::information(this,
                                  QStringLiteral("设置"),
-                                 QStringLiteral("相机连接流程进行中，请等待完成后再修改设置。"));
+                                 QStringLiteral("相机连接流程进行中，请等待完成后再修改设置"));
         return;
     }
 
@@ -1536,9 +2009,17 @@ void DIMM::onShowSettings()
     m_settingsDialog->autoExpDarkFrameRatioEdit->setText(QString::number(m_autoExposureConfig.darkFrameRatioThreshold, 'f', 2));
     m_settingsDialog->autoExpStableFrameRatioEdit->setText(QString::number(m_autoExposureConfig.stableFrameRatioThreshold, 'f', 2));
     m_settingsDialog->autoExpHardSaturationFrameRatioEdit->setText(QString::number(m_autoExposureConfig.hardSaturationFrameRatioThreshold, 'f', 2));
-    m_settingsDialog->autoExpSampleWindowSecEdit->setText(QString::number(m_autoExposureConfig.sampleWindowSec));
-    m_settingsDialog->autoExpSampleIntervalMsEdit->setText(QString::number(m_autoExposureConfig.autoExposureSampleIntervalMs));
+    if (m_settingsDialog->autoExpSampleWindowSecEdit) {
+        m_settingsDialog->autoExpSampleWindowSecEdit->setText(QString::number(m_autoExposureConfig.sampleWindowSec));
+    }
+    if (m_settingsDialog->autoExpSampleIntervalMsEdit) {
+        m_settingsDialog->autoExpSampleIntervalMsEdit->setText(
+            QString::number(m_autoExposureConfig.autoExposureSampleIntervalMs));
+    }
     m_settingsDialog->autoExpMinDecisionSampleCountEdit->setText(QString::number(m_autoExposureConfig.minDecisionSampleCount));
+    m_settingsDialog->autoExpStepUsEdit->setText(QString::number(m_autoExposureConfig.autoExposureStepUs, 'f', 0));
+    m_settingsDialog->autoExpInitialExposureUsEdit->setText(QString::number(m_autoExposureConfig.initialExposureUs, 'f', 0));
+    m_settingsDialog->autoExpDecisionCooldownMinEdit->setText(QString::number(m_autoExposureConfig.autoExposureDecisionCooldownMin));
     m_settingsDialog->autoExpTrendConflictPersistenceSecEdit->setText(QString::number(m_autoExposureConfig.trendConflictPersistenceSec));
     m_settingsDialog->autoExpMinEdit->setText(QString::number(m_autoExposureConfig.minExposureUs, 'f', 0));
     m_settingsDialog->autoExpMaxEdit->setText(QString::number(m_autoExposureConfig.maxExposureUs, 'f', 0));
@@ -1561,11 +2042,6 @@ void DIMM::onShowSettings()
             m_settingsDialog->centroidModeCombo->findData(m_imageProcessor->centroidMode());
         m_settingsDialog->centroidModeCombo->setCurrentIndex(modeIndex >= 0 ? modeIndex : 0);
     }
-    if (m_settingsDialog->peakKernelMethodCombo) {
-        const int methodIndex =
-            m_settingsDialog->peakKernelMethodCombo->findData(m_imageProcessor->peakKernelMethod());
-        m_settingsDialog->peakKernelMethodCombo->setCurrentIndex(methodIndex >= 0 ? methodIndex : 1);
-    }
     if (m_settingsDialog->peakKernelRadiusEdit) {
         m_settingsDialog->peakKernelRadiusEdit->setText(
             QString::number(m_imageProcessor->peakKernelRadiusPx()));
@@ -1573,6 +2049,10 @@ void DIMM::onShowSettings()
     if (m_settingsDialog->strongHotPixelExcessEdit) {
         m_settingsDialog->strongHotPixelExcessEdit->setText(
             QString::number(m_imageProcessor->strongHotPixelExcessDn(), 'f', 0));
+    }
+    if (m_settingsDialog->r0HistoryWindowFramesEdit) {
+        m_settingsDialog->r0HistoryWindowFramesEdit->setText(
+            QString::number(m_imageProcessor->atmosphereHistoryWindowFrames()));
     }
     m_settingsDialog->roiRecenterThresholdEdit->setText(
         QString::number(m_roiRecenteringThresholdPx, 'f', 1));
@@ -1583,14 +2063,10 @@ void DIMM::onShowSettings()
     m_settingsDialog->roiRecenterMinimumShiftEdit->setText(
         QString::number(m_roiRecenteringMinimumShiftPx, 'f', 1));
     const InitialStarDetectionConfig starConfig = currentInitialStarDetectionConfig();
-    m_settingsDialog->starThresholdAbsoluteEdit->setText(
-        QString::number(starConfig.thresholdAbsolute, 'f', 1));
     m_settingsDialog->starSigmaThresholdEdit->setText(
         QString::number(starConfig.sigmaThreshold, 'f', 2));
     m_settingsDialog->starPeakFractionEdit->setText(
         QString::number(starConfig.peakFraction, 'f', 2));
-    m_settingsDialog->starMinimumIntensityEdit->setText(
-        QString::number(starConfig.minimumIntensity, 'f', 1));
     m_settingsDialog->starMinAreaEdit->setText(QString::number(starConfig.minArea));
     m_settingsDialog->starMaxAreaEdit->setText(QString::number(starConfig.maxArea));
     m_settingsDialog->hotPixelEnableCheck->setChecked(m_hotPixelTemplatesEnabled);
@@ -1640,6 +2116,7 @@ void DIMM::onShowSettings()
                                              m_pulseGeneratorRemoteControl);
     m_settingsDialog->netIpEdit->setText(m_commManager->remoteAddress());
     m_settingsDialog->netPortEdit->setText(QString::number(m_commManager->remotePort()));
+    m_settingsDialog->setCommittedConfig(currentAppConfig());
     if (m_settingsDialog->applyStatusLabel) {
         m_settingsDialog->applyStatusLabel->setText(QStringLiteral("待应用"));
         m_settingsDialog->applyStatusLabel->setStyleSheet(statusLabelStyle(UiStatusLevel::Muted));
@@ -1700,7 +2177,7 @@ void DIMM::onExportData()
     } else {
         QMessageBox::warning(this,
                              QStringLiteral("导出数据"),
-                             QStringLiteral("导出失败，请检查目标路径是否可写。"));
+                             QStringLiteral("导出失败，请检查目标路径是否可写"));
     }
 }
 
@@ -1719,7 +2196,7 @@ void DIMM::onAbout()
                        QStringLiteral("<h3>C-DIMM 大气相干长度测量系统</h3>"
                                       "<p>版本: v1.0</p>"
                                       "<ul>"
-                                      "<li>双相机同步采集/li>"
+                                      "<li>双相机同步采集</li>"
                                       "<li>实时质心计算</li>"
                                       "<li>大气参数反演 (r0 / seeing / theta0 / tau0)</li>"
                                       "<li>结果记录与通信上报</li>"
@@ -1774,6 +2251,39 @@ void DIMM::updateCurrentRoi()
     updateMinuteRoi(true);
 }
 
+void DIMM::resetLiveStartupRecoveryState(bool resetRetryCount)
+{
+    if (m_hardwareTriggerStartupTimer) {
+        m_hardwareTriggerStartupTimer->stop();
+    }
+
+    if (m_liveStartupRetryTimer) {
+        m_liveStartupRetryTimer->stop();
+    }
+
+    m_liveStartupConfirmed = false;
+    m_liveStartupRecoveryInProgress = false;
+    m_pulseBoardResponseTimedOut = false;
+    m_lastPulseBoardTimeoutStatusMs = -1;
+
+    m_hardwareTriggerStartupStage =
+        HardwareTriggerStartupStage::None;
+
+    for (int cameraIndex = 0;
+         cameraIndex < 2;
+         ++cameraIndex) {
+        m_hardwareTriggerStageBaselineFrameCount[cameraIndex] = 0;
+        m_hardwareTriggerStageFrameSeen[cameraIndex] = false;
+    }
+
+    m_internalLiveStartupRetry = false;
+
+    if (resetRetryCount) {
+        m_liveStartupRetryCount = 0;
+        m_liveStartupWindowId.clear();
+    }
+}
+
 bool DIMM::stopLiveCapture()
 {
     if (m_captureState != CaptureState::Live) {
@@ -1783,8 +2293,21 @@ bool DIMM::stopLiveCapture()
     if (m_hardwareTriggerStartupTimer) {
         m_hardwareTriggerStartupTimer->stop();
     }
+    m_liveStartupConfirmed = false;
+    m_pulseBoardResponseTimedOut = false;
+    m_lastPulseBoardTimeoutStatusMs = -1;
     m_liveHardwareRoiActive = false;
     m_liveStartupPhase = LiveStartupPhase::None;
+
+    m_hardwareTriggerStartupStage =
+        HardwareTriggerStartupStage::None;
+
+    for (int cameraIndex = 0;
+         cameraIndex < 2;
+         ++cameraIndex) {
+        m_hardwareTriggerStageFrameSeen[cameraIndex] = false;
+    }
+
     if (m_pulseGenerator && m_pulseGenerator->isRunning()) {
         m_pulseGenerator->stop();
     }

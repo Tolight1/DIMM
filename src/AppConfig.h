@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ConnectedDomain.h"
+
 #include <QString>
 #include <QTime>
 #include <QtGlobal>
@@ -18,9 +20,9 @@ struct AutoExposureConfig {
     double darkRatio = 1.2;
     double brightRatio = 0.8;
 
-    double targetPeakLowDn = 3000.0;
+    double targetPeakLowDn = 500.0;
     double targetPeakHighDn = 3600.0;
-    double exposureHysteresisDn = 200.0;
+    double exposureHysteresisDn = 300.0;
     double hardSaturationDn = 4090.0;
     int saturatedPixelCount = 1;
 
@@ -33,7 +35,10 @@ struct AutoExposureConfig {
     bool trendConflictEnabled = true;
     double stableFrameRatioThreshold = 0.70;
     int autoExposureSampleIntervalMs = 500;
-    int minDecisionSampleCount = 20;
+    int minDecisionSampleCount = 500;
+    double autoExposureStepUs = 200.0;
+    double initialExposureUs = 4000.0;
+    int autoExposureDecisionCooldownMin = 30;
     double hardSaturationFrameRatioThreshold = 0.05;
     int peakSupportRadiusPx = 2;
     double peakSupportFraction = 0.50;
@@ -58,10 +63,10 @@ struct AutoExposureConfig {
 struct ProcessingConfig {
     int backgroundKernelSize = 5;
     double backgroundSigmaMultiplier = 4.0;
-    int centroidMode = 0;
-    int peakKernelMethod = 1;
+    int centroidMode = 1;
     int peakKernelRadiusPx = 3;
     double strongHotPixelExcessDn = 100.0;
+    int r0HistoryWindowFrames = 5000;
 };
 
 struct RoiRecenteringConfig {
@@ -72,12 +77,11 @@ struct RoiRecenteringConfig {
 };
 
 struct StarDetectionConfig {
-    double thresholdAbsolute = -1.0;
     double sigmaThreshold = 4.0;
     double peakFraction = 0.20;
-    double minimumIntensity = 16.0;
-    int minArea = 1;
+    int minArea = ConnectedDomain::kMinimumComponentArea;
     int maxArea = 1000;
+    int connectivity = ConnectedDomain::kDefaultConnectivity;
 };
 
 struct HotPixelConfig {
@@ -157,10 +161,11 @@ struct PulseGeneratorConfig {
 
 struct AutoAcquisitionConfig {
     bool enabled = false;
-    double latitudeDeg = 0.0;
-    double longitudeDeg = 0.0;
+    double latitudeDeg = 40.45;
+    double longitudeDeg = 116.86;
     int startOffsetMinutesAfterSunset = 30;
     int stopOffsetMinutesBeforeSunrise = 30;
+    int recoveryScanIntervalMinutes = 20;
     bool testTimeOverrideEnabled = false;
     QTime testStartTime = QTime(18, 30);
     QTime testStopTime = QTime(6, 0);
@@ -187,4 +192,62 @@ struct AppConfig {
     PulseGeneratorConfig pulseGenerator;
     AutoAcquisitionConfig autoAcquisition;
     NetworkConfig network;
+};
+
+struct ConfigChangeSet {
+    bool camera = false;
+    bool autoExposure = false;
+    bool trigger = false;
+    bool processing = false;
+    bool roiRecentering = false;
+    bool fullFrameStarDetection = false;
+    bool hotPixel = false;
+    bool optics = false;
+    bool alignment = false;
+    bool polarisSolver = false;
+    bool storage = false;
+    bool environmentSensor = false;
+    bool pulseGenerator = false;
+    bool autoAcquisition = false;
+    bool network = false;
+
+    bool any() const
+    {
+        return camera ||
+               autoExposure ||
+               trigger ||
+               processing ||
+               roiRecentering ||
+               fullFrameStarDetection ||
+               hotPixel ||
+               optics ||
+               alignment ||
+               polarisSolver ||
+               storage ||
+               environmentSensor ||
+               pulseGenerator ||
+               autoAcquisition ||
+               network;
+    }
+
+    static ConfigChangeSet all()
+    {
+        ConfigChangeSet changes;
+        changes.camera = true;
+        changes.autoExposure = true;
+        changes.trigger = true;
+        changes.processing = true;
+        changes.roiRecentering = true;
+        changes.fullFrameStarDetection = true;
+        changes.hotPixel = true;
+        changes.optics = true;
+        changes.alignment = true;
+        changes.polarisSolver = true;
+        changes.storage = true;
+        changes.environmentSensor = true;
+        changes.pulseGenerator = true;
+        changes.autoAcquisition = true;
+        changes.network = true;
+        return changes;
+    }
 };

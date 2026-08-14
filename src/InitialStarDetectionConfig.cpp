@@ -14,7 +14,6 @@
 #include <QTextStream>
 
 namespace {
-constexpr double kMono12MaxDn = 4095.0;
 
 InitialStarDetectionConfig loadInitialStarDetectionConfig()
 {
@@ -53,20 +52,19 @@ InitialStarDetectionConfig loadInitialStarDetectionConfig()
             continue;
         }
 
-        if (key == QStringLiteral("threshold_absolute") || key == QStringLiteral("absolute")) {
-            config.thresholdAbsolute = number >= 0.0 ? number : -1.0;
-        } else if (key == QStringLiteral("threshold_sigma") || key == QStringLiteral("sigma")) {
+        if (key == QStringLiteral("threshold_sigma") || key == QStringLiteral("sigma")) {
             config.sigmaThreshold = std::max(0.0, number);
         } else if (key == QStringLiteral("threshold_peak_fraction") ||
                    key == QStringLiteral("peak_fraction")) {
             config.peakFraction = std::clamp(number, 0.01, 0.95);
-        } else if (key == QStringLiteral("threshold_min_intensity") ||
-                   key == QStringLiteral("min_intensity")) {
-            config.minimumIntensity = std::max(0.0, number);
         } else if (key == QStringLiteral("star_min_area")) {
             config.minArea = std::max(1, static_cast<int>(std::lround(number)));
         } else if (key == QStringLiteral("star_max_area")) {
             config.maxArea = std::max(config.minArea, static_cast<int>(std::lround(number)));
+        } else if (key == QStringLiteral("connectivity") ||
+                   key == QStringLiteral("connected_domain_connectivity")) {
+            config.connectivity = ConnectedDomain::sanitizeConnectivity(
+                static_cast<int>(std::lround(number)));
         }
     }
     return config;
@@ -74,13 +72,11 @@ InitialStarDetectionConfig loadInitialStarDetectionConfig()
 
 InitialStarDetectionConfig sanitizeInitialStarDetectionConfig(InitialStarDetectionConfig config)
 {
-    config.thresholdAbsolute =
-        config.thresholdAbsolute >= 0.0 ? std::clamp(config.thresholdAbsolute, 0.0, kMono12MaxDn) : -1.0;
     config.sigmaThreshold = std::clamp(config.sigmaThreshold, 0.0, 20.0);
     config.peakFraction = std::clamp(config.peakFraction, 0.01, 0.95);
-    config.minimumIntensity = std::clamp(std::max(0.0, config.minimumIntensity), 0.0, kMono12MaxDn);
-    config.minArea = std::max(1, config.minArea);
+    config.minArea = std::max(ConnectedDomain::kMinimumComponentArea, config.minArea);
     config.maxArea = std::max(config.minArea, config.maxArea);
+    config.connectivity = ConnectedDomain::sanitizeConnectivity(config.connectivity);
     return config;
 }
 

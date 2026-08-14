@@ -1,0 +1,19 @@
+threshold_absolute=2100
+threshold_sigma=4.0
+threshold_peak_fraction=0.20
+threshold_min_intensity=260
+star_min_area=8
+star_max_area=1000
+
+# ROI centroid stage. Values above 255 are treated as 12-bit DN and mapped to 8-bit.
+roi_signal_sigma=4.0
+roi_noise_trim_fraction=0.10
+roi_min_signal_pixels=2
+
+# Optional hot-pixel correction. Paths use the 2000 us templates matching the current default exposure.
+hot_pixel_template_width=5120
+hot_pixel_template_height=5120
+camera_a_hot_pixel_mask=dark_noise_runs/run_20260709_174722/fixed_hot_pixel_intensity/camera_CAT26060002/exposure_0002000us/fixed_hot_pixel_mask_u8.raw
+camera_a_hot_pixel_excess=dark_noise_runs/run_20260709_174722/fixed_hot_pixel_intensity/camera_CAT26060002/exposure_0002000us/fixed_hot_pixel_excess_over_median_u16.raw
+camera_b_hot_pixel_mask=dark_noise_runs/run_20260709_174722/fixed_hot_pixel_intensity/camera_CAT26060003/exposure_0002000us/fixed_hot_pixel_mask_u8.raw
+camera_b_hot_pixel_excess=dark_noise_runs/run_20260709_174722/fixed_hot_pixel_intensity/camera_CAT26060003/exposure_0002000us/fixed_hot_pixel_excess_over_median_u16.raw
