@@ -181,7 +181,7 @@ class PolarisCandidateRoiStaticTest(unittest.TestCase):
         body = function_body(
             dimm_cpp,
             "void DIMM::onStartCapture()",
-            "void DIMM::onStartSimulation()",
+            "void DIMM::onStopCapture()",
         )
 
         self.assertIn("resetMeasurementState()", body)

@@ -38,7 +38,9 @@ class LiveRoiOverlayStaticTest(unittest.TestCase):
 
         self.assertIn("setRoiList", helper_body)
         self.assertNotIn("lastLivePreviewUpdateMs", helper_body)
-        self.assertNotIn("kSimulationPreviewIntervalMs", helper_body)
+
+        comm_cpp = read("src/DIMM.CommCamera.cpp")
+        self.assertIn("kLiveFullFramePreviewIntervalMs", comm_cpp)
 
     def test_tracking_roi_update_does_not_refresh_full_frame_overlays_immediately(self):
         dimm_cpp = read("src/DIMM.LiveRoi.cpp")

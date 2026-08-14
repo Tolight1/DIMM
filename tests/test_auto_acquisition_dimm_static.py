@@ -96,15 +96,15 @@ class AutoAcquisitionDimmStaticTest(unittest.TestCase):
         ]:
             self.assertIn(fragment, manual_body)
 
-        start_live_branch = cpp.split("if (m_captureState == CaptureState::Live)", 1)[1].split(
-            "if (m_captureState == CaptureState::Simulation)",
+        capture_body = cpp.split("void DIMM::onStartCapture()", 1)[1].split(
+            "void DIMM::onStopCapture()",
             1,
         )[0]
         stop_body = cpp.split("void DIMM::onStopCapture()", 1)[1].split(
             "void DIMM::onShowMainPage()",
             1,
         )[0]
-        self.assertIn("noteManualAutoAcquisitionStopIfNeeded();", start_live_branch)
+        self.assertIn("noteManualAutoAcquisitionStopIfNeeded();", capture_body)
         self.assertIn("noteManualAutoAcquisitionStopIfNeeded();", stop_body)
 
     def test_auto_acquisition_status_is_throttled(self):
