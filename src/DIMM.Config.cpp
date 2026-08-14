@@ -600,7 +600,6 @@ void DIMM::setupStorageSettingsCallbacks()
         if (!m_parameterValidationEnabled) {
             m_detailResultWriter.close();
             m_liveRuntime.pendingPairedCentroidDetails.clear();
-            m_simulationRuntime.pendingPairedCentroidDetails.clear();
         } else if (m_resultWriter.isOpen()) {
             initDetailResultFile();
         }

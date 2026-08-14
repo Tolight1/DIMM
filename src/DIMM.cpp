@@ -2103,7 +2103,7 @@ void DIMM::onExportData()
     if (m_resultFilePath.isEmpty() || !QFile::exists(m_resultFilePath)) {
         QMessageBox::warning(this,
                              QStringLiteral("导出数据"),
-                             QStringLiteral("当前还没有可导出的采集结果文件，请先运行一次模拟采集"));
+                             QStringLiteral("当前还没有可导出的采集结果文件，请先运行一次采集"));
         return;
     }
 
