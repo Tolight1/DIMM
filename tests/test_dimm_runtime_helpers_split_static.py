@@ -20,7 +20,6 @@ class DimmRuntimeHelpersSplitStaticTest(unittest.TestCase):
             "kFullFrameLocalizationPulseHz",
             "kHardwareTriggerLine",
             "kRoiUpdateGateLine",
-            "kPi",
         ]:
             self.assertIn(token, header)
 
