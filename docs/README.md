@@ -36,7 +36,6 @@ DIMM（Differential Image Motion Monitor，差分像运动监测仪）通过同�
 - 热像素 Mask / Excess 模板修正
 - 稳健峰值检测和自动曝光状态机
 - 北极星自动识别、星表匹配和局部跟踪
-- 模拟采集与无硬件算法调试
 - 温湿压传感器、EAF 自动调焦器和脉冲发生器接入
 - CSV 测量结果、详细质心数据和运行统计输出
 - TCP 二进制协议测量结果上报
@@ -125,7 +124,6 @@ flowchart LR
 | 连续采集 | 相机按照配置帧率持续输出 |
 | 硬件触发 | 两台相机接收统一脉冲源，适合双路同步测量 |
 | 对准模式 | 使用低速全画幅预览进行北极星识别和光轴调整 |
-| 模拟采集 | 不依赖实际相机，便于界面和算法调试 |
 
 ### 2. ROI 定位与跟踪
 
@@ -292,7 +290,6 @@ DIMM/
 │  ├─ DIMM.Config.cpp        # 配置读取、应用和持久化
 │  ├─ DIMM.LiveRoi.cpp       # 实时采集、定位和 ROI 更新
 │  ├─ DIMM.Results.cpp       # 结果保存和上报
-│  ├─ DIMM.Simulation.cpp    # 模拟采集
 │  ├─ ImageProcessor.*       # 图像处理线程、质心和大气参数
 │  ├─ AutoExposureLogic.h    # 自动曝光峰值分析
 │  ├─ AutoExposureController.h
@@ -592,9 +589,8 @@ ImageProcessorWorker::appendDifferentialSample
 
 ## 验证建议
 
-### 无硬件验证
+### 离线验证
 
-- 模拟采集能够稳定启动和停止；
 - UI 不因高频刷新阻塞；
 - 设置能够保存并在重启后恢复；
 - CSV 能正确创建、刷新和关闭；

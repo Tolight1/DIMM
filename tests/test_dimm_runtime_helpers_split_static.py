@@ -15,18 +15,16 @@ class DimmRuntimeHelpersSplitStaticTest(unittest.TestCase):
 
         for token in [
             "kFixedRoiSize",
-            "kSimulationFrameIntervalMs",
+            "kLiveFullFramePreviewIntervalMs",
             "kAlignmentCandidateDetectionRefreshMs",
             "kFullFrameLocalizationPulseHz",
             "kHardwareTriggerLine",
             "kRoiUpdateGateLine",
-            "kPi",
         ]:
             self.assertIn(token, header)
 
         for token in [
             "medianOfSamples",
-            "deterministicUnitNoise",
             "decimalYearFromUtc",
             "alignRoiValue",
             "toggleButtonStyle",

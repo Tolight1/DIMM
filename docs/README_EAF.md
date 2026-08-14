@@ -16,7 +16,7 @@
 复制到程序输出目录。
 
 ## 采集互锁
-Live、Simulation、Alignment 状态禁止普通焦点移动和参数写入。
+Live、Alignment 状态禁止普通焦点移动和参数写入。
 紧急停止仍允许。
 
 ## 测试记录

@@ -64,7 +64,7 @@ AlignmentStartReadiness validateAlignmentStartReadiness(bool hasCameraManager,
     }
 
     if (!idleOrPaused) {
-        readiness.reason = QStringLiteral("请先停止当前采集或模拟采集，再进入对准模式。");
+        readiness.reason = QStringLiteral("请先停止当前采集，再进入对准模式。");
         return readiness;
     }
 

@@ -328,24 +328,18 @@ void DIMM::refreshStatusUi()
 
     if (m_settingsDialog && m_settingsDialog->netStatusLabel) {
         QString netText;
-        if (isSimulationCaptureActive()) {
-            netText = m_commConnected
-                          ? QStringLiteral("状态: 已连接，模拟模式不对外上传")
-                          : QStringLiteral("状态: 模拟模式本地运行");
-        } else if (m_commConnected) {
+        if (m_commConnected) {
             netText = QStringLiteral("状态: 已连接");
         } else if (m_commConnecting) {
             netText = QStringLiteral("状态: 正在连接");
         } else {
             netText = QStringLiteral("状态: 未连接");
         }
-        if (m_reporting && !isSimulationCaptureActive()) {
+        if (m_reporting) {
             netText += QStringLiteral(" / 正在上报");
         }
         UiStatusLevel netLevel = UiStatusLevel::Muted;
-        if (isSimulationCaptureActive()) {
-            netLevel = UiStatusLevel::Info;
-        } else if (m_commConnected) {
+        if (m_commConnected) {
             netLevel = UiStatusLevel::Success;
         } else if (m_commConnecting) {
             netLevel = UiStatusLevel::Warning;
@@ -482,17 +476,13 @@ void DIMM::refreshActionStates()
     ui->actionCameraSettings->setEnabled(!busy);
     ui->actionViewSettings->setEnabled(!busy);
     ui->btnStart->setEnabled(!busy);
-    if (m_actionStartSimulation) {
-        m_actionStartSimulation->setEnabled(!busy);
-    }
     if (m_actionAlignmentMode) {
         const bool alignmentActive = m_captureState == CaptureState::Alignment;
         m_actionAlignmentMode->setChecked(alignmentActive);
         m_actionAlignmentMode->setText(alignmentActive ? QStringLiteral("退出对准")
                                                        : QStringLiteral("对准模式"));
         m_actionAlignmentMode->setEnabled(!busy &&
-                                          m_captureState != CaptureState::Live &&
-                                          m_captureState != CaptureState::Simulation);
+                                          m_captureState != CaptureState::Live);
     }
     if (m_actionConfirmCamera1Polaris) {
         m_actionConfirmCamera1Polaris->setEnabled(m_captureState == CaptureState::Alignment &&
@@ -593,33 +583,15 @@ void DIMM::refreshActionStates()
     switch (m_captureState) {
     case CaptureState::Idle:
         ui->btnStart->setText(QStringLiteral("开始采集"));
-        if (m_actionStartSimulation) {
-            m_actionStartSimulation->setText(QStringLiteral("模拟采集"));
-        }
         break;
     case CaptureState::Paused:
         ui->btnStart->setText(QStringLiteral("继续采集"));
-        if (m_actionStartSimulation) {
-            m_actionStartSimulation->setText(QStringLiteral("模拟采集"));
-        }
         break;
     case CaptureState::Live:
         ui->btnStart->setText(QStringLiteral("暂停采集"));
-        if (m_actionStartSimulation) {
-            m_actionStartSimulation->setText(QStringLiteral("切换到模拟"));
-        }
-        break;
-    case CaptureState::Simulation:
-        ui->btnStart->setText(QStringLiteral("开始采集"));
-        if (m_actionStartSimulation) {
-            m_actionStartSimulation->setText(QStringLiteral("暂停模拟"));
-        }
         break;
     case CaptureState::Alignment:
         ui->btnStart->setText(QStringLiteral("开始采集"));
-        if (m_actionStartSimulation) {
-            m_actionStartSimulation->setText(QStringLiteral("模拟采集"));
-        }
         break;
     }
 }
@@ -641,10 +613,6 @@ QString DIMM::currentPreviewModeText() const
 {
     if (m_captureState == CaptureState::Alignment) {
         return QStringLiteral("对准模式 (双相机 / 低频全画幅 / 不计算不保存)");
-    }
-
-    if (m_captureState == CaptureState::Simulation) {
-        return QStringLiteral("模拟模式 (双相机 / 30s 预览 / 1Hz 计算)");
     }
 
     if (m_captureState != CaptureState::Live) {

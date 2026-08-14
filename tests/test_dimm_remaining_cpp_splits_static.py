@@ -7,19 +7,6 @@ def read(rel_path: str) -> str:
     return (ROOT / rel_path).read_text(encoding="utf-8-sig")
 
 class DimmRemainingCppSplitsStaticTest(unittest.TestCase):
-    def test_simulation_members_live_in_dimm_simulation_cpp(self):
-        dimm = read("src/DIMM.cpp")
-        sim = read("src/DIMM.Simulation.cpp")
-        for token in [
-            "void DIMM::onStartSimulation()",
-            "void DIMM::stopSimulationCapture()",
-            "bool DIMM::startSimulationCapture()",
-            "cv::Mat DIMM::buildSimulationFrame(int cameraIndex) const",
-            "void DIMM::onUpdateSimulation()",
-        ]:
-            self.assertIn(token, sim)
-            self.assertNotIn(token, dimm)
-
     def test_results_members_live_in_dimm_results_cpp(self):
         dimm = read("src/DIMM.cpp")
         results = read("src/DIMM.Results.cpp")
@@ -72,7 +59,6 @@ class DimmRemainingCppSplitsStaticTest(unittest.TestCase):
     def test_all_remaining_splits_are_registered_in_cmake(self):
         cmake = read("CMakeLists.txt")
         for rel in [
-            "src/DIMM.Simulation.cpp",
             "src/DIMM.Results.cpp",
             "src/DIMM.CommCamera.cpp",
             "src/DIMM.AutoExposure.cpp",

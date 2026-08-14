@@ -110,7 +110,7 @@ class AlignmentModeStaticTest(unittest.TestCase):
     def test_start_capture_is_guarded_while_alignment_is_active(self):
         dimm_cpp = read("src/DIMM.cpp")
         start_body = dimm_cpp.split("void DIMM::onStartCapture()", 1)[1].split(
-            "void DIMM::onStartSimulation()", 1
+            "void DIMM::onStopCapture()", 1
         )[0]
 
         self.assertIn("CaptureState::Alignment", start_body)

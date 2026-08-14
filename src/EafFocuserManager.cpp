@@ -613,7 +613,7 @@ bool EafFocuserWorker::checkMotionAllowed(TelescopeSlot slot, const QString& com
     const int idx = static_cast<int>(slot);
     if (!m_slots[idx].motionAllowed) {
         emit commandFailed(slot, QStringLiteral("motion"),
-            QStringLiteral("Focuser motion is disabled while capture, simulation, or alignment is active."));
+            QStringLiteral("Focuser motion is disabled while capture or alignment is active."));
         return false;
     }
     return true;

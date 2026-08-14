@@ -63,7 +63,6 @@ public:
     enum class CaptureState {
         Idle,
         Live,
-        Simulation,
         Paused,
         Alignment
     };
@@ -95,7 +94,6 @@ public:
 
 private slots:
     void onStartCapture();
-    void onStartSimulation();
     void onStopCapture();
     void onShowMainPage();
     void onShowRoiPage();
@@ -113,7 +111,6 @@ private slots:
     void onConnectAll();
     void onDisconnectAll();
     void onAbout();
-    void onUpdateSimulation();
     void onCapturedFramePacket(int cameraIndex, CameraFrame packet);
     void onFrameReady(int cameraIndex);
     void onCameraConnected(int index, QString serial, QString model);
@@ -154,8 +151,6 @@ private:
         double maxSyncJitterUs = 0.0;
         quint64 pairedSampleCount = 0;
         quint64 droppedUnpairedSampleCount = 0;
-        int simulationFrameIndex = 0;
-        int lastSimulationPreviewFrame = -1;
         qint64 lastLivePreviewUpdateMs[2] = {-1, -1};
         qint64 lastMeasurementUiUpdateMs = -1;
         bool hasValidAtmosphere = false;
@@ -173,7 +168,6 @@ private:
         AtmosphericParams latestAtmosphere;
         int chartMinuteKey = -1;
         int chartSecond = -1;
-        bool simulationRoiSeeded = false;
         bool initialRoiConfirmed[2] = {false, false};
         RoiRect pendingInitialRoi[2];
         bool pendingInitialRoiReady[2] = {false, false};
@@ -255,7 +249,6 @@ private:
     int openCameraCount() const;
     bool hasActiveCapture() const;
     bool isLiveCaptureActive() const;
-    bool isSimulationCaptureActive() const;
     void handleLiveFramePacket(int cameraIndex, const CameraFrame& packet);
     bool canReportMeasurements() const;
     std::uint32_t monitoringDeviceStatus(const CaptureRuntimeContext& runtime,
@@ -267,8 +260,6 @@ private:
     QString resultSubdirectoryName() const;
     CaptureRuntimeContext& activeRuntime();
     const CaptureRuntimeContext& activeRuntime() const;
-    CaptureRuntimeContext& runtimeForState(CaptureState state);
-    const CaptureRuntimeContext& runtimeForState(CaptureState state) const;
     bool hasValidCentroidsForRoiUpdate() const;
     void appendActualRoiTrackPoint(int cameraIndex, const RoiRect& roi);
     void updateActualRoiTrackOverlay(int cameraIndex);
@@ -429,9 +420,6 @@ private:
                                           quint64 cam1Timestamp,
                                           quint64 droppedUnpairedSamples);
     bool stopLiveCapture();
-    void stopSimulationCapture();
-    bool startSimulationCapture();
-    cv::Mat buildSimulationFrame(int cameraIndex) const;
     void updateCurrentRoi();
     void on1hzTick();
     void evaluateAutoAcquisitionSchedule();
@@ -498,8 +486,6 @@ private:
     void requestAutomaticPolarisSolveBoth();
 
     Ui_DIMM* ui = nullptr;
-    QTimer* m_simulationTimer = nullptr;
-    QAction* m_actionStartSimulation = nullptr;
     QAction* m_actionAlignmentMode = nullptr;
     QAction* m_actionConfirmCamera1Polaris = nullptr;
     QAction* m_actionConfirmCamera2Polaris = nullptr;
@@ -573,7 +559,6 @@ private:
     quint64 m_diagnosticLivePacketGapCount[2] = {0, 0};
 
     CaptureRuntimeContext m_liveRuntime;
-    CaptureRuntimeContext m_simulationRuntime;
     double m_configExposureUs = 1000.0;
     double m_cameraExposureUs[2] = {1000.0, 1000.0};
     double m_configGainDb = 10.0;
