@@ -2,6 +2,9 @@
 
 #include <QRectF>
 
+#include <cmath>
+#include <limits>
+
 PolarisDetectionPipeline::InitialStarSelection
 PolarisDetectionPipeline::selectFullFrameStarCandidate(
     const QVector<InitialStarCandidate>& candidates,
@@ -38,6 +41,39 @@ PolarisDetectionPipeline::selectFullFrameStarCandidate(
 
     selection.requiresUserSelection = true;
     selection.reason = QStringLiteral("Multiple star candidates detected; confirm the Polaris candidate index");
+    return selection;
+}
+
+PolarisDetectionPipeline::InitialStarSelection
+PolarisDetectionPipeline::selectNearestCandidate(
+    const QVector<InitialStarCandidate>& candidates,
+    const QPointF& target,
+    double maxDistancePx)
+{
+    InitialStarSelection selection;
+    if (candidates.isEmpty() || !std::isfinite(maxDistancePx) || maxDistancePx <= 0.0) {
+        selection.reason = QStringLiteral("No candidate is near the confirmed target");
+        return selection;
+    }
+
+    const double maxDistanceSquared = maxDistancePx * maxDistancePx;
+    double nearestDistanceSquared = std::numeric_limits<double>::max();
+    for (const InitialStarCandidate& candidate : candidates) {
+        const double dx = candidate.center.x() - target.x();
+        const double dy = candidate.center.y() - target.y();
+        const double distanceSquared = dx * dx + dy * dy;
+        if (distanceSquared < nearestDistanceSquared) {
+            nearestDistanceSquared = distanceSquared;
+            selection.candidate = candidate;
+        }
+    }
+
+    if (nearestDistanceSquared <= maxDistanceSquared) {
+        selection.selected = true;
+        return selection;
+    }
+
+    selection.reason = QStringLiteral("No candidate is near the confirmed target");
     return selection;
 }
 

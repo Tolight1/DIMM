@@ -185,6 +185,15 @@ void DIMM::setupFullFramePreviewCanvases()
         }
     });
 
+    m_btnConfirmAndStartCapture = new QPushButton(QStringLiteral("确认并开始采集"), ui->previewCanvas);
+    m_btnConfirmAndStartCapture->setVisible(false);
+    previewCanvasLayout->addWidget(m_btnConfirmAndStartCapture);
+    connect(m_btnConfirmAndStartCapture, &QPushButton::clicked, this, [this]() {
+        if (m_actionConfirmAndStartCapture) {
+            m_actionConfirmAndStartCapture->trigger();
+        }
+    });
+
     connect(m_btnConfirmCamera1Polaris,
             &QPushButton::clicked,
             this,
@@ -539,6 +548,14 @@ void DIMM::refreshActionStates()
                                                    ? QStringLiteral("停止粗对准")
                                                    : QStringLiteral("开始粗对准"));
     }
+    if (m_actionConfirmAndStartCapture) {
+        const bool canStartFromAlignment =
+            m_captureState == CaptureState::Alignment &&
+            !busy &&
+            !m_alignmentCoarseActive &&
+            hasConfirmedAlignmentTargets();
+        m_actionConfirmAndStartCapture->setEnabled(canStartFromAlignment);
+    }
     const bool alignmentControlsVisible = m_captureState == CaptureState::Alignment;
     if (m_btnConfirmCamera1Polaris) {
         m_btnConfirmCamera1Polaris->setVisible(alignmentControlsVisible);
@@ -578,6 +595,11 @@ void DIMM::refreshActionStates()
         m_btnToggleCoarseAlignment->setText(m_alignmentCoarseActive
                                                 ? QStringLiteral("停止粗对准")
                                                 : QStringLiteral("开始粗对准"));
+    }
+    if (m_btnConfirmAndStartCapture) {
+        m_btnConfirmAndStartCapture->setVisible(alignmentControlsVisible);
+        m_btnConfirmAndStartCapture->setEnabled(m_actionConfirmAndStartCapture &&
+                                                m_actionConfirmAndStartCapture->isEnabled());
     }
 
     switch (m_captureState) {
