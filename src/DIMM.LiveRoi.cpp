@@ -23,6 +23,9 @@ using PolarisDetectionPipeline::InitialStarSelection;
 
 namespace {
 
+constexpr double kConfirmedTargetAssociationMinimumGatePx = 64.0;
+constexpr double kConfirmedTargetAssociationMaximumGatePx = 256.0;
+
 LivePreviewPolicy::StartupPhase livePreviewStartupPhase(DIMM::LiveStartupPhase phase)
 {
     switch (phase) {
@@ -864,15 +867,49 @@ bool DIMM::selectLiveRelocalizationCentroid(
         return false;
     }
 
-    auto& runtime = activeRuntime();
     FullFrameCanvas* targetCanvas =
         cameraIndex == 0 ? m_fullFrameCanvas1 : m_fullFrameCanvas2;
+    auto& runtime = activeRuntime();
     const int previousSelectedIndex = runtime.selectedInitialCandidateIndex[cameraIndex];
-    InitialStarSelection selection =
-        PolarisDetectionPipeline::selectFullFrameStarCandidate(
+    const double targetAssociationGatePx = std::clamp(
+        0.05 * static_cast<double>(std::min(fullFrame.cols, fullFrame.rows)),
+        kConfirmedTargetAssociationMinimumGatePx,
+        kConfirmedTargetAssociationMaximumGatePx);
+
+    InitialStarSelection selection;
+    QString preferredTargetLabel;
+    if (runtime.hasLastTargetPosition[cameraIndex]) {
+        selection = PolarisDetectionPipeline::selectNearestCandidate(
+            candidates,
+            runtime.lastTargetPosition[cameraIndex],
+            targetAssociationGatePx);
+        preferredTargetLabel = QStringLiteral("上次实时跟踪目标");
+    } else if (runtime.hasConfirmedPolarisPosition[cameraIndex]) {
+        selection = PolarisDetectionPipeline::selectNearestCandidate(
+            candidates,
+            runtime.confirmedPolarisPosition[cameraIndex],
+            targetAssociationGatePx);
+        preferredTargetLabel = QStringLiteral("对准模式人工确认目标");
+    } else {
+        selection = PolarisDetectionPipeline::selectFullFrameStarCandidate(
             candidates,
             previousSelectedIndex,
             previousSelectedIndex > 0);
+    }
+
+    if (!preferredTargetLabel.isEmpty() && !selection.selected) {
+        runtime.pendingInitialCandidateSelectionRequired[cameraIndex] = false;
+        if (targetCanvas) {
+            targetCanvas->setStarCandidateOverlays(
+                PolarisDetectionPipeline::buildCandidateOverlays(candidates, -1));
+        }
+        if (failureReason) {
+            *failureReason = QStringLiteral("相机%1已确认的%2附近未找到星点，不切换到其他候选星点")
+                                 .arg(cameraIndex + 1)
+                                 .arg(preferredTargetLabel);
+        }
+        return false;
+    }
 
     if (!selection.selected && selection.requiresUserSelection) {
         runtime.pendingInitialCandidateSelectionRequired[cameraIndex] = true;
@@ -899,7 +936,9 @@ bool DIMM::selectLiveRelocalizationCentroid(
         *peakValue = selection.candidate.peak;
     }
     if (selectionSource) {
-        *selectionSource = previousSelectedIndex > 0
+        *selectionSource = !preferredTargetLabel.isEmpty()
+                               ? preferredTargetLabel
+                               : previousSelectedIndex > 0
                                ? QStringLiteral("人工确认全画幅候选星")
                                : (candidates.size() == 1
                                       ? QStringLiteral("全画幅单候选星")

@@ -160,6 +160,8 @@ void DIMM::setupRuntimeActions()
     m_actionConfirmCamera1Polaris->setObjectName(QStringLiteral("btnConfirmCamera1Polaris"));
     m_actionConfirmCamera2Polaris = new QAction(QStringLiteral("确认相机2的北极星"), this);
     m_actionConfirmCamera2Polaris->setObjectName(QStringLiteral("btnConfirmCamera2Polaris"));
+    m_actionConfirmAndStartCapture = new QAction(QStringLiteral("确认并开始采集"), this);
+    m_actionConfirmAndStartCapture->setObjectName(QStringLiteral("btnConfirmAndStartCapture"));
     m_actionRetryCamera1PolarisSolve = new QAction(QStringLiteral("重新自动识别相机1"), this);
     m_actionRetryCamera1PolarisSolve->setObjectName(QStringLiteral("btnRetryCamera1PolarisSolve"));
     m_actionRetryCamera2PolarisSolve = new QAction(QStringLiteral("重新自动识别相机2"), this);
@@ -167,6 +169,7 @@ void DIMM::setupRuntimeActions()
     m_actionRetryBothPolarisSolve = new QAction(QStringLiteral("重新自动识别双相机"), this);
     m_actionRetryBothPolarisSolve->setObjectName(QStringLiteral("btnRetryBothPolarisSolve"));
     if (ui->menuTools) {
+        ui->menuTools->insertAction(ui->actionROISchedule, m_actionConfirmAndStartCapture);
         ui->menuTools->insertAction(ui->actionROISchedule, m_actionConfirmCamera2Polaris);
         ui->menuTools->insertAction(m_actionConfirmCamera2Polaris, m_actionConfirmCamera1Polaris);
         ui->menuTools->insertAction(m_actionConfirmCamera1Polaris, m_actionRetryBothPolarisSolve);
@@ -752,6 +755,10 @@ void DIMM::setupConnections()
             &QAction::triggered,
             this,
             &DIMM::onConfirmCamera2PolarisCandidate);
+    connect(m_actionConfirmAndStartCapture,
+            &QAction::triggered,
+            this,
+            &DIMM::onConfirmAndStartCapture);
     connect(m_actionRetryCamera1PolarisSolve, &QAction::triggered, this, [this]() {
         requestAutomaticPolarisSolve(0, true);
     });

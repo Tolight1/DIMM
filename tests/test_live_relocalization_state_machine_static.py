@@ -38,7 +38,7 @@ class LiveRelocalizationStateMachineStaticTest(unittest.TestCase):
                         watchdog_body.find("applyLiveFullFrameForRelocalization(&switchReason)"))
         self.assertIn("resetLiveFrameAcceptanceGates();", watchdog_body)
 
-    def test_runtime_relocalization_does_not_use_alignment_polaris_as_preference(self):
+    def test_runtime_relocalization_uses_alignment_target_after_live_reset(self):
         source = read("src/DIMM.LiveRoi.cpp")
         relocalization_body = source.split("bool DIMM::selectLiveRelocalizationCentroid", 1)[1].split(
             "bool DIMM::maybeSeedRoiFromFrame",
@@ -46,8 +46,9 @@ class LiveRelocalizationStateMachineStaticTest(unittest.TestCase):
         )[0]
 
         self.assertIn("runtime.hasLastTargetPosition[cameraIndex]", relocalization_body)
-        self.assertNotIn("hasConfirmedPolarisPosition", relocalization_body)
-        self.assertNotIn("confirmedPolarisPosition", relocalization_body)
+        self.assertIn("runtime.hasConfirmedPolarisPosition[cameraIndex]", relocalization_body)
+        self.assertIn("runtime.confirmedPolarisPosition[cameraIndex]", relocalization_body)
+        self.assertIn("selectNearestCandidate", relocalization_body)
 
     def test_live_relocalization_uses_single_detector_path_without_attempt_counter_limit(self):
         header = read("src/DIMM.h")

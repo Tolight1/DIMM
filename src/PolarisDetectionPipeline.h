@@ -29,6 +29,10 @@ InitialStarSelection selectFullFrameStarCandidate(
     const QVector<InitialStarCandidate>& candidates,
     int selectedCandidateIndex,
     bool manualSelectionConfirmed);
+InitialStarSelection selectNearestCandidate(
+    const QVector<InitialStarCandidate>& candidates,
+    const QPointF& target,
+    double maxDistancePx);
 QVector<FullFrameCanvas::StarCandidateOverlay> buildCandidateOverlays(
     const QVector<InitialStarCandidate>& candidates,
     int selectedIndex);

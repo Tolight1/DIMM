@@ -106,6 +106,38 @@ void DIMM::onConfirmCamera2PolarisCandidate()
     requestAlignmentPolarisSelection(1);
 }
 
+bool DIMM::hasConfirmedAlignmentTargets() const
+{
+    return m_liveRuntime.hasConfirmedPolarisPosition[0] &&
+           m_liveRuntime.hasConfirmedPolarisPosition[1];
+}
+
+void DIMM::onConfirmAndStartCapture()
+{
+    if (m_captureState != CaptureState::Alignment) {
+        return;
+    }
+    if (m_alignmentCoarseActive) {
+        setStatusMessage(QStringLiteral("状态: 请先停止粗对准，再开始正式采集"),
+                         UiStatusLevel::Warning);
+        return;
+    }
+    if (!hasConfirmedAlignmentTargets()) {
+        const QString message = QStringLiteral("请先确认相机1和相机2的候选星点。\n确认后才能开始正式采集。");
+        QMessageBox::warning(this, QStringLiteral("开始采集"), message);
+        setStatusMessage(message, UiStatusLevel::Warning);
+        return;
+    }
+
+    // Keep the alignment/live state transition identical to the existing
+    // exit-alignment-then-start workflow. The confirmed positions remain in
+    // m_liveRuntime and are consumed by live full-frame relocalization.
+    stopAlignmentMode();
+    if (m_captureState == CaptureState::Idle) {
+        onStartCapture();
+    }
+}
+
 void DIMM::requestAlignmentPolarisSelection(int cameraIndex)
 {
     if (m_captureState != CaptureState::Alignment) {

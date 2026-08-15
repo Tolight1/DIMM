@@ -102,6 +102,7 @@ private slots:
     void onToggleCoarseAlignment();
     void onConfirmCamera1PolarisCandidate();
     void onConfirmCamera2PolarisCandidate();
+    void onConfirmAndStartCapture();
     void onToggleRoiImages();
     void onToggleCharts();
     void onSaveConfig();
@@ -293,6 +294,7 @@ private:
     void restoreCamerasAfterAlignment();
     void showAlignmentModeStarted();
     void showAlignmentModeStopped();
+    bool hasConfirmedAlignmentTargets() const;
     void resetAlignmentRuntimeForStart();
     void resetAlignmentRuntimeForStop();
     void clearAlignmentCanvasesForStart();
@@ -492,6 +494,7 @@ private:
     QAction* m_actionRetryCamera1PolarisSolve = nullptr;
     QAction* m_actionRetryCamera2PolarisSolve = nullptr;
     QAction* m_actionRetryBothPolarisSolve = nullptr;
+    QAction* m_actionConfirmAndStartCapture = nullptr;
     QAction* m_actionToggleCoarseAlignment = nullptr;
     QPushButton* m_btnToggleCoarseAlignment = nullptr;
     QPushButton* m_btnConfirmCamera1Polaris = nullptr;
@@ -499,6 +502,7 @@ private:
     QPushButton* m_btnRetryCamera1PolarisSolve = nullptr;
     QPushButton* m_btnRetryCamera2PolarisSolve = nullptr;
     QPushButton* m_btnRetryBothPolarisSolve = nullptr;
+    QPushButton* m_btnConfirmAndStartCapture = nullptr;
     QVector<PolarisDetectionPipeline::InitialStarCandidate> m_alignmentCachedCandidates[kCameraCount];
     qint64 m_alignmentLastCandidateDetectionMs[kCameraCount] = {-1, -1};
     double m_alignmentOtsuThreshold[kCameraCount] = {-1.0, -1.0};
