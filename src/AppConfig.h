@@ -1,5 +1,6 @@
 #pragma once
 
+#include "CdimPsdAnalysis.h"
 #include "ConnectedDomain.h"
 
 #include <QString>
@@ -14,6 +15,7 @@ struct CameraConfig {
 
 struct AutoExposureConfig {
     bool enabled = false;
+    bool exposureFrequencySwitchEnabled = true;
 
     double lowThreshold = 80.0;
     double highThreshold = 220.0;
@@ -28,6 +30,7 @@ struct AutoExposureConfig {
 
     double darkSnrWarning = 8.0;
     double darkSnrCritical = 5.0;
+    double trackingLostSnr = 5.0;
     double minValidCentroidRatio = 0.50;
     double starLostValidRatio = 0.10;
     double brightFrameRatioThreshold = 0.30;
@@ -37,7 +40,7 @@ struct AutoExposureConfig {
     int autoExposureSampleIntervalMs = 500;
     int minDecisionSampleCount = 500;
     double autoExposureStepUs = 200.0;
-    double initialExposureUs = 4000.0;
+    double initialExposureUs = 9000.0;
     int autoExposureDecisionCooldownMin = 30;
     double hardSaturationFrameRatioThreshold = 0.05;
     int peakSupportRadiusPx = 2;
@@ -54,19 +57,23 @@ struct AutoExposureConfig {
     int trendConflictPersistenceSec = 30;
 
     double minExposureUs = 500.0;
-    double maxExposureUs = 20000.0;
+    double maxExposureUs = 9000.0;
+    QString exposureFrameRateWindows = QStringLiteral("1-4:200;4-9:100");
     double maxExposureChangeRatioUp = 1.30;
     double maxExposureChangeRatioDown = 0.70;
     double cameraAgreementRatio = 0.50;
 };
 
 struct ProcessingConfig {
-    int backgroundKernelSize = 5;
-    double backgroundSigmaMultiplier = 4.0;
-    int centroidMode = 1;
+    int backgroundThresholdClipIterations = 3;
+    double backgroundThresholdClipSigma = 3.0;
+    double backgroundThresholdSigmaMultiplier = 1.0;
+    // 0 = background threshold + peak kernel; 1 = background-subtracted full ROI.
+    int centroidMode = 0;
     int peakKernelRadiusPx = 3;
     double strongHotPixelExcessDn = 100.0;
     int r0HistoryWindowFrames = 5000;
+    CdimPsdAnalysisConfig psdAnalysis;
 };
 
 struct RoiRecenteringConfig {
@@ -102,6 +109,7 @@ struct OpticalConfig {
     double zenithAngleDeg = 0.0;
     double wavelengthNm = 500.0;
     double pixelSizeUm = 2.5;
+    double outerScaleM = 20.0;
 };
 
 struct AlignmentConfig {
@@ -133,7 +141,7 @@ struct StorageConfig {
 };
 
 struct TriggerConfig {
-    int mode = 0;
+    int mode = 1;
 };
 
 struct EnvironmentSensorConfig {
@@ -159,6 +167,10 @@ struct PulseGeneratorConfig {
     bool remoteControl = true;
 };
 
+enum class AutoAcquisitionSearchMode {
+    Continuous = 1
+};
+
 struct AutoAcquisitionConfig {
     bool enabled = false;
     double latitudeDeg = 40.45;
@@ -166,6 +178,8 @@ struct AutoAcquisitionConfig {
     int startOffsetMinutesAfterSunset = 30;
     int stopOffsetMinutesBeforeSunrise = 30;
     int recoveryScanIntervalMinutes = 20;
+    AutoAcquisitionSearchMode searchMode = AutoAcquisitionSearchMode::Continuous;
+    int starFindingAttemptDurationSec = 15;
     bool testTimeOverrideEnabled = false;
     QTime testStartTime = QTime(18, 30);
     QTime testStopTime = QTime(6, 0);

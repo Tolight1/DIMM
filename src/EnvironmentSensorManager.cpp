@@ -5,6 +5,7 @@
 
 #include <QMetaObject>
 #include <QMutexLocker>
+#include <QDebug>
 #include <QThread>
 #include <QTimer>
 #include <memory>
@@ -151,28 +152,36 @@ void EnvironmentSensorManager::start(const EnvironmentSensorConfig& config)
     m_workerThread->start();
 }
 
-void EnvironmentSensorManager::stop()
+bool EnvironmentSensorManager::stop(int timeoutMs)
 {
     if (!m_workerThread) {
-        return;
+        return true;
     }
 
     const bool wasRunning = m_workerThread->isRunning();
     if (m_worker) {
         if (wasRunning) {
-            QMetaObject::invokeMethod(m_worker, "stop", Qt::BlockingQueuedConnection);
+            QMetaObject::invokeMethod(m_worker, "stop", Qt::QueuedConnection);
         } else {
             m_worker->stop();
         }
     }
     m_workerThread->quit();
-    m_workerThread->wait();
+    if (wasRunning && !m_workerThread->wait(qMax(0, timeoutMs))) {
+        qWarning() << "Environment sensor worker did not stop within" << timeoutMs
+                   << "ms; leaving it to process exit.";
+        m_workerThread->setParent(nullptr);
+        m_workerThread = nullptr;
+        m_worker = nullptr;
+        return false;
+    }
     if (!wasRunning && m_worker) {
         delete m_worker;
     }
     m_workerThread->deleteLater();
     m_workerThread = nullptr;
     m_worker = nullptr;
+    return true;
 }
 
 bool EnvironmentSensorManager::isRunning() const

@@ -37,12 +37,14 @@ public:
 
     std::function<void(double exposure, double gain, double continuousFrameRateHz)> onApplyCamera;
     std::function<void(const AutoExposureConfig& config)> onApplyAutoExposure;
-    std::function<void(int backgroundKernelSize,
-                       double backgroundSigmaMultiplier,
+    std::function<void(int backgroundThresholdClipIterations,
+                       double backgroundThresholdClipSigma,
+                       double backgroundThresholdSigmaMultiplier,
                        int centroidMode,
                        int peakKernelRadiusPx,
                        double strongHotPixelExcessDn,
                        int r0HistoryWindowFrames)> onApplyProcessing;
+    std::function<void(const CdimPsdAnalysisConfig& config)> onApplyPsdAnalysis;
     std::function<void(double thresholdPx,
                        int requiredFrames,
                        qint64 cooldownMs,
@@ -65,7 +67,8 @@ public:
                        double focalLengthCm,
                        double zenithAngleDeg,
                        double lambdaNm,
-                       double pixelSizeUm)> onApplyOptics;
+                       double pixelSizeUm,
+                       double outerScaleM)> onApplyOptics;
     std::function<void(bool autoRadius,
                        double focalLengthMm,
                        double pixelSizeUm,
@@ -124,6 +127,7 @@ public:
     QLineEdit* autoExpSaturatedPixelCountEdit = nullptr;
     QLineEdit* autoExpDarkSnrWarningEdit = nullptr;
     QLineEdit* autoExpDarkSnrCriticalEdit = nullptr;
+    QLineEdit* autoExpTrackingLostSnrEdit = nullptr;
     QLineEdit* autoExpMinValidCentroidRatioEdit = nullptr;
     QLineEdit* autoExpStarLostValidRatioEdit = nullptr;
     QLineEdit* autoExpBrightFrameRatioEdit = nullptr;
@@ -139,6 +143,8 @@ public:
     QLineEdit* autoExpTrendConflictPersistenceSecEdit = nullptr;
     QLineEdit* autoExpMinEdit = nullptr;
     QLineEdit* autoExpMaxEdit = nullptr;
+    QLineEdit* autoExpFrequencyWindowsEdit = nullptr;
+    QCheckBox* autoExpFrequencySwitchCheck = nullptr;
     QLineEdit* autoExpMaxChangeUpEdit = nullptr;
     QLineEdit* autoExpMaxChangeDownEdit = nullptr;
     QLineEdit* autoExpCameraAgreementRatioEdit = nullptr;
@@ -163,11 +169,26 @@ public:
     QLineEdit* envSensorAddressEdit = nullptr;
     QLineEdit* envSensorPollIntervalEdit = nullptr;
     QComboBox* centroidModeCombo = nullptr;
-    QLineEdit* procKernelSize = nullptr;
-    QLineEdit* procSigma = nullptr;
+    QLineEdit* backgroundThresholdClipIterationsEdit = nullptr;
+    QLineEdit* backgroundThresholdClipSigmaEdit = nullptr;
+    QLineEdit* backgroundThresholdSigmaMultiplierEdit = nullptr;
     QLineEdit* peakKernelRadiusEdit = nullptr;
     QLineEdit* strongHotPixelExcessEdit = nullptr;
     QLineEdit* r0HistoryWindowFramesEdit = nullptr;
+    QCheckBox* psdEnabledCheck = nullptr;
+    QComboBox* psdModeCombo = nullptr;
+    QComboBox* psdNoiseDetectionModeCombo = nullptr;
+    QLabel* psdWelchSegmentLengthLabel = nullptr;
+    QLineEdit* psdWelchSegmentLengthEdit = nullptr;
+    QLabel* psdWelchOverlapLabel = nullptr;
+    QLineEdit* psdWelchOverlapEdit = nullptr;
+    QLineEdit* psdNfftEdit = nullptr;
+    QLineEdit* psdNoiseCandidateStartEdit = nullptr;
+    QLineEdit* psdNoiseCandidateEndEdit = nullptr;
+    QLineEdit* psdMinimumNoiseBandBinsEdit = nullptr;
+    QLineEdit* psdMinimumNoiseBandWidthEdit = nullptr;
+    QLabel* psdFitNoiseDominanceKappaLabel = nullptr;
+    QLineEdit* psdFitNoiseDominanceKappaEdit = nullptr;
     QLineEdit* roiRecenterThresholdEdit = nullptr;
     QLineEdit* roiRecenterRequiredFramesEdit = nullptr;
     QLineEdit* roiRecenterCooldownMsEdit = nullptr;
@@ -232,6 +253,7 @@ public:
     QLineEdit* autoAcquisitionStartOffsetEdit = nullptr;
     QLineEdit* autoAcquisitionStopOffsetEdit = nullptr;
     QLineEdit* autoAcquisitionRecoveryScanIntervalEdit = nullptr;
+    QLineEdit* autoAcquisitionAttemptDurationEdit = nullptr;
     QCheckBox* autoAcquisitionTestOverrideCheck = nullptr;
     QLineEdit* autoAcquisitionTestStartEdit = nullptr;
     QLineEdit* autoAcquisitionTestStopEdit = nullptr;
@@ -246,6 +268,7 @@ public:
                        bool remoteControl,
                        QString* errorMessage)> onSetPulseControlSource;
     QPushButton* pulseApplyConfigBtn = nullptr;
+    QLineEdit* opticsOuterScale = nullptr;
 
 private:
     void updateApplyStatus(const QString& text, const QString& color);

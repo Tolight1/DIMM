@@ -490,7 +490,6 @@ int main(int argc, char* argv[])
         #lblStatFrames,
         #lblStatValid,
         #lblStatLatency,
-        #lblStatWindow,
         #lblROIX,
         #lblROIY,
         #lblROIW,
@@ -526,26 +525,30 @@ int main(int argc, char* argv[])
 
         #lblR0Value {
             color: #56d4ff;
-            font-size: 22px;
+            font-size: 20px;
             font-weight: 700;
+            padding: 1px 0px;
         }
 
         #lblSeeingValue {
             color: #95dd6b;
-            font-size: 22px;
+            font-size: 20px;
             font-weight: 700;
+            padding: 1px 0px;
         }
 
         #lblThetaValue {
             color: #ffb347;
-            font-size: 22px;
+            font-size: 20px;
             font-weight: 700;
+            padding: 1px 0px;
         }
 
         #lblTauValue {
             color: #ff6aa7;
-            font-size: 22px;
+            font-size: 20px;
             font-weight: 700;
+            padding: 1px 0px;
         }
 
         #previewCanvas,

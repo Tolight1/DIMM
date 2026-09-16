@@ -437,6 +437,12 @@ inline AutoExposureControlAction chooseAutoExposureAction(const AutoExposureWind
         return AutoExposureLogicDetail::holdAction(currentExposureUs, "WAIT_SAMPLES");
     }
 
+    if (stats.weakOrNoSignalCount >= std::max(1, config.minDecisionSampleCount) &&
+        currentExposureUs >= config.maxExposureUs) {
+        return AutoExposureLogicDetail::holdAction(currentExposureUs,
+                                                   "MAX_EXPOSURE_STAR_LOST");
+    }
+
     if (stats.brightRatio >= config.brightFrameRatioThreshold) {
         return AutoExposureLogicDetail::exposureAction(AutoExposureAdjustDirection::Decrease,
                                                        currentExposureUs,

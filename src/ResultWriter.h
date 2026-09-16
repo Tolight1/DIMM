@@ -25,8 +25,8 @@ public:
     bool open(const ResultFileConfig& config, QString* error = nullptr);
     void enqueue(const MeasurementRecord& record);
     void enqueueLine(const QString& line);
-    void flush();
-    void close();
+    bool flush(QString* error = nullptr);
+    bool close(QString* error = nullptr);
 
     bool isOpen() const;
     QString filePath() const;

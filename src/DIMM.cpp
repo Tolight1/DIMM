@@ -1,5 +1,7 @@
 #include "DIMM.h"
 #include "DimmRuntimeHelpers.h"
+#include "ExposureFrequencySwitchController.h"
+#include "FrameRateChangePolicy.h"
 
 #include "AlignmentCameraCoordinator.h"
 #include "AlignmentCoarseController.h"
@@ -8,10 +10,15 @@
 #include "AlignmentLocalTracker.h"
 #include "AlignmentTaskManager.h"
 #include "AlignmentUiPresenter.h"
+#include "AcquisitionImagePolicy.h"
 #include "CameraManager.h"
 #include "CanvasWidgets.h"
 #include "CommManager.h"
 #include "AppConfigPersistence.h"
+#include "AutoAcquisitionCameraLifecycle.h"
+#include "AutoFocusConnectionPolicy.h"
+#include "AutoFocusMetricCalculator.h"
+#include "AutoFocusSettings.h"
 #include "EafFocuserManager.h"
 #include "FocuserControlWidget.h"
 #include "FullFrameStarDetector.h"
@@ -31,6 +38,7 @@
 #include <limits>
 
 #include <QAction>
+#include <QCloseEvent>
 #include <QApplication>
 #include <QDate>
 #include <QDateTime>
@@ -58,6 +66,8 @@
 #include <QSignalBlocker>
 #include <QRandomGenerator>
 #include <QScrollArea>
+#include <QSettings>
+#include <QShowEvent>
 #include <QShortcut>
 #include <QStringList>
 #include <QThread>
@@ -87,6 +97,7 @@ DIMM::DIMM(QWidget* parent)
     setupSettingsCallbacks();
     setupCameraConnections();
     setupImageProcessorConnections();
+    setupAutoFocusConnections();
     setupRuntimeTimers();
     setupCommConnections();
     setupCanvasMouseStatusConnections();
@@ -120,18 +131,47 @@ void DIMM::setupServiceManagers()
     m_focuserControlWidget->setManager(m_focuserManager);
     m_focuserManager->initialize();
     m_settingsDialog->addSettingsPage(m_focuserControlWidget, QStringLiteral("自动调焦"));
+    {
+        QSettings settings;
+        m_autoFocusConfig = AutoFocusSettings::load(settings);
+    }
+    m_autoFocusLogWriter.setEnabled(m_autoFocusConfig.dataLoggingEnabled);
+    m_autoFocusRealtimeMetricsSampler.configure(m_autoFocusConfig.framesPerState,
+                                                m_autoFocusConfig.statisticsMode,
+                                                m_autoFocusConfig.trimRatio);
+    m_autoFocusController = std::make_unique<AutoFocusController>(m_autoFocusConfig);
     m_environmentSensor = new EnvironmentSensorManager(this);
     connect(m_environmentSensor, &EnvironmentSensorManager::dataUpdated, this, [this](EnvironmentSensorData data) {
         m_latestEnvironment = data;
+        if (m_autoFocusController) {
+            if (data.valid) {
+                m_autoFocusSensorHadValidData = true;
+                m_autoFocusSensorOutageNotified = false;
+            } else if (isTrackingForAutoFocus() &&
+                       m_autoFocusConfig.masterEnabled &&
+                       m_autoFocusSensorHadValidData &&
+                       QDateTime::currentMSecsSinceEpoch() >= m_autoFocusSensorAlertNotBeforeMs &&
+                       !m_autoFocusSensorOutageNotified) {
+                m_autoFocusSensorOutageNotified = true;
+                QMessageBox::warning(this,
+                                     QStringLiteral("自动调焦环境传感器"),
+                                     QStringLiteral("环境传感器数据无效：正在进行的自动调焦会继续完成，新的温度触发已暂停。"));
+            }
+            if (isTrackingForAutoFocus()) {
+                for (int camera = 0; camera < 2; ++camera) {
+                    handleAutoFocusAction(
+                        camera,
+                        m_autoFocusController->updateTemperature(
+                            camera, data.temperatureC, data.valid),
+                        QStringLiteral("温度触发"));
+                }
+            }
+        }
         updateCameraInfo();
     });
     connect(m_environmentSensor, &EnvironmentSensorManager::errorOccurred, this, [this](const QString& error) {
         qDebug() << "[EnvironmentSensor]" << error;
     });
-    if (m_environmentSensorConfig.enabled) {
-        m_environmentSensor->start(m_environmentSensorConfig);
-    }
-
 }
 
 void DIMM::setupRuntimeActions()
@@ -186,7 +226,7 @@ void DIMM::initializeCaptureServices()
     m_cameraManager = &CameraManager::instance();
     m_cameraManager->init();
     m_imageProcessor = new ImageProcessor(this);
-    m_imageProcessor->setTargetFrameRateHz(m_pulseGeneratorFrequencyHz);
+    m_imageProcessor->setTargetFrameRateHz(currentTrackingFrameRateHz());
     m_imageProcessor->setAutoExposureMetricConfig(m_autoExposureConfig.enabled,
                                                   m_autoExposureConfig.hardSaturationDn,
                                                   m_autoExposureConfig.autoExposureSampleIntervalMs,
@@ -270,10 +310,58 @@ void DIMM::setupImageProcessorConnections()
     setupRoiImageProcessorConnection();
     setupAtmosphereProcessorConnection();
     connect(m_imageProcessor,
-            &ImageProcessor::roiThresholdReady,
+            &ImageProcessor::roiBackgroundThresholdReady,
             this,
-            [this](int cameraIndex, double otsuThreshold, double actualThreshold) {
-                setRoiThresholdDisplay(cameraIndex, otsuThreshold, actualThreshold);
+            [this](int cameraIndex, double background, double noiseSigma, double threshold) {
+                setRoiBackgroundThresholdDisplay(cameraIndex, background, noiseSigma, threshold);
+            });
+    connect(m_imageProcessor,
+            &ImageProcessor::calculationImageReady,
+            this,
+            [this](int cameraIndex, quint64 frameId, cv::Mat calculationImage) {
+                const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+                const bool saveForAutoExposureCooldown =
+                    cameraIndex >= 0 && cameraIndex < 2 &&
+                    m_trackingImageSaveOnNextRoiFrame[cameraIndex];
+                const bool saveForPeriodicTracking =
+                    cameraIndex >= 0 && cameraIndex < 2 &&
+                    !saveForAutoExposureCooldown &&
+                    AcquisitionImagePolicy::shouldSavePeriodicTrackingRoiImage(
+                        m_autoExposureConfig.enabled,
+                        m_lastPeriodicTrackingRoiImageSavedMs[cameraIndex],
+                        nowMs);
+                if (cameraIndex < 0 || cameraIndex >= 2 || calculationImage.empty() ||
+                    (!saveForAutoExposureCooldown && !saveForPeriodicTracking) ||
+                    !m_resultSessionActive || !m_resultWriter.isOpen() ||
+                    m_liveStartupPhase != LiveStartupPhase::Tracking) {
+                    return;
+                }
+                const QFileInfo sessionInfo(m_resultFilePath);
+                QDir sessionDir(sessionInfo.absolutePath());
+                if (!sessionDir.mkpath(QStringLiteral("images"))) {
+                    return;
+                }
+                const QString stamp = QDateTime::currentDateTime().toLocalTime().toString(
+                    QStringLiteral("yyyy-MM-dd_HHmmss_zzz"));
+                const QString imageKind = saveForAutoExposureCooldown
+                                              ? QStringLiteral("calculation")
+                                              : QStringLiteral("periodic");
+                const QString path = sessionDir.filePath(
+                    QStringLiteral("images/camera%1_tracking_roi_%2_%3_frame-%4.bmp")
+                        .arg(cameraIndex + 1)
+                        .arg(imageKind)
+                        .arg(stamp)
+                        .arg(frameId));
+                const cv::Mat mono8 = ImageUtils::fullFrameMono8Preview(calculationImage, 12, 4095.0);
+                if (mono8.empty() || !cv::imwrite(path.toStdString(), mono8)) {
+                    return;
+                }
+                if (saveForAutoExposureCooldown) {
+                    m_trackingImageSaveOnNextRoiFrame[cameraIndex] = false;
+                    m_trackingImageSaveNextRetryMs[cameraIndex] = -1;
+                } else {
+                    m_lastPeriodicTrackingRoiImageSavedMs[cameraIndex] = nowMs;
+                }
             });
     connect(m_imageProcessor,
             &ImageProcessor::acquisitionStopRequested,
@@ -282,6 +370,927 @@ void DIMM::setupImageProcessorConnections()
                 setStatusMessage(QStringLiteral("Status: %1").arg(reason), UiStatusLevel::Error);
                 onStopCapture();
             });
+}
+
+void DIMM::setupAutoFocusConnections()
+{
+    if (!m_autoFocusController || !m_focuserControlWidget || !m_focuserManager ||
+        !m_imageProcessor) {
+        return;
+    }
+
+    connect(m_focuserControlWidget,
+            &FocuserControlWidget::autoFocusConfigApplied,
+            this,
+            [this](AutoFocusConfig requestedConfig) {
+                AutoFocusConfig immediatelyApplied = m_autoFocusConfig;
+                if (!requestedConfig.masterEnabled) {
+                    immediatelyApplied.masterEnabled = false;
+                    for (int camera = 0; camera < 2; ++camera) {
+                        cancelAutoFocus(camera,
+                                        QStringLiteral("自动调焦总开关已关闭"),
+                                        true);
+                    }
+                }
+                for (int camera = 0; camera < 2; ++camera) {
+                    if (!requestedConfig.cameraEnabled[camera]) {
+                        immediatelyApplied.cameraEnabled[camera] = false;
+                        cancelAutoFocus(camera,
+                                        QStringLiteral("相机自动调焦已关闭"),
+                                        true);
+                    }
+                }
+                m_autoFocusConfig = immediatelyApplied;
+                m_autoFocusController->setConfig(m_autoFocusConfig);
+                if (m_autoFocusController->isActive(0) || m_autoFocusController->isActive(1)) {
+                    m_pendingAutoFocusConfig = requestedConfig;
+                    setStatusMessage(QStringLiteral("自动调焦参数将在当前轮次结束后生效"),
+                                     UiStatusLevel::Warning);
+                    return;
+                }
+                applyAutoFocusConfig(requestedConfig);
+            });
+    connect(m_focuserControlWidget,
+            &FocuserControlWidget::manualAutoFocusRequested,
+            this,
+            &DIMM::startManualAutoFocus);
+    connect(m_focuserControlWidget,
+            &FocuserControlWidget::autoFocusDisabled,
+            this,
+            [this](int cameraIndex) {
+                if (cameraIndex < 0) {
+                    m_autoFocusConfig.masterEnabled = false;
+                    for (int camera = 0; camera < 2; ++camera) {
+                        cancelAutoFocus(camera,
+                                        QStringLiteral("自动调焦总开关已关闭"),
+                                        true);
+                    }
+                } else if (cameraIndex < 2) {
+                    m_autoFocusConfig.cameraEnabled[cameraIndex] = false;
+                    cancelAutoFocus(cameraIndex,
+                                    QStringLiteral("相机自动调焦已关闭"),
+                                    true);
+                }
+                m_pendingAutoFocusConfig.reset();
+                m_autoFocusController->setConfig(m_autoFocusConfig);
+            });
+
+    connect(m_focuserManager,
+            &EafFocuserManager::stateChanged,
+            this,
+            [this](TelescopeSlot slot, EafDeviceState state) {
+                handleAutoAcquisitionPreFocusFocuserState(static_cast<int>(slot), state);
+                handleAutoFocusFocuserState(static_cast<int>(slot),
+                                             state.opened,
+                                             state.moving,
+                                             state.currentPosition);
+            });
+    connect(m_focuserManager,
+            &EafFocuserManager::commandFinished,
+            this,
+            [this](TelescopeSlot slot, const QString& command) {
+                const int cameraIndex = static_cast<int>(slot);
+                if (cameraIndex < 0 || cameraIndex >= 2) {
+                    return;
+                }
+                if (command == QStringLiteral("move") &&
+                    m_autoAcquisitionPreFocus.awaitingMoveAcknowledgement(cameraIndex)) {
+                    handleAutoAcquisitionPreFocusCommandFinished(cameraIndex, command);
+                    return;
+                }
+                if (command == QStringLiteral("move") && m_autoFocusController &&
+                    !m_autoFocusAwaitingTimeoutStop[cameraIndex]) {
+                    m_autoFocusController->markFocuserMoveAcknowledged(cameraIndex);
+                    return;
+                }
+                if (command != QStringLiteral("stop") ||
+                    !m_autoFocusAwaitingTimeoutStop[cameraIndex]) {
+                    return;
+                }
+                m_autoFocusTimeoutStopCommandFinished[cameraIndex] = true;
+                m_focuserManager->requestStateRefresh(slot);
+            });
+    connect(m_focuserManager,
+            &EafFocuserManager::commandFailed,
+            this,
+            [this](TelescopeSlot slot, const QString& command, const QString& error) {
+                handleAutoAcquisitionPreFocusCommandFailed(static_cast<int>(slot), command, error);
+            });
+    connect(m_focuserManager,
+            &EafFocuserManager::deviceRemoved,
+            this,
+            [this](TelescopeSlot slot, const QString&) {
+                handleAutoAcquisitionPreFocusFocuserState(
+                    static_cast<int>(slot),
+                    {false, false, false, false, 0, 0, 0});
+                handleAutoFocusFocuserState(static_cast<int>(slot), false, false, 0);
+            });
+    connect(m_imageProcessor,
+            &ImageProcessor::autoFocusRoiMeasurementReady,
+            this,
+            [this](int cameraIndex,
+                   quint64,
+                   cv::Mat calculationImage,
+                   bool centroidValid,
+                   double centroidX,
+                   double centroidY) {
+                handleAutoFocusMeasurement(cameraIndex,
+                                            calculationImage,
+                                            centroidValid,
+                                            centroidX,
+                                            centroidY);
+            });
+}
+
+bool DIMM::isTrackingForAutoFocus() const
+{
+    return m_captureState == CaptureState::Live &&
+           m_liveStartupPhase == LiveStartupPhase::Tracking &&
+           !m_autoAcquisitionPreFocus.blocksAutoFocus();
+}
+
+QString DIMM::autoFocusStateText(AutoFocusRunState state) const
+{
+    switch (state) {
+    case AutoFocusRunState::ReferenceCalibration:
+        return QStringLiteral("参考标定");
+    case AutoFocusRunState::AwaitingInitialMetrics:
+        return QStringLiteral("等待初始指标");
+    case AutoFocusRunState::DirectionSearch:
+        return QStringLiteral("调焦方向搜索");
+    case AutoFocusRunState::Adjusting:
+        return QStringLiteral("调焦调整搜索");
+    case AutoFocusRunState::Callback:
+        return QStringLiteral("回调补偿");
+    case AutoFocusRunState::ReturningBest:
+        return QStringLiteral("回到最佳位置");
+    case AutoFocusRunState::OvershootReturnSearch:
+        return QStringLiteral("越焦回调后搜索");
+    case AutoFocusRunState::FinalValidation:
+        return QStringLiteral("最终验证");
+    case AutoFocusRunState::Complete:
+        return QStringLiteral("完成");
+    case AutoFocusRunState::Failed:
+        return QStringLiteral("失败");
+    case AutoFocusRunState::Idle:
+        return QStringLiteral("空闲");
+    }
+    return QStringLiteral("未知");
+}
+
+QString DIMM::autoFocusStatisticsText() const
+{
+    switch (m_autoFocusConfig.statisticsMode) {
+    case AutoFocusStatisticsMode::Mean:
+        return QStringLiteral("Mean");
+    case AutoFocusStatisticsMode::Median:
+        return QStringLiteral("Median");
+    case AutoFocusStatisticsMode::TrimmedMean:
+        return QStringLiteral("TrimmedMean");
+    }
+    return QStringLiteral("Unknown");
+}
+
+void DIMM::logAutoFocusEvent(int cameraIndex,
+                             const AutoFocusAction& action,
+                             const QString& finalResult)
+{
+    if (!m_autoFocusConfig.dataLoggingEnabled || !m_resultSessionActive ||
+        !m_resultWriter.isOpen() || !m_autoFocusController || cameraIndex < 0 ||
+        cameraIndex >= 2) {
+        return;
+    }
+
+    const AutoFocusRunState state = m_autoFocusController->state(cameraIndex);
+    if (!m_autoFocusRunActive[cameraIndex] &&
+        action.type == AutoFocusActionType::AwaitingInitialMetrics) {
+        ++m_autoFocusRunSequence[cameraIndex];
+        m_autoFocusPendingDirectionStep[cameraIndex] = 0;
+        AutoFocusLogRecord initial;
+        initial.timestamp = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
+        initial.sequence = m_autoFocusRunSequence[cameraIndex];
+        initial.stage = QStringLiteral("InitialPosition");
+        initial.motorPosition = m_autoFocusFocuserPosition[cameraIndex];
+        initial.statisticsMode = autoFocusStatisticsText();
+        QString initialError;
+        if (!m_autoFocusLogWriter.append(QFileInfo(m_resultFilePath).absolutePath(),
+                                         cameraIndex,
+                                         initial,
+                                         &initialError)) {
+            setStatusMessage(QStringLiteral("相机 %1 自动调焦日志写入失败：%2")
+                                 .arg(cameraIndex + 1)
+                                 .arg(initialError),
+                             UiStatusLevel::Error);
+            return;
+        }
+        m_autoFocusRunActive[cameraIndex] = true;
+    }
+    if (!m_autoFocusRunActive[cameraIndex]) {
+        return;
+    }
+
+    if (action.type == AutoFocusActionType::MoveRelative) {
+        m_autoFocusPendingDirectionStep[cameraIndex] = action.relativeStep;
+        return;
+    }
+
+    const AutoFocusRunSnapshot snapshot = m_autoFocusController->snapshot(cameraIndex);
+    AutoFocusLogRecord record;
+    record.timestamp = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
+    record.sequence = m_autoFocusRunSequence[cameraIndex];
+    record.stage = finalResult.isEmpty() ? QStringLiteral("MotorMove")
+                                         : autoFocusStateText(snapshot.state);
+    record.motorPosition = m_autoFocusFocuserPosition[cameraIndex];
+    record.directionStep = m_autoFocusPendingDirectionStep[cameraIndex];
+    if (snapshot.hasCurrentMetrics) {
+        record.metrics = snapshot.currentMetrics;
+    }
+    record.statisticsMode = autoFocusStatisticsText();
+    record.searchDeadZoneActive = false;
+    record.reverseBacklashActive = false;
+    record.accumulatedBacklashTravel = snapshot.accumulatedBacklashTravel;
+    record.bestHfr = snapshot.bestHfr;
+    record.reference = m_autoFocusController->referenceMetrics(cameraIndex);
+    record.finalResult = finalResult;
+    QString error;
+    const QString sessionDirectory = QFileInfo(m_resultFilePath).absolutePath();
+    if (!m_autoFocusLogWriter.append(sessionDirectory, cameraIndex, record, &error)) {
+        setStatusMessage(QStringLiteral("相机 %1 自动调焦日志写入失败：%2")
+                             .arg(cameraIndex + 1)
+                             .arg(error),
+                         UiStatusLevel::Error);
+    }
+    if (!finalResult.isEmpty()) {
+        m_autoFocusRunActive[cameraIndex] = false;
+    }
+    if (action.type != AutoFocusActionType::MoveRelative) {
+        m_autoFocusPendingDirectionStep[cameraIndex] = 0;
+    }
+}
+
+void DIMM::setAutoFocusManualLock(int cameraIndex, bool locked)
+{
+    if (cameraIndex < 0 || cameraIndex >= 2 ||
+        m_autoFocusManualLocked[cameraIndex] == locked) {
+        return;
+    }
+    m_autoFocusManualLocked[cameraIndex] = locked;
+    const TelescopeSlot slot = static_cast<TelescopeSlot>(cameraIndex);
+    const QString reason = locked
+                               ? QStringLiteral("自动调焦运行中，已锁定该路人工焦点器控制")
+                               : QString();
+    if (m_focuserManager) {
+        m_focuserManager->setManualMotionAllowed(slot, !locked, reason);
+    }
+    if (m_focuserControlWidget) {
+        m_focuserControlWidget->setAutoFocusMotionLocked(slot, locked);
+    }
+}
+
+void DIMM::applyAutoFocusConfig(const AutoFocusConfig& config)
+{
+    const AutoFocusConfig previousConfig = m_autoFocusConfig;
+    m_autoFocusConfig = config;
+    m_autoFocusLogWriter.setEnabled(config.dataLoggingEnabled);
+    m_autoFocusRealtimeMetricsSampler.configure(config.framesPerState,
+                                                config.statisticsMode,
+                                                config.trimRatio);
+    m_pendingAutoFocusConfig.reset();
+    if (!m_autoFocusController) {
+        m_autoFocusController = std::make_unique<AutoFocusController>(config);
+    } else {
+        m_autoFocusController->setConfig(config);
+    }
+    if (!m_focuserManager) {
+        return;
+    }
+    for (int camera = 0; camera < 2; ++camera) {
+        if (shouldOpenFocuserAfterAutoFocusEnable(previousConfig,
+                                                  config,
+                                                  camera,
+                                                  m_autoFocusFocuserOpened[camera])) {
+            m_focuserManager->openAssignedDevice(static_cast<TelescopeSlot>(camera));
+        }
+    }
+}
+
+void DIMM::beginAutoAcquisitionPreFocus()
+{
+    if (m_liveStartupOrigin != LiveStartupOrigin::AutoAcquisition ||
+        !m_latestEnvironment.valid || !m_focuserManager ||
+        !m_autoAcquisitionPreFocus.begin(m_latestEnvironment.temperatureC)) {
+        if (m_liveStartupOrigin == LiveStartupOrigin::AutoAcquisition &&
+            !m_latestEnvironment.valid) {
+            setStatusMessage(QStringLiteral("自动采集温度预调焦已跳过：环境温度无效"),
+                             UiStatusLevel::Warning);
+        }
+        return;
+    }
+
+    for (int camera = 0; camera < 2; ++camera) {
+        m_autoAcquisitionPreFocusMoveIssued[camera] = false;
+        setAutoFocusManualLock(camera, true);
+        const TelescopeSlot slot = static_cast<TelescopeSlot>(camera);
+        if (!m_autoFocusFocuserOpened[camera] &&
+            !m_autoAcquisitionPreFocusOpenRequestedByConfig[camera]) {
+            m_focuserManager->openAssignedDevice(slot);
+        }
+        m_focuserManager->requestStateRefresh(slot);
+    }
+    setStatusMessage(QStringLiteral("自动采集已按当前温度启动调焦器预定位，正在并行找星"),
+                     UiStatusLevel::Info);
+}
+
+void DIMM::handleAutoAcquisitionPreFocusFocuserState(int cameraIndex,
+                                                      const EafDeviceState& state)
+{
+    const AutoAcquisitionPreFocusAction action = m_autoAcquisitionPreFocus.update(
+        cameraIndex,
+        {state.opened,
+         state.positionValid,
+         state.motionValid,
+         state.moving,
+         state.currentPosition,
+         state.maxStep});
+    if (action.type == AutoAcquisitionPreFocusActionType::MoveAbsolute && m_focuserManager) {
+        m_autoAcquisitionPreFocusMoveIssued[cameraIndex] = true;
+        m_focuserManager->moveAbsoluteForAutoFocus(static_cast<TelescopeSlot>(cameraIndex), action.target);
+    }
+    resumeTrackingAutoFocusAfterPreFocus();
+}
+
+void DIMM::handleAutoAcquisitionPreFocusCommandFinished(int cameraIndex,
+                                                         const QString& command)
+{
+    if (command != QStringLiteral("move") ||
+        !m_autoAcquisitionPreFocus.awaitingMoveAcknowledgement(cameraIndex)) {
+        return;
+    }
+    m_autoAcquisitionPreFocus.markMoveAccepted(cameraIndex);
+    if (m_focuserManager) {
+        m_focuserManager->requestStateRefresh(static_cast<TelescopeSlot>(cameraIndex));
+    }
+}
+
+void DIMM::handleAutoAcquisitionPreFocusCommandFailed(int cameraIndex,
+                                                       const QString& command,
+                                                       const QString& error)
+{
+    if (cameraIndex < 0 || cameraIndex >= 2) {
+        return;
+    }
+    if (command == QStringLiteral("open")) {
+        m_autoAcquisitionPreFocus.markOpenFailed(cameraIndex);
+        setStatusMessage(QStringLiteral("相机 %1 温度预调焦已跳过：%2")
+                             .arg(cameraIndex + 1)
+                             .arg(error),
+                         UiStatusLevel::Warning);
+        resumeTrackingAutoFocusAfterPreFocus();
+        return;
+    }
+    if ((command != QStringLiteral("move") && command != QStringLiteral("autoFocusMove")) ||
+        !m_autoAcquisitionPreFocus.awaitingMoveAcknowledgement(cameraIndex)) {
+        return;
+    }
+    m_autoAcquisitionPreFocus.markMoveFailed(cameraIndex);
+    if (m_focuserManager) {
+        m_focuserManager->requestStateRefresh(static_cast<TelescopeSlot>(cameraIndex));
+    }
+    setStatusMessage(QStringLiteral("相机 %1 温度预调焦移动失败：%2；等待电机停止")
+                         .arg(cameraIndex + 1)
+                         .arg(error),
+                     UiStatusLevel::Warning);
+}
+
+void DIMM::cancelAutoAcquisitionPreFocus(const QString& reason)
+{
+    if (!m_autoAcquisitionPreFocus.active()) {
+        return;
+    }
+    for (int camera = 0; camera < 2; ++camera) {
+        if (m_autoAcquisitionPreFocusMoveIssued[camera] && m_focuserManager) {
+            m_focuserManager->stopMotion(static_cast<TelescopeSlot>(camera));
+        }
+        m_autoAcquisitionPreFocusMoveIssued[camera] = false;
+        setAutoFocusManualLock(camera, false);
+    }
+    m_autoAcquisitionPreFocus.cancel();
+    setStatusMessage(QStringLiteral("自动采集温度预调焦已取消：%1").arg(reason),
+                     UiStatusLevel::Warning);
+}
+
+void DIMM::resumeTrackingAutoFocusAfterPreFocus()
+{
+    if (!m_autoAcquisitionPreFocus.takeReady()) {
+        return;
+    }
+    for (int camera = 0; camera < 2; ++camera) {
+        m_autoAcquisitionPreFocusMoveIssued[camera] = false;
+        setAutoFocusManualLock(camera, false);
+    }
+    if (m_captureState != CaptureState::Live ||
+        m_liveStartupPhase != LiveStartupPhase::Tracking) {
+        return;
+    }
+    if (m_focuserControlWidget) {
+        m_focuserControlWidget->setAutoFocusTrackingAvailable(true);
+    }
+    if (m_autoFocusController && m_latestEnvironment.valid) {
+        for (int camera = 0; camera < 2; ++camera) {
+            m_autoFocusController->primeTemperatureBaseline(
+                camera, m_latestEnvironment.temperatureC, true);
+        }
+    }
+    if (m_focuserManager) {
+        m_focuserManager->requestStateRefresh(TelescopeSlot::Telescope1);
+        m_focuserManager->requestStateRefresh(TelescopeSlot::Telescope2);
+    }
+    startAutoFocusReferenceCalibration();
+    startAutoFocusForAutoAcquisition();
+}
+
+void DIMM::applyPendingAutoFocusConfigIfIdle()
+{
+    if (!m_pendingAutoFocusConfig.has_value() || !m_autoFocusController ||
+        m_autoFocusController->isActive(0) || m_autoFocusController->isActive(1)) {
+        return;
+    }
+    applyAutoFocusConfig(*m_pendingAutoFocusConfig);
+}
+
+void DIMM::cancelAutoFocus(int cameraIndex, const QString& reason, bool stopFocuser)
+{
+    if (cameraIndex < 0 || cameraIndex >= 2 || !m_autoFocusController) {
+        return;
+    }
+    const bool wasActive = m_autoFocusController->isActive(cameraIndex);
+    const bool wasMainRun = m_autoFocusMainRecordActive[cameraIndex];
+    if (wasActive) {
+        logAutoFocusEvent(cameraIndex,
+                          AutoFocusAction{},
+                          QStringLiteral("cancelled: %1").arg(reason));
+        if (m_autoFocusMainRecordActive[cameraIndex]) {
+            writeResultSessionEvent(QStringLiteral("AutoFocusEnd"),
+                                    QStringLiteral("camera=%1; reason=cancelled")
+                                        .arg(cameraIndex + 1),
+                                    QStringLiteral("Tracking"),
+                                    QDateTime::currentMSecsSinceEpoch());
+            m_autoFocusMainRecordActive[cameraIndex] = false;
+        }
+        m_autoFocusAwaitingPreExposure[cameraIndex] = false;
+        m_autoFocusPreExposureComplete[cameraIndex] = false;
+        m_deferredAutoFocusAction[cameraIndex] = {};
+        m_deferredAutoFocusContext[cameraIndex].clear();
+    }
+    m_autoFocusController->cancel(cameraIndex);
+    m_autoFocusAwaitingTimeoutStop[cameraIndex] = false;
+    m_autoFocusTimeoutStopCommandFinished[cameraIndex] = false;
+    if (wasMainRun) {
+        m_autoFocusCompletionBarrier.reset();
+    }
+    if (stopFocuser && wasActive && m_focuserManager) {
+        m_focuserManager->stopMotion(static_cast<TelescopeSlot>(cameraIndex));
+    }
+    setAutoFocusManualLock(cameraIndex, false);
+    if (wasActive) {
+        setStatusMessage(QStringLiteral("相机 %1 自动调焦已停止：%2")
+                             .arg(cameraIndex + 1)
+                             .arg(reason),
+                         UiStatusLevel::Warning);
+    }
+}
+
+void DIMM::stopAutoFocusForTrackingExit(const QString& reason)
+{
+    if (m_focuserControlWidget) {
+        m_focuserControlWidget->setAutoFocusTrackingAvailable(false);
+    }
+    for (int camera = 0; camera < 2; ++camera) {
+        cancelAutoFocus(camera, reason, true);
+        m_autoFocusReconnectAfterMs[camera] = -1;
+        m_autoFocusReferenceCalibrationStarted[camera] = false;
+    }
+    m_autoFocusCompletionBarrier.reset();
+    if (m_autoAcquisitionPreFocus.blocksAutoFocus()) {
+        for (int camera = 0; camera < 2; ++camera) {
+            setAutoFocusManualLock(camera, true);
+        }
+    }
+}
+
+void DIMM::startAutoFocusReferenceCalibration()
+{
+    if (!isTrackingForAutoFocus() || !m_autoFocusController) {
+        return;
+    }
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    for (int camera = 0; camera < 2; ++camera) {
+        if (!m_autoFocusConfig.masterEnabled || !m_autoFocusConfig.cameraEnabled[camera] ||
+            m_autoFocusReferenceCalibrationStarted[camera] ||
+            m_autoFocusController->isActive(camera) ||
+            (!m_autoFocusConfig.autoCalibrateHfr[camera] &&
+             !m_autoFocusConfig.autoCalibrateRms[camera])) {
+            continue;
+        }
+        if (!m_autoFocusFocuserOpened[camera] || m_autoFocusFocuserMoving[camera]) {
+            setStatusMessage(QStringLiteral("相机 %1 自动参考标定未启动：焦点器不可用或仍在移动")
+                                 .arg(camera + 1),
+                             UiStatusLevel::Warning);
+            continue;
+        }
+        const AutoFocusAction action =
+            m_autoFocusController->startReferenceCalibration(camera, nowMs);
+        if (action.type == AutoFocusActionType::Failed) {
+            setStatusMessage(QStringLiteral("相机 %1 自动参考标定未启动：设置无效")
+                                 .arg(camera + 1),
+                             UiStatusLevel::Warning);
+            continue;
+        }
+        m_autoFocusReferenceCalibrationStarted[camera] = true;
+        setAutoFocusManualLock(camera, true);
+        setStatusMessage(QStringLiteral("相机 %1 自动调焦：等待稳定后标定参考值")
+                             .arg(camera + 1),
+                         UiStatusLevel::Warning);
+    }
+}
+
+void DIMM::startManualAutoFocus()
+{
+    if (!isTrackingForAutoFocus() || !m_autoFocusController) {
+        return;
+    }
+    if (!m_latestEnvironment.valid) {
+        setStatusMessage(QStringLiteral("环境传感器无效，无法建立本轮自动调焦温度基准"),
+                         UiStatusLevel::Warning);
+        return;
+    }
+    for (int camera = 0; camera < 2; ++camera) {
+        if (!m_autoFocusConfig.masterEnabled || !m_autoFocusConfig.cameraEnabled[camera] ||
+            m_autoFocusController->isActive(camera)) {
+            continue;
+        }
+        if (!m_autoFocusFocuserOpened[camera] || m_autoFocusFocuserMoving[camera]) {
+            setStatusMessage(QStringLiteral("相机 %1 自动调焦未启动：焦点器不可用或仍在移动")
+                                 .arg(camera + 1),
+                             UiStatusLevel::Warning);
+            continue;
+        }
+        handleAutoFocusAction(camera,
+                              m_autoFocusController->start(
+                                  camera,
+                                  m_latestEnvironment.temperatureC,
+                                  AutoFocusTrigger::Manual),
+                              QStringLiteral("手动立即调焦"));
+    }
+}
+
+void DIMM::startAutoFocusForAutoAcquisition()
+{
+    if (!isTrackingForAutoFocus() || !m_autoFocusController ||
+        m_liveStartupOrigin != LiveStartupOrigin::AutoAcquisition) {
+        return;
+    }
+    for (int camera = 0; camera < 2; ++camera) {
+        if (!m_autoFocusStartupPending[camera] || m_autoFocusStartupTriggered[camera] ||
+            !m_autoFocusConfig.masterEnabled || !m_autoFocusConfig.cameraEnabled[camera] ||
+            m_autoFocusController->isActive(camera)) {
+            continue;
+        }
+        if (m_autoFocusReferenceCalibrationStarted[camera] ||
+            m_autoFocusController->state(camera) == AutoFocusRunState::ReferenceCalibration) {
+            continue;
+        }
+        if (!m_autoFocusFocuserOpened[camera] || m_autoFocusFocuserMoving[camera]) {
+            continue;
+        }
+        if (!m_latestEnvironment.valid) {
+            continue;
+        }
+        const AutoFocusAction action = m_autoFocusController->start(
+            camera,
+            m_latestEnvironment.temperatureC,
+            AutoFocusTrigger::AutoAcquisitionStartup);
+        if (action.type == AutoFocusActionType::AwaitingInitialMetrics) {
+            m_autoFocusStartupPending[camera] = false;
+            m_autoFocusStartupTriggered[camera] = true;
+            handleAutoFocusAction(camera, action, QStringLiteral("自动采集启动调焦"));
+        }
+    }
+}
+
+void DIMM::handleAutoFocusMeasurement(int cameraIndex,
+                                      const cv::Mat& calculationImage,
+                                      bool centroidValid,
+                                      double centroidX,
+                                      double centroidY)
+{
+    if (m_captureState != CaptureState::Live ||
+        m_liveStartupPhase != LiveStartupPhase::Tracking ||
+        cameraIndex < 0 || cameraIndex >= 2) {
+        return;
+    }
+
+    AutoFocusRoiMeasurement measurement;
+    measurement.calculationImage = calculationImage;
+    measurement.centroidValid = centroidValid;
+    measurement.centroidX = centroidX;
+    measurement.centroidY = centroidY;
+    const AutoFocusSample sample = AutoFocusMetricCalculator::calculate(measurement);
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    m_autoFocusRealtimeMetricsSampler.submitSample(cameraIndex, sample, nowMs);
+    m_latestAutoFocusSample[cameraIndex] = sample;
+    m_hasLatestAutoFocusSample[cameraIndex] = sample.valid;
+
+    if (!isTrackingForAutoFocus() || !m_autoFocusController ||
+        m_autoFocusAwaitingPreExposure[cameraIndex]) {
+        return;
+    }
+
+    if (!m_autoFocusController->isActive(cameraIndex)) {
+        return;
+    }
+    const AutoFocusAction action =
+        m_autoFocusController->submitSample(cameraIndex,
+                                             sample,
+                                             nowMs);
+    if (action.metricsReady && action.type != AutoFocusActionType::Finished &&
+        action.type != AutoFocusActionType::Failed) {
+        logAutoFocusEvent(cameraIndex, AutoFocusAction{});
+    }
+    handleAutoFocusAction(cameraIndex, action, QStringLiteral("ROI 测量"));
+}
+
+void DIMM::handleAutoFocusFocuserState(int cameraIndex,
+                                       bool opened,
+                                       bool moving,
+                                       int position)
+{
+    if (cameraIndex < 0 || cameraIndex >= 2 || !m_autoFocusController) {
+        return;
+    }
+    const bool wasActive = m_autoFocusController->isActive(cameraIndex);
+    m_autoFocusFocuserOpened[cameraIndex] = opened;
+    m_autoFocusFocuserMoving[cameraIndex] = moving;
+    m_autoFocusFocuserPosition[cameraIndex] = position;
+    const bool timeoutStopConfirmed = m_autoFocusAwaitingTimeoutStop[cameraIndex] &&
+                                      m_autoFocusTimeoutStopCommandFinished[cameraIndex] &&
+                                      !moving;
+    if (wasActive && !opened) {
+        logAutoFocusEvent(cameraIndex,
+                          AutoFocusAction{},
+                          QStringLiteral("failed: focuser_disconnected"));
+    }
+    m_autoFocusController->updateFocuserState(
+        cameraIndex, opened, moving, QDateTime::currentMSecsSinceEpoch());
+
+    if (!opened) {
+        const bool timeoutStopPending = m_autoFocusAwaitingTimeoutStop[cameraIndex];
+        m_autoFocusAwaitingTimeoutStop[cameraIndex] = false;
+        m_autoFocusTimeoutStopCommandFinished[cameraIndex] = false;
+        m_autoFocusAwaitingPreExposure[cameraIndex] = false;
+        m_autoFocusPreExposureComplete[cameraIndex] = false;
+        m_deferredAutoFocusAction[cameraIndex] = {};
+        m_deferredAutoFocusContext[cameraIndex].clear();
+        if (wasActive) {
+            if (m_autoFocusMainRecordActive[cameraIndex]) {
+                writeResultSessionEvent(QStringLiteral("AutoFocusEnd"),
+                                        QStringLiteral("camera=%1").arg(cameraIndex + 1),
+                                        QStringLiteral("Tracking"),
+                                        QDateTime::currentMSecsSinceEpoch());
+                m_autoFocusMainRecordActive[cameraIndex] = false;
+            }
+            completeAutoFocusCycle(cameraIndex);
+            setAutoFocusManualLock(cameraIndex, false);
+            setStatusMessage(QStringLiteral("相机 %1 焦点器已断开，自动调焦已结束；Tracking 采集继续")
+                                 .arg(cameraIndex + 1),
+                             UiStatusLevel::Warning);
+        } else if (timeoutStopPending) {
+            handleAutoFocusAction(cameraIndex,
+                                  {AutoFocusActionType::Failed, 0},
+                                  QStringLiteral("调焦阶段超时后焦点器断开"));
+        }
+        if (isTrackingForAutoFocus() && m_autoFocusConfig.masterEnabled &&
+            m_autoFocusConfig.cameraEnabled[cameraIndex]) {
+            m_autoFocusReconnectAfterMs[cameraIndex] =
+                QDateTime::currentMSecsSinceEpoch() + 10000;
+        }
+        return;
+    }
+
+    m_autoFocusReconnectAfterMs[cameraIndex] = -1;
+    if (timeoutStopConfirmed) {
+        m_autoFocusAwaitingTimeoutStop[cameraIndex] = false;
+        m_autoFocusTimeoutStopCommandFinished[cameraIndex] = false;
+        handleAutoFocusAction(cameraIndex,
+                              {AutoFocusActionType::Failed, 0},
+                              QStringLiteral("调焦阶段超时"));
+        return;
+    }
+    if (isTrackingForAutoFocus()) {
+        startAutoFocusReferenceCalibration();
+        startAutoFocusForAutoAcquisition();
+    }
+    if (!m_autoFocusController->isActive(cameraIndex) && wasActive) {
+        const AutoFocusRunSnapshot snapshot = m_autoFocusController->snapshot(cameraIndex);
+        logAutoFocusEvent(cameraIndex,
+                          AutoFocusAction{},
+                          snapshot.unreachedReference ? QStringLiteral("unreached")
+                                                       : QStringLiteral("failed"));
+        if (m_autoFocusMainRecordActive[cameraIndex]) {
+            writeResultSessionEvent(QStringLiteral("AutoFocusEnd"),
+                                    QStringLiteral("camera=%1").arg(cameraIndex + 1),
+                                    QStringLiteral("Tracking"),
+                                    QDateTime::currentMSecsSinceEpoch());
+            m_autoFocusMainRecordActive[cameraIndex] = false;
+        }
+        m_autoFocusPreExposureComplete[cameraIndex] = false;
+        completeAutoFocusCycle(cameraIndex);
+        setAutoFocusManualLock(cameraIndex, false);
+        applyPendingAutoFocusConfigIfIdle();
+    }
+}
+
+void DIMM::completeAutoFocusCycle(int cameraIndex)
+{
+    m_autoFocusCompletionBarrier.complete(cameraIndex);
+    const std::uint8_t cameraMask = m_autoFocusCompletionBarrier.takeReadyMask();
+    if (cameraMask != 0) {
+        beginAutoExposureAdjustmentForAutoFocus(QStringLiteral("after_autofocus"),
+                                                cameraMask);
+    }
+}
+
+void DIMM::handleAutoFocusAction(int cameraIndex,
+                                 const AutoFocusAction& action,
+                                 const QString& context)
+{
+    if (cameraIndex < 0 || cameraIndex >= 2 || !m_autoFocusController) {
+        return;
+    }
+    switch (action.type) {
+    case AutoFocusActionType::None:
+        return;
+    case AutoFocusActionType::AwaitingInitialMetrics:
+        if (!m_autoFocusMainRecordActive[cameraIndex]) {
+            m_autoFocusMainRecordActive[cameraIndex] = true;
+            m_autoFocusCompletionBarrier.begin(cameraIndex);
+            QString trigger;
+            switch (m_autoFocusController->trigger(cameraIndex)) {
+            case AutoFocusTrigger::Manual:
+                trigger = QStringLiteral("manual");
+                break;
+            case AutoFocusTrigger::Temperature:
+                trigger = QStringLiteral("temperature");
+                break;
+            case AutoFocusTrigger::AutoAcquisitionStartup:
+                trigger = QStringLiteral("auto_acquisition_startup");
+                break;
+            }
+            QString reason = QStringLiteral("camera=%1; trigger=%2")
+                                 .arg(cameraIndex + 1)
+                                 .arg(trigger);
+            if (!m_autoFocusConfig.dataLoggingEnabled) {
+                reason += QStringLiteral("; process_log=disabled");
+            }
+            writeResultSessionEvent(QStringLiteral("AutoFocusStart"),
+                                    reason,
+                                    QStringLiteral("Tracking"),
+                                    QDateTime::currentMSecsSinceEpoch());
+            logAutoFocusEvent(cameraIndex, action);
+        }
+        if (m_autoExposureConfig.enabled &&
+            !m_autoFocusPreExposureComplete[cameraIndex]) {
+            m_autoFocusAwaitingPreExposure[cameraIndex] = true;
+            m_deferredAutoFocusAction[cameraIndex] = action;
+            m_deferredAutoFocusContext[cameraIndex] = context;
+            beginAutoExposureAdjustmentForAutoFocus(QStringLiteral("before_autofocus"),
+                                                    1 << cameraIndex);
+            setAutoFocusManualLock(cameraIndex, true);
+            return;
+        }
+        if (!m_autoFocusPreExposureComplete[cameraIndex]) {
+            beginAutoExposureAdjustmentForAutoFocus(QStringLiteral("before_autofocus"),
+                                                    1 << cameraIndex);
+            m_autoFocusPreExposureComplete[cameraIndex] = true;
+        }
+        setAutoFocusManualLock(cameraIndex, true);
+        setStatusMessage(QStringLiteral("相机 %1 自动调焦：曝光稳定后判定初始指标")
+                             .arg(cameraIndex + 1),
+                         UiStatusLevel::Warning);
+        return;
+    case AutoFocusActionType::MoveRelative:
+        if (!m_autoFocusFocuserOpened[cameraIndex]) {
+            cancelAutoFocus(cameraIndex,
+                            QStringLiteral("焦点器不可用"),
+                            false);
+            return;
+        }
+        setAutoFocusManualLock(cameraIndex, true);
+        logAutoFocusEvent(cameraIndex, action);
+        if (!m_focuserManager) {
+            cancelAutoFocus(cameraIndex, QStringLiteral("焦点器管理器不可用"), false);
+            return;
+        }
+        m_autoFocusController->armStageTimeout(cameraIndex,
+                                               QDateTime::currentMSecsSinceEpoch());
+        m_focuserManager->moveRelativeForAutoFocus(static_cast<TelescopeSlot>(cameraIndex),
+                                                    action.relativeStep);
+        setStatusMessage(QStringLiteral("相机 %1 自动调焦：%2，移动 %3 步")
+                             .arg(cameraIndex + 1)
+                             .arg(autoFocusStateText(m_autoFocusController->state(cameraIndex)))
+                             .arg(action.relativeStep),
+                         UiStatusLevel::Warning);
+        return;
+    case AutoFocusActionType::ReferenceCalibrated: {
+        m_autoFocusReferenceCalibrationStarted[cameraIndex] = false;
+        m_autoFocusConfig.reference[cameraIndex] =
+            m_autoFocusController->referenceMetrics(cameraIndex);
+        {
+            QSettings settings;
+            AutoFocusSettings::save(settings, m_autoFocusConfig);
+        }
+        if (m_focuserControlWidget) {
+            m_focuserControlWidget->setAutoFocusConfigUi(m_autoFocusConfig);
+        }
+        setAutoFocusManualLock(cameraIndex, false);
+        setStatusMessage(QStringLiteral("相机 %1 自动调焦参考值已标定")
+                             .arg(cameraIndex + 1),
+                         UiStatusLevel::Success);
+        applyPendingAutoFocusConfigIfIdle();
+        startAutoFocusForAutoAcquisition();
+        return;
+    }
+    case AutoFocusActionType::Finished: {
+        m_autoFocusAwaitingTimeoutStop[cameraIndex] = false;
+        m_autoFocusTimeoutStopCommandFinished[cameraIndex] = false;
+        const AutoFocusCompletionKind completion =
+            m_autoFocusController->snapshot(cameraIndex).completionKind;
+        if (completion == AutoFocusCompletionKind::AlreadyWithinTolerance) {
+            logAutoFocusEvent(cameraIndex, action, QStringLiteral("AlreadyWithinTolerance"));
+            m_autoFocusPreExposureComplete[cameraIndex] = false;
+            setAutoFocusManualLock(cameraIndex, false);
+            if (m_autoFocusMainRecordActive[cameraIndex]) {
+                writeResultSessionEvent(QStringLiteral("AutoFocusEnd"),
+                                        QStringLiteral("camera=%1").arg(cameraIndex + 1),
+                                        QStringLiteral("Tracking"),
+                                        QDateTime::currentMSecsSinceEpoch());
+                m_autoFocusMainRecordActive[cameraIndex] = false;
+            }
+            completeAutoFocusCycle(cameraIndex);
+            setStatusMessage(QStringLiteral("相机 %1 初始指标在容差范围内，无需调焦（%2）")
+                                 .arg(cameraIndex + 1)
+                                 .arg(context),
+                             UiStatusLevel::Success);
+            applyPendingAutoFocusConfigIfIdle();
+            return;
+        }
+        logAutoFocusEvent(cameraIndex,
+                          action,
+                          completion == AutoFocusCompletionKind::ReturnedToBest
+                              ? QStringLiteral("ReturnedToBest")
+                              : QStringLiteral("ReachedTargetBoundary"));
+        setAutoFocusManualLock(cameraIndex, false);
+        if (m_autoFocusMainRecordActive[cameraIndex]) {
+            writeResultSessionEvent(QStringLiteral("AutoFocusEnd"),
+                                    QStringLiteral("camera=%1").arg(cameraIndex + 1),
+                                    QStringLiteral("Tracking"),
+                                    QDateTime::currentMSecsSinceEpoch());
+            m_autoFocusMainRecordActive[cameraIndex] = false;
+        }
+        m_autoFocusPreExposureComplete[cameraIndex] = false;
+        completeAutoFocusCycle(cameraIndex);
+        setStatusMessage(QStringLiteral("相机 %1 自动调焦完成（%2）")
+                             .arg(cameraIndex + 1)
+                             .arg(context),
+                         UiStatusLevel::Success);
+        applyPendingAutoFocusConfigIfIdle();
+        return;
+    }
+    case AutoFocusActionType::Failed:
+        m_autoFocusAwaitingTimeoutStop[cameraIndex] = false;
+        m_autoFocusTimeoutStopCommandFinished[cameraIndex] = false;
+        logAutoFocusEvent(cameraIndex,
+                          action,
+                          m_autoFocusController->snapshot(cameraIndex).unreachedReference
+                              ? QStringLiteral("unreached")
+                              : QStringLiteral("failed"));
+        setAutoFocusManualLock(cameraIndex, false);
+        if (m_autoFocusMainRecordActive[cameraIndex]) {
+            writeResultSessionEvent(QStringLiteral("AutoFocusEnd"),
+                                    QStringLiteral("camera=%1").arg(cameraIndex + 1),
+                                    QStringLiteral("Tracking"),
+                                    QDateTime::currentMSecsSinceEpoch());
+            m_autoFocusMainRecordActive[cameraIndex] = false;
+        }
+        m_autoFocusPreExposureComplete[cameraIndex] = false;
+        completeAutoFocusCycle(cameraIndex);
+        setStatusMessage(QStringLiteral("相机 %1 自动调焦未达目标或失败（%2）")
+                             .arg(cameraIndex + 1)
+                             .arg(context),
+                         UiStatusLevel::Warning);
+        applyPendingAutoFocusConfigIfIdle();
+        return;
+    }
 }
 
 void DIMM::setupCentroidProcessorConnection()
@@ -295,6 +1304,7 @@ void DIMM::setupCentroidProcessorConnection()
                    double peakValue,
                    double totalFlux,
                    double background,
+                   double noiseSigma,
                    double threshold,
                    quint64 signalPixelCount) {
         if (!hasActiveCapture()) {
@@ -314,20 +1324,15 @@ void DIMM::setupCentroidProcessorConnection()
                                                    peakValue,
                                                    totalFlux,
                                                    background,
+                                                   noiseSigma,
                                                    threshold,
                                                    signalPixelCount,
                                                    false);
-        const bool liveTrackingEdgeCentroid =
-            m_captureState == CaptureState::Live &&
-            m_liveStartupPhase == LiveStartupPhase::Tracking &&
-            isCentroidNearCurrentRoiEdge(camIdx, x, y);
         auto* label = camIdx == 0 ? ui->lblCam1ROICoord : ui->lblCam2ROICoord;
         label->setText(QStringLiteral("(%1, %2)").arg(x, 0, 'f', 1).arg(y, 0, 'f', 1));
-        if (!usable || liveTrackingEdgeCentroid) {
+        if (!usable) {
             runtime.hasValidCentroid[camIdx] = false;
-            if (liveTrackingEdgeCentroid) {
-                handleLiveRoiCentroidLoss(camIdx);
-            }
+            handleLiveRoiCentroidLoss(camIdx);
             return;
         }
 
@@ -335,6 +1340,8 @@ void DIMM::setupCentroidProcessorConnection()
         runtime.centroidY[camIdx] = y;
         runtime.peakBrightness[camIdx] = peakValue;
         runtime.hasValidCentroid[camIdx] = true;
+        runtime.lostCentroidFrameCount[camIdx] = 0;
+        runtime.lostCentroidSinceMs[camIdx] = -1;
         if (m_captureState == CaptureState::Live && m_liveStartupPhase == LiveStartupPhase::Tracking) {
             runtime.lastTargetPosition[camIdx] = QPointF(x, y);
             runtime.hasLastTargetPosition[camIdx] = true;
@@ -495,12 +1502,12 @@ void DIMM::setupFrameProcessedProcessorConnection()
         auto& runtime = activeRuntime();
         ++runtime.processedFrameCount;
         ++runtime.processedFrameCountPerCamera[camIdx];
-        if (centroidValid) {
+        if (centroidValid && runtime.hasValidCentroid[camIdx]) {
             ++runtime.validCentroidCount;
             ++runtime.validCentroidCountPerCamera[camIdx];
             runtime.lostCentroidFrameCount[camIdx] = 0;
             runtime.lostCentroidSinceMs[camIdx] = -1;
-        } else {
+        } else if (!centroidValid) {
             runtime.hasValidCentroid[camIdx] = false;
             handleLiveRoiCentroidLoss(camIdx);
         }
@@ -583,12 +1590,7 @@ void DIMM::setupAtmosphereProcessorConnection()
                    double longitudinalVarianceRad2,
                    double transverseVarianceRad2,
                    double r0LongitudinalCm,
-                   double r0TransverseCm,
-                   quint64 sampleCount,
-                   bool partialWindow,
-                   bool riskFlag,
-                   quint64 targetSampleCount,
-                   const QString& riskReason) {
+                   double r0TransverseCm) {
         if (!hasActiveCapture()) {
             return;
         }
@@ -609,16 +1611,63 @@ void DIMM::setupAtmosphereProcessorConnection()
         runtime.latestAtmosphere.transverseVarianceRad2 = transverseVarianceRad2;
         runtime.latestAtmosphere.r0LongitudinalCm = r0LongitudinalCm;
         runtime.latestAtmosphere.r0TransverseCm = r0TransverseCm;
-        runtime.latestAtmosphere.sampleCount = sampleCount;
-        runtime.latestAtmosphere.partialWindow = partialWindow;
-        runtime.latestAtmosphere.riskFlag = riskFlag;
-        runtime.latestAtmosphere.targetSampleCount = targetSampleCount;
-        runtime.latestAtmosphere.riskReason = riskReason;
         refreshMeasurementUi();
 
         saveResultRow(runtime.frameCount);
     });
 
+    connect(m_imageProcessor,
+            &ImageProcessor::psdAnalysisReady,
+            this,
+            [this](const CdimPsdAnalysisResult& result) {
+        if (!hasActiveCapture()) {
+            return;
+        }
+        auto& runtime = activeRuntime();
+        runtime.latestPsdAnalysis = result;
+        runtime.hasPsdAnalysis = result.sampleCount > 0;
+        runtime.latestAtmosphere.psdAnalysis = result;
+        refreshPsdAnalysisUi(result);
+    });
+
+}
+
+void DIMM::refreshPsdAnalysisUi(const CdimPsdAnalysisResult& result)
+{
+    if (!result.enabled) {
+        if (m_longitudinalPsdChart) {
+            m_longitudinalPsdChart->clear();
+        }
+        if (m_transversePsdChart) {
+            m_transversePsdChart->clear();
+        }
+    } else {
+        if (m_longitudinalPsdChart) {
+            m_longitudinalPsdChart->setResult(result.longitudinal, result.fsActualHz);
+        }
+        if (m_transversePsdChart) {
+            m_transversePsdChart->setResult(result.transverse, result.fsActualHz);
+        }
+    }
+    if (!m_lblPsdSummary) {
+        return;
+    }
+    const QString fsSource = result.fsSource == CdimPsdFsSource::Timestamp
+                                 ? QStringLiteral("时间戳")
+                                 : QStringLiteral("配置帧率回退");
+    const QString correction = !result.enabled
+                                   ? QStringLiteral("PSD 已关闭，r0 使用原始时域方差")
+                                   : result.valid
+                                         ? QStringLiteral("修正已启用")
+                                         : QStringLiteral("修正无效，r0 使用原始时域方差");
+    m_lblPsdSummary->setText(
+        QStringLiteral("fs=%1 Hz（%2） Nyquist=%3 Hz | Δf=%4 Hz | 方差输入 px²，r0 输入 rad² | %5")
+            .arg(result.fsActualHz, 0, 'f', 2)
+            .arg(fsSource)
+            .arg(result.nyquistHz, 0, 'f', 2)
+            .arg(result.frequencyResolutionHz, 0, 'f', 3)
+            .arg(correction));
+    m_lblPsdSummary->setToolTip(result.warnings.join(QStringLiteral("\n")));
 }
 
 void DIMM::setupRuntimeTimers()
@@ -694,6 +1743,33 @@ void DIMM::setupReportTimer()
 
 DIMM::~DIMM()
 {
+    shutdownForExit();
+}
+
+void DIMM::closeEvent(QCloseEvent* event)
+{
+    shutdownForExit();
+    event->accept();
+}
+
+void DIMM::showEvent(QShowEvent* event)
+{
+    QMainWindow::showEvent(event);
+    if (!m_mainSplitterStartupLayoutApplied) {
+        m_mainSplitterSizes.clear();
+        m_mainSplitterLayoutPending = true;
+    }
+    QTimer::singleShot(0, this, [this]() {
+        refreshPanelUi();
+    });
+}
+
+void DIMM::shutdownForExit()
+{
+    if (m_shutdownCompleted) {
+        return;
+    }
+    m_shutdownCompleted = true;
     if (m_focuserManager) {
         m_focuserManager->shutdown();
     }
@@ -722,17 +1798,23 @@ DIMM::~DIMM()
     if (m_polarisSolverController) {
         disconnect(m_polarisSolverController, nullptr, this, nullptr);
     }
+    if (m_cameraManager && m_configTriggerMode != 0) {
+        QString ignoredReason;
+        setLiveHardwareTriggerLine(QString::fromLatin1(kPausedTriggerLine), &ignoredReason);
+    }
+    if (m_pulseGenerator) {
+        m_pulseGenerator->disconnect();
+    }
     if (m_cameraManager) {
         disconnect(m_cameraManager, nullptr, this, nullptr);
         m_cameraManager->stopAll();
         m_cameraManager->closeAll();
     }
     if (m_pulseGenerator) {
-        m_pulseGenerator->stop();
         delete m_pulseGenerator;
         m_pulseGenerator = nullptr;
     }
-    closeResultFile();
+    closeResultFile(ResultSessionEndReason::Destruction);
     delete ui;
 }
 
@@ -843,6 +1925,12 @@ void DIMM::resetMeasurementState()
         m_fullFrameCanvas2->clearStarCandidateOverlays();
     }
     m_resultRowsSeen = 0;
+    m_autoFocusRealtimeMetricsSampler.reset();
+    for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+        m_latestAutoFocusSample[cameraIndex] = AutoFocusSample{};
+        m_hasLatestAutoFocusSample[cameraIndex] = false;
+    }
+    m_starTrackingState = StarTrackingState::Unknown;
     m_roiUpdateCount = 0;
     m_lastRoiUpdateMs = -1;
     m_lastRoiUpdateReason.clear();
@@ -855,7 +1943,20 @@ void DIMM::resetMeasurementState()
     if (m_seeingChart) {
         m_seeingChart->clear();
     }
+    if (m_longitudinalPsdChart) {
+        m_longitudinalPsdChart->clear();
+    }
+    if (m_transversePsdChart) {
+        m_transversePsdChart->clear();
+    }
+    if (m_lblPsdSummary) {
+        m_lblPsdSummary->setText(QStringLiteral("等待完整 r0 窗口"));
+        m_lblPsdSummary->setToolTip(QString());
+    }
     advanceLiveAcquisitionGeneration();
+    if (m_imageProcessor) {
+        m_imageProcessor->resetAcquisitionStatistics();
+    }
     ui->lblCam1ROICoord->setText(QStringLiteral("(0.0, 0.0)"));
     ui->lblCam2ROICoord->setText(QStringLiteral("(0.0, 0.0)"));
     refreshMeasurementUi();
@@ -865,10 +1966,12 @@ void DIMM::updateCaptureState(CaptureState state)
 {
     m_captureState = state;
     const bool focuserMotionAllowed =
-        m_captureState == CaptureState::Idle || m_captureState == CaptureState::Paused;
+        m_captureState == CaptureState::Idle ||
+        m_captureState == CaptureState::Live ||
+        m_captureState == CaptureState::Paused;
     const QString reason = focuserMotionAllowed
                                ? QString()
-                               : QStringLiteral("实时采集、模拟或对准模式中禁止移动焦点。请先暂停或停止采集");
+                               : QStringLiteral("对准模式中禁止移动焦点。请先退出对准模式");
     if (m_focuserManager) {
         m_focuserManager->setMotionAllowed(focuserMotionAllowed, reason);
     }
@@ -913,6 +2016,64 @@ bool DIMM::canStartLiveCapture(QString* reason) const
         return false;
     }
     return true;
+}
+
+bool DIMM::ensureAutoAcquisitionCamerasReady(QString* reason)
+{
+    if (!m_cameraManager) {
+        if (reason) {
+            *reason = QStringLiteral("相机管理器未初始化");
+        }
+        return false;
+    }
+    if (m_connectingCameras) {
+        if (reason) {
+            *reason = QStringLiteral("相机正在连接中，请等待当前连接流程完成");
+        }
+        return false;
+    }
+
+    const AutoAcquisitionCameraLifecycleDecision decision =
+        decideAutoAcquisitionCameraLifecycle(openCameraCount(), 2);
+    if (!decision.needsOpenAll) {
+        m_autoAcquisitionCameraLifecycleActive = true;
+        return true;
+    }
+
+    m_connectingCameras = true;
+    refreshActionStates();
+    setAutoAcquisitionStatus(QStringLiteral("自动采集正在连接相机"),
+                             UiStatusLevel::Warning,
+                             QStringLiteral("auto-camera-connect"));
+    const auto devices = m_cameraManager->enumerateDevices();
+    const bool opened = !devices.isEmpty() && m_cameraManager->openAll();
+    m_connectingCameras = false;
+    refreshUi();
+
+    if (!opened || openCameraCount() < 2) {
+        if (reason) {
+            *reason = devices.isEmpty()
+                          ? QStringLiteral("自动采集未发现两台相机")
+                          : QStringLiteral("自动采集自动连接相机失败：需要两台相机，当前已连接 %1 台")
+                                .arg(openCameraCount());
+        }
+        m_autoAcquisitionCameraLifecycleActive = false;
+        return false;
+    }
+
+    m_autoAcquisitionCameraLifecycleActive = true;
+    return true;
+}
+
+void DIMM::closeAutoAcquisitionCameras()
+{
+    if (!m_autoAcquisitionCameraLifecycleActive || !m_cameraManager) {
+        return;
+    }
+
+    m_cameraManager->closeAll();
+    m_autoAcquisitionCameraLifecycleActive = false;
+    refreshUi();
 }
 
 bool DIMM::canConnectOrDisconnectCameras(QString* reason) const
@@ -1286,7 +2447,9 @@ void DIMM::evaluateAutoAcquisitionSchedule()
     const bool insideWindow = AutoAcquisitionScheduler::contains(window, now);
     const qint64 nowMs = now.toMSecsSinceEpoch();
     if (!insideWindow) {
-        if (m_autoAcquisitionStartedCurrentRun && m_captureState == CaptureState::Live) {
+        if (m_autoAcquisitionStartedCurrentRun &&
+            (m_captureState == CaptureState::Live ||
+             m_captureState == CaptureState::Paused)) {
             m_autoAcquisitionCommandInProgress = true;
             onStopCapture();
             m_autoAcquisitionCommandInProgress = false;
@@ -1336,6 +2499,14 @@ void DIMM::evaluateAutoAcquisitionSchedule()
     }
 
     QString reason;
+    if (!ensureAutoAcquisitionCamerasReady(&reason)) {
+        setAutoAcquisitionStatus(reason.isEmpty()
+                                     ? QStringLiteral("自动采集等待相机连接")
+                                     : QStringLiteral("自动采集等待: %1").arg(reason),
+                                 UiStatusLevel::Warning,
+                                 QStringLiteral("waiting-camera-connect"));
+        return;
+    }
     if (!canStartLiveCapture(&reason)) {
         setAutoAcquisitionStatus(reason.isEmpty()
                                      ? QStringLiteral("自动采集等待相机连接")
@@ -1344,8 +2515,37 @@ void DIMM::evaluateAutoAcquisitionSchedule()
                                  QStringLiteral("waiting-start-readiness"));
         return;
     }
+    if (!startFullFrameLocalizationPulse(&reason)) {
+        setAutoAcquisitionStatus(reason.isEmpty()
+                                     ? QStringLiteral("自动采集等待触发输出")
+                                     : QStringLiteral("自动采集等待触发输出: %1").arg(reason),
+                                 UiStatusLevel::Warning,
+                                 QStringLiteral("waiting-trigger-output"));
+        return;
+    }
 
     resetAutoExposureState(true);
+
+    for (int camera = 0; camera < 2; ++camera) {
+        m_autoAcquisitionPreFocusOpenRequestedByConfig[camera] = false;
+    }
+    if (!m_autoFocusConfig.masterEnabled) {
+        AutoFocusConfig enabledConfig = m_autoFocusConfig;
+        enabledConfig.masterEnabled = true;
+        for (int camera = 0; camera < 2; ++camera) {
+            m_autoAcquisitionPreFocusOpenRequestedByConfig[camera] =
+                enabledConfig.cameraEnabled[camera] && !m_autoFocusFocuserOpened[camera];
+        }
+        applyAutoFocusConfig(enabledConfig);
+        QSettings settings;
+        AutoFocusSettings::save(settings, m_autoFocusConfig);
+        settings.sync();
+        if (m_focuserControlWidget) {
+            m_focuserControlWidget->setAutoFocusConfigUi(m_autoFocusConfig);
+        }
+        setStatusMessage(QStringLiteral("自动采集已启用并保存自动调焦总开关"),
+                         UiStatusLevel::Success);
+    }
 
     m_liveStartupOrigin =
         LiveStartupOrigin::AutoAcquisition;
@@ -1357,6 +2557,9 @@ void DIMM::evaluateAutoAcquisitionSchedule()
     m_liveStartupConfirmed = false;
     m_liveStartupRecoveryInProgress = false;
     m_pulseBoardResponseTimedOut = false;
+
+    cancelAutoAcquisitionPreFocus(QStringLiteral("新的自动采集启动"));
+    beginAutoAcquisitionPreFocus();
 
     m_autoAcquisitionRecovery.noteScanStarted(window.windowId, nowMs);
     m_lastAutoAcquisitionAttemptMs = nowMs;
@@ -1381,6 +2584,9 @@ void DIMM::evaluateAutoAcquisitionSchedule()
                 UiStatusLevel::Warning,
                 QStringLiteral("auto-start-pending"));
         }
+    } else if (m_liveStartupOrigin == LiveStartupOrigin::AutoAcquisition) {
+        cancelAutoAcquisitionPreFocus(QStringLiteral("自动采集启动失败"));
+        closeAutoAcquisitionCameras();
     }
 }
 
@@ -1400,38 +2606,93 @@ void DIMM::setAutoAcquisitionStatus(const QString& text,
     setStatusMessage(text, level);
 }
 
-void DIMM::stopAutoAcquisitionScanUntilNextInterval(const QString& reason,
-                                                    bool manualSelectionRequired)
+void DIMM::prepareAutoAcquisitionRelocalization(const QString& reason,
+                                                bool manualSelectionRequired)
 {
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    const bool continuousSearch = !manualSelectionRequired;
     if (manualSelectionRequired) {
         m_autoAcquisitionRecovery.noteManualSelectionRequired(nowMs);
     } else {
         m_autoAcquisitionRecovery.noteScanFoundNoStar(nowMs);
     }
 
-    const bool previousCommandState = m_autoAcquisitionCommandInProgress;
-    m_autoAcquisitionCommandInProgress = true;
-    if (m_captureState == CaptureState::Live) {
-        onStopCapture();
+    if (continuousSearch && m_captureState == CaptureState::Live) {
+        auto& runtime = activeRuntime();
+        runtime.liveRelocalizationStartedMs = nowMs;
+        ++m_searchAttempt;
+        m_searchAttemptStartedMs = nowMs;
+        writeSearchLifecycleEventsOnce(reason,
+                                      QStringLiteral("search_relocalization"),
+                                      nowMs);
+        runtime.pendingInitialRoiReady[0] = false;
+        runtime.pendingInitialRoiReady[1] = false;
+        m_liveStartupOrigin = LiveStartupOrigin::AutoAcquisition;
+        stopAutoFocusForTrackingExit(QStringLiteral("自动采集正在重新定位"));
+        m_liveStartupPhase = LiveStartupPhase::LocatePair;
+        m_liveHardwareRoiActive = false;
+        resetLiveFrameAcceptanceGates();
+        QString switchReason;
+        const bool fullFrameReady = applyLiveFullFrameForRelocalization(&switchReason);
+        if (!fullFrameReady && m_resultSessionActive && m_resultWriter.isOpen()) {
+            writeHardwareErrorEvent(QStringLiteral("camera"),
+                                    -1,
+                                    0,
+                                    QStringLiteral("search_full_frame_switch"),
+                                    switchReason,
+                                    true,
+                                    nowMs);
+        }
+        if (fullFrameReady || m_configTriggerMode == 0) {
+            setAutoAcquisitionStatus(
+                reason + QStringLiteral("；连续搜索保持采集并重新等待全画幅"),
+                UiStatusLevel::Info,
+                QStringLiteral("auto-continuous-retry"));
+        } else {
+            handleHardwareTriggerStartupFailure(
+                switchReason.isEmpty() ? reason : switchReason);
+        }
+        return;
     }
-    m_autoAcquisitionCommandInProgress = previousCommandState;
 
-    m_autoAcquisitionStartedCurrentRun = false;
-    m_autoAcquisitionActiveWindowId.clear();
-    m_liveStartupOrigin = LiveStartupOrigin::Manual;
-    m_liveStartupWindowId.clear();
-    m_liveStartupConfirmed = false;
-    m_liveStartupRecoveryInProgress = false;
+    auto& runtime = activeRuntime();
+    runtime.liveRelocalizationStartedMs = -1;
+    runtime.pendingInitialRoiReady[0] = false;
+    runtime.pendingInitialRoiReady[1] = false;
+    m_liveStartupOrigin = LiveStartupOrigin::AutoAcquisition;
     m_liveHardwareRoiActive = false;
-    m_liveStartupPhase = LiveStartupPhase::None;
+    stopAutoFocusForTrackingExit(QStringLiteral("自动采集正在重新定位"));
+    m_liveStartupPhase = LiveStartupPhase::LocatePair;
+    ++m_searchAttempt;
+    m_searchAttemptStartedMs = nowMs;
+    writeSearchLifecycleEventsOnce(reason,
+                                  QStringLiteral("search_relocalization"),
+                                  nowMs);
+    resetLiveFrameAcceptanceGates();
+
+    QString switchReason;
+    const bool fullFrameReady = applyLiveFullFrameForRelocalization(&switchReason);
+    if (!fullFrameReady && m_configTriggerMode != 0) {
+        writeHardwareErrorEvent(QStringLiteral("camera_or_trigger"),
+                                -1,
+                                0,
+                                QStringLiteral("search_full_frame_switch"),
+                                switchReason,
+                                true,
+                                nowMs);
+        setAutoAcquisitionStatus(
+            switchReason.isEmpty() ? QStringLiteral("找星切换全画幅失败") : switchReason,
+            UiStatusLevel::Error,
+            QStringLiteral("auto-recovery-full-frame-failed"));
+        return;
+    }
 
     setAutoAcquisitionStatus(reason,
                              manualSelectionRequired ? UiStatusLevel::Warning
                                                      : UiStatusLevel::Info,
                              manualSelectionRequired
                                  ? QStringLiteral("auto-manual-selection-hold")
-                                 : QStringLiteral("auto-wait-next-scan"));
+                             : QStringLiteral("auto-relocalization"));
 }
 
 void DIMM::noteManualAutoAcquisitionStopIfNeeded()
@@ -1539,6 +2800,21 @@ void DIMM::handleHardwareTriggerStartupFailure(
     const bool previousCommandState =
         m_autoAcquisitionCommandInProgress;
 
+    const bool retryAllowed =
+        m_liveStartupRetryCount <
+            kLiveStartupMaxImmediateRetries &&
+        shouldRetryFailedLiveStartup();
+    if (m_resultSessionActive && m_resultWriter.isOpen()) {
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        writeHardwareErrorEvent(QStringLiteral("trigger"),
+                                 -1,
+                                 0,
+                                 QStringLiteral("live_startup"),
+                                 detail,
+                                 retryAllowed,
+                                 nowMs);
+    }
+
     /*
      * 内部故障恢复不属于用户手动停止。
      * 临时置为 true，阻止当前观测窗口被标记为人工停止。
@@ -1554,17 +2830,23 @@ void DIMM::handleHardwareTriggerStartupFailure(
         m_reportTimer->stop();
     }
 
-    closeResultFile();
-    updateCaptureState(CaptureState::Idle);
+    if (retryAllowed && m_resultSessionActive && m_resultWriter.isOpen()) {
+        writeAcquisitionPauseEvent(QStringLiteral("hardware_trigger_startup_failure"),
+                                   QDateTime::currentMSecsSinceEpoch(),
+                                   currentDeviceStatusForResultLog(
+                                       QDateTime::currentMSecsSinceEpoch()));
+        updateCaptureState(CaptureState::Paused);
+    } else {
+        closeResultSessionForHardwareError();
+        updateCaptureState(CaptureState::Idle);
+        if (m_liveStartupOrigin == LiveStartupOrigin::AutoAcquisition) {
+            closeAutoAcquisitionCameras();
+        }
+    }
     resetMeasurementState();
 
     m_autoAcquisitionCommandInProgress =
         previousCommandState;
-
-    const bool retryAllowed =
-        m_liveStartupRetryCount <
-            kLiveStartupMaxImmediateRetries &&
-        shouldRetryFailedLiveStartup();
 
     if (!retryAllowed) {
         m_liveStartupRecoveryInProgress = false;
@@ -1712,6 +2994,8 @@ void DIMM::onStartCapture()
         m_liveStartupOrigin =
             LiveStartupOrigin::Manual;
 
+        cancelAutoAcquisitionPreFocus(QStringLiteral("手动采集启动"));
+
         m_liveStartupWindowId.clear();
         m_liveStartupRetryCount = 0;
         m_liveStartupConfirmed = false;
@@ -1732,13 +3016,23 @@ void DIMM::onStartCapture()
 
     if (m_captureState == CaptureState::Live) {
         resetLiveStartupRecoveryState(true);
+        cancelAutoAcquisitionPreFocus(QStringLiteral("采集暂停"));
 
         noteManualAutoAcquisitionStopIfNeeded();
+        if (m_resultSessionActive && m_resultWriter.isOpen()) {
+            const qint64 pausedAtMs = QDateTime::currentMSecsSinceEpoch();
+            writeAcquisitionPauseEvent(QStringLiteral("manual_pause"),
+                                       pausedAtMs,
+                                       currentDeviceStatusForResultLog(pausedAtMs));
+        }
         stopLiveCapture();
         updateCaptureState(CaptureState::Paused);
         setStatusMessage(QStringLiteral("状态: 已暂停"), UiStatusLevel::Warning);
         return;
     }
+
+    const bool resumeExistingResultSession =
+        m_captureState == CaptureState::Paused && m_resultWriter.isOpen();
 
     QString reason;
     if (!canStartLiveCapture(&reason)) {
@@ -1755,14 +3049,35 @@ void DIMM::onStartCapture()
         m_hardwareTriggerStartupTimer->stop();
     }
 
-    closeResultFile();
-    resetMeasurementState();
+    if (!resumeExistingResultSession) {
+        closeResultFile(ResultSessionEndReason::ManualStop);
+        resetMeasurementState();
+    } else {
+        m_captureStopRequested = false;
+        resetMeasurementState();
+    }
     m_liveHardwareRoiActive = false;
     m_liveStartupPhase = LiveStartupPhase::None;
+    stopAutoFocusForTrackingExit(QStringLiteral("开始新的采集流程"));
     updateMinuteRoi(true);
 
     if (!configureLiveCameras(&reason)) {
-        updateCaptureState(CaptureState::Idle);
+        if (resumeExistingResultSession && m_resultSessionActive && m_resultWriter.isOpen()) {
+            const qint64 failedAtMs = QDateTime::currentMSecsSinceEpoch();
+            writeHardwareErrorEvent(QStringLiteral("camera"),
+                                    -1,
+                                    0,
+                                    QStringLiteral("configure_live_cameras"),
+                                    reason,
+                                    true,
+                                    failedAtMs);
+            writeAcquisitionPauseEvent(QStringLiteral("configure_live_cameras"),
+                                       failedAtMs,
+                                       currentDeviceStatusForResultLog(failedAtMs));
+            updateCaptureState(CaptureState::Paused);
+        } else {
+            updateCaptureState(CaptureState::Idle);
+        }
         setStatusMessage(reason, UiStatusLevel::Error);
         QMessageBox::warning(this, QStringLiteral("开始采集"), reason);
         return;
@@ -1773,6 +3088,32 @@ void DIMM::onStartCapture()
 
     if (liveStarted) {
         updateCaptureState(CaptureState::Live);
+        if (!resumeExistingResultSession) {
+            const AcquisitionCsvSessionType resultSessionType =
+                m_liveStartupOrigin == LiveStartupOrigin::AutoAcquisition
+                    ? AcquisitionCsvSessionType::Auto
+                    : AcquisitionCsvSessionType::Manual;
+            if (!beginResultSession(resultSessionType)) {
+                m_cameraManager->stopAll();
+                updateCaptureState(CaptureState::Idle);
+                setStatusMessage(QStringLiteral("状态: 结果会话创建失败"), UiStatusLevel::Error);
+                return;
+            }
+            if (m_searchAttempt == 0) {
+                m_searchAttempt = 1;
+                m_searchAttemptStartedMs = QDateTime::currentMSecsSinceEpoch();
+            }
+            writeSearchLifecycleEventsOnce(QStringLiteral("initial_search"),
+                                           QStringLiteral("initial_search"),
+                                           QDateTime::currentMSecsSinceEpoch());
+        } else {
+            writeSearchLifecycleEventsOnce(
+                m_liveStartupOrigin == LiveStartupOrigin::AutoAcquisition
+                    ? QStringLiteral("automatic_resume_search")
+                    : QStringLiteral("manual_resume_search"),
+                QStringLiteral("resume_search"),
+                QDateTime::currentMSecsSinceEpoch());
+        }
         m_reporting = m_commConnected;
         if (m_reporting && m_reportTimer) {
             m_reportTimer->start();
@@ -1788,6 +3129,10 @@ void DIMM::onStartCapture()
                 isFullFrameLocalizationPulseRunning();
 
             if (reuseRunningPulse) {
+                m_activeTriggerFrequencyHz = kFullFrameLocalizationPulseHz;
+                if (m_imageProcessor) {
+                    m_imageProcessor->setTargetFrameRateHz(kFullFrameLocalizationPulseHz);
+                }
                 beginHardwareTriggerStartupStage(
                     HardwareTriggerStartupStage::WaitingFullFramePair);
 
@@ -1812,35 +3157,16 @@ void DIMM::onStartCapture()
 
                     return;
                 }
-
-                m_hardwareTriggerStartupStage =
-                    HardwareTriggerStartupStage::None;
-
-                if (m_hardwareTriggerStartupTimer) {
-                    m_hardwareTriggerStartupTimer->stop();
-                }
-
-                m_liveStartupConfirmed = false;
-                m_pulseBoardResponseTimedOut = false;
-
-                m_cameraManager->stopAll();
-
-                updateCaptureState(CaptureState::Idle);
-
-                setStatusMessage(
+                handleHardwareTriggerStartupFailure(
                     reason.isEmpty()
-                        ? QStringLiteral("状态: 全画幅低频触发启动失败")
-                        : reason,
-                    UiStatusLevel::Error);
-
-                QMessageBox::warning(
-                    this,
-                    QStringLiteral("开始采集"),
-                    reason.isEmpty()
-                        ? QStringLiteral("全画幅低频触发启动失败。")
+                        ? QStringLiteral("全画幅低频触发启动失败")
                         : reason);
-
                 return;
+            }
+
+            m_activeTriggerFrequencyHz = kFullFrameLocalizationPulseHz;
+            if (m_imageProcessor) {
+                m_imageProcessor->setTargetFrameRateHz(kFullFrameLocalizationPulseHz);
             }
 
             beginHardwareTriggerStartupStage(
@@ -1861,7 +3187,22 @@ void DIMM::onStartCapture()
         return;
     }
 
-    updateCaptureState(CaptureState::Idle);
+    if (resumeExistingResultSession && m_resultSessionActive && m_resultWriter.isOpen()) {
+        const qint64 failedAtMs = QDateTime::currentMSecsSinceEpoch();
+        writeHardwareErrorEvent(QStringLiteral("camera"),
+                                -1,
+                                0,
+                                QStringLiteral("start_acquisition"),
+                                reason,
+                                true,
+                                failedAtMs);
+        writeAcquisitionPauseEvent(QStringLiteral("start_acquisition"),
+                                   failedAtMs,
+                                   currentDeviceStatusForResultLog(failedAtMs));
+        updateCaptureState(CaptureState::Paused);
+    } else {
+        updateCaptureState(CaptureState::Idle);
+    }
     setStatusMessage(reason.isEmpty() ? QStringLiteral("状态: 启动采集失败") : reason, UiStatusLevel::Error);
 }
 
@@ -1872,17 +3213,28 @@ void DIMM::onStopCapture()
         return;
     }
 
+    const bool automaticStop =
+        m_autoAcquisitionCommandInProgress &&
+        m_liveStartupOrigin == LiveStartupOrigin::AutoAcquisition;
+
     resetLiveStartupRecoveryState(true);
 
     noteManualAutoAcquisitionStopIfNeeded();
 
+    m_captureStopRequested = true;
+    cancelAutoAcquisitionPreFocus(QStringLiteral("采集已停止"));
     stopLiveCapture();
     m_reporting = false;
     if (m_reportTimer) {
         m_reportTimer->stop();
     }
-    closeResultFile();
+    closeResultFile(automaticStop
+                        ? ResultSessionEndReason::AutoWindowEnd
+                        : ResultSessionEndReason::ManualStop);
     updateCaptureState(CaptureState::Idle);
+    if (automaticStop) {
+        closeAutoAcquisitionCameras();
+    }
     setStatusMessage(QStringLiteral("状态: 已停止"), UiStatusLevel::Error);
     resetMeasurementState();
     if (m_fullFrameCanvas1) {
@@ -1940,6 +3292,10 @@ void DIMM::onShowSettings()
         m_settingsDialog->envSensorPollIntervalEdit->setText(QString::number(m_environmentSensorConfig.pollIntervalMs));
     }
     m_settingsDialog->autoExposureCheck->setChecked(m_autoExposureConfig.enabled);
+    if (m_settingsDialog->autoExpFrequencySwitchCheck) {
+        m_settingsDialog->autoExpFrequencySwitchCheck->setChecked(
+            m_autoExposureConfig.exposureFrequencySwitchEnabled);
+    }
     m_settingsDialog->autoExpTrendConflictCheck->setChecked(m_autoExposureConfig.trendConflictEnabled);
     m_settingsDialog->autoExpTargetPeakLowEdit->setText(QString::number(m_autoExposureConfig.targetPeakLowDn, 'f', 1));
     m_settingsDialog->autoExpTargetPeakHighEdit->setText(QString::number(m_autoExposureConfig.targetPeakHighDn, 'f', 1));
@@ -1948,6 +3304,7 @@ void DIMM::onShowSettings()
     m_settingsDialog->autoExpSaturatedPixelCountEdit->setText(QString::number(m_autoExposureConfig.saturatedPixelCount));
     m_settingsDialog->autoExpDarkSnrWarningEdit->setText(QString::number(m_autoExposureConfig.darkSnrWarning, 'f', 2));
     m_settingsDialog->autoExpDarkSnrCriticalEdit->setText(QString::number(m_autoExposureConfig.darkSnrCritical, 'f', 2));
+    m_settingsDialog->autoExpTrackingLostSnrEdit->setText(QString::number(m_autoExposureConfig.trackingLostSnr, 'f', 2));
     m_settingsDialog->autoExpMinValidCentroidRatioEdit->setText(QString::number(m_autoExposureConfig.minValidCentroidRatio, 'f', 2));
     m_settingsDialog->autoExpStarLostValidRatioEdit->setText(QString::number(m_autoExposureConfig.starLostValidRatio, 'f', 2));
     m_settingsDialog->autoExpBrightFrameRatioEdit->setText(QString::number(m_autoExposureConfig.brightFrameRatioThreshold, 'f', 2));
@@ -1968,6 +3325,10 @@ void DIMM::onShowSettings()
     m_settingsDialog->autoExpTrendConflictPersistenceSecEdit->setText(QString::number(m_autoExposureConfig.trendConflictPersistenceSec));
     m_settingsDialog->autoExpMinEdit->setText(QString::number(m_autoExposureConfig.minExposureUs, 'f', 0));
     m_settingsDialog->autoExpMaxEdit->setText(QString::number(m_autoExposureConfig.maxExposureUs, 'f', 0));
+    if (m_settingsDialog->autoExpFrequencyWindowsEdit) {
+        m_settingsDialog->autoExpFrequencyWindowsEdit->setText(
+            m_autoExposureConfig.exposureFrameRateWindows);
+    }
     m_settingsDialog->autoExpMaxChangeUpEdit->setText(QString::number(m_autoExposureConfig.maxExposureChangeRatioUp, 'f', 2));
     m_settingsDialog->autoExpMaxChangeDownEdit->setText(QString::number(m_autoExposureConfig.maxExposureChangeRatioDown, 'f', 2));
     m_settingsDialog->autoExpCameraAgreementRatioEdit->setText(QString::number(m_autoExposureConfig.cameraAgreementRatio, 'f', 2));
@@ -1980,8 +3341,12 @@ void DIMM::onShowSettings()
     m_settingsDialog->autoExpExposureSettleMsEdit->setText(QString::number(m_autoExposureConfig.exposureSettleMs));
     m_settingsDialog->autoExpMinExposureDeltaEdit->setText(QString::number(m_autoExposureConfig.minExposureDeltaUs, 'f', 0));
     m_settingsDialog->autoExpMinExposureChangeRatioEdit->setText(QString::number(m_autoExposureConfig.minExposureChangeRatio, 'f', 2));
-    m_settingsDialog->procKernelSize->setText(QString::number(m_imageProcessor->backgroundDenoiseKernelSize()));
-    m_settingsDialog->procSigma->setText(QString::number(m_imageProcessor->backgroundDenoiseSigmaMultiplier(), 'f', 2));
+    m_settingsDialog->backgroundThresholdClipIterationsEdit->setText(
+        QString::number(m_imageProcessor->backgroundThresholdClipIterations()));
+    m_settingsDialog->backgroundThresholdClipSigmaEdit->setText(
+        QString::number(m_imageProcessor->backgroundThresholdClipSigma(), 'f', 2));
+    m_settingsDialog->backgroundThresholdSigmaMultiplierEdit->setText(
+        QString::number(m_imageProcessor->backgroundThresholdSigmaMultiplier(), 'f', 2));
     if (m_settingsDialog->centroidModeCombo) {
         const int modeIndex =
             m_settingsDialog->centroidModeCombo->findData(m_imageProcessor->centroidMode());
@@ -1998,6 +3363,47 @@ void DIMM::onShowSettings()
     if (m_settingsDialog->r0HistoryWindowFramesEdit) {
         m_settingsDialog->r0HistoryWindowFramesEdit->setText(
             QString::number(m_imageProcessor->atmosphereHistoryWindowFrames()));
+    }
+    const CdimPsdAnalysisConfig psdConfig = m_imageProcessor->psdAnalysisConfig();
+    if (m_settingsDialog->psdModeCombo) {
+        const int index = m_settingsDialog->psdModeCombo->findData(static_cast<int>(psdConfig.psdMode));
+        m_settingsDialog->psdModeCombo->setCurrentIndex(index >= 0 ? index : 0);
+    }
+    if (m_settingsDialog->psdNoiseDetectionModeCombo) {
+        const int index = m_settingsDialog->psdNoiseDetectionModeCombo->findData(
+            static_cast<int>(psdConfig.noiseDetectionMode));
+        m_settingsDialog->psdNoiseDetectionModeCombo->setCurrentIndex(index >= 0 ? index : 0);
+    }
+    if (m_settingsDialog->psdWelchSegmentLengthEdit) {
+        m_settingsDialog->psdWelchSegmentLengthEdit->setText(
+            QString::number(psdConfig.welchSegmentLength));
+    }
+    if (m_settingsDialog->psdWelchOverlapEdit) {
+        m_settingsDialog->psdWelchOverlapEdit->setText(
+            QString::number(psdConfig.welchOverlap, 'f', 2));
+    }
+    if (m_settingsDialog->psdNfftEdit) {
+        m_settingsDialog->psdNfftEdit->setText(QString::number(psdConfig.nfft));
+    }
+    if (m_settingsDialog->psdNoiseCandidateStartEdit) {
+        m_settingsDialog->psdNoiseCandidateStartEdit->setText(
+            QString::number(psdConfig.noiseCandidateStartNyquist, 'f', 2));
+    }
+    if (m_settingsDialog->psdNoiseCandidateEndEdit) {
+        m_settingsDialog->psdNoiseCandidateEndEdit->setText(
+            QString::number(psdConfig.noiseCandidateEndNyquist, 'f', 2));
+    }
+    if (m_settingsDialog->psdMinimumNoiseBandBinsEdit) {
+        m_settingsDialog->psdMinimumNoiseBandBinsEdit->setText(
+            QString::number(psdConfig.minimumNoiseBandBins));
+    }
+    if (m_settingsDialog->psdMinimumNoiseBandWidthEdit) {
+        m_settingsDialog->psdMinimumNoiseBandWidthEdit->setText(
+            QString::number(psdConfig.minimumNoiseBandNyquistWidth, 'f', 2));
+    }
+    if (m_settingsDialog->psdFitNoiseDominanceKappaEdit) {
+        m_settingsDialog->psdFitNoiseDominanceKappaEdit->setText(
+            QString::number(psdConfig.fitNoiseDominanceKappa, 'f', 2));
     }
     m_settingsDialog->roiRecenterThresholdEdit->setText(
         QString::number(m_roiRecenteringThresholdPx, 'f', 1));
@@ -2026,6 +3432,8 @@ void DIMM::onShowSettings()
     m_settingsDialog->opticsBaselineAngle->setText(QString::number(m_imageProcessor->baselineAngleDeg(), 'f', 1));
     m_settingsDialog->opticsF->setText(QString::number(m_imageProcessor->focalLengthCm(), 'f', 1));
     m_settingsDialog->opticsZenith->setText(QString::number(m_imageProcessor->zenithAngleDeg(), 'f', 1));
+    m_settingsDialog->opticsOuterScale->setText(
+        QString::number(m_imageProcessor->outerScaleMeters(), 'f', 1));
     m_settingsDialog->detectorWavelength->setText(QString::number(m_imageProcessor->wavelengthNm(), 'f', 1));
     m_settingsDialog->detectorPixelSize->setText(QString::number(m_imageProcessor->pixelSizeUm(), 'f', 2));
     m_settingsDialog->alignmentAutoRadiusCheck->setChecked(m_alignmentAutoRadius);
@@ -2168,10 +3576,29 @@ void DIMM::updateCameraInfo()
             continue;
         }
 
-        const double fps = m_cameraManager->getFrameRate(i);
+        const double fps = m_cameraManager->measuredCaptureFrameRateHz(i);
         infoLabel->setText(QStringLiteral("SN: %1 | %2 fps")
                                .arg(m_cameraManager->getSerialNumber(i))
                                .arg(fps, 0, 'f', 0));
+
+        if (m_lblAutoFocusCam[i]) {
+            const QString position = m_autoFocusFocuserOpened[i]
+                                         ? QString::number(m_autoFocusFocuserPosition[i])
+                                         : QStringLiteral("--");
+            const QString hfr = m_hasLatestAutoFocusSample[i]
+                                    ? QString::number(m_latestAutoFocusSample[i].hfr, 'f', 2)
+                                    : QStringLiteral("--");
+            const AutoFocusReferenceMetrics reference = m_autoFocusController
+                                                            ? m_autoFocusController->referenceMetrics(i)
+                                                            : AutoFocusReferenceMetrics{};
+            const QString referenceHfr = reference.hfr > 0.0
+                                             ? QString::number(reference.hfr, 'f', 2)
+                                             : QStringLiteral("--");
+            m_lblAutoFocusCam[i]->setText(
+                QStringLiteral("相机%1：%2 |HFR %3/%4")
+                    .arg(i + 1)
+                    .arg(position, hfr, referenceHfr));
+        }
     }
 
     if (!m_latestEnvironment.valid) {
@@ -2243,6 +3670,7 @@ bool DIMM::stopLiveCapture()
     m_lastPulseBoardTimeoutStatusMs = -1;
     m_liveHardwareRoiActive = false;
     m_liveStartupPhase = LiveStartupPhase::None;
+    stopAutoFocusForTrackingExit(QStringLiteral("已退出 Tracking"));
 
     m_hardwareTriggerStartupStage =
         HardwareTriggerStartupStage::None;
@@ -2254,7 +3682,7 @@ bool DIMM::stopLiveCapture()
     }
 
     if (m_pulseGenerator && m_pulseGenerator->isRunning()) {
-        m_pulseGenerator->stop();
+        m_pulseGenerator->stopOutput();
     }
     m_cameraManager->stopAll();
     return true;
@@ -2263,6 +3691,46 @@ bool DIMM::stopLiveCapture()
 void DIMM::on1hzTick()
 {
     updateCameraInfo();
+    verifyPendingFrequencySwitch();
+    if (isTrackingForAutoFocus() && m_autoFocusController &&
+        m_autoFocusConfig.masterEnabled) {
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        for (int camera = 0; camera < 2; ++camera) {
+            const AutoFocusRunState stateBeforeTimeout = m_autoFocusController->state(camera);
+            const AutoFocusAction timeoutAction =
+                m_autoFocusController->checkTimeout(camera, nowMs);
+            if (timeoutAction.type != AutoFocusActionType::Failed) {
+                continue;
+            }
+            if (stateBeforeTimeout == AutoFocusRunState::ReferenceCalibration ||
+                !m_focuserManager) {
+                handleAutoFocusAction(camera, timeoutAction, QStringLiteral("调焦阶段超时"));
+                continue;
+            }
+            m_autoFocusAwaitingTimeoutStop[camera] = true;
+            m_autoFocusTimeoutStopCommandFinished[camera] = false;
+            m_focuserManager->stopMotion(static_cast<TelescopeSlot>(camera));
+        }
+    }
+    if (isTrackingForAutoFocus() && m_focuserManager && m_autoFocusConfig.masterEnabled) {
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        for (int camera = 0; camera < 2; ++camera) {
+            if (!m_autoFocusConfig.cameraEnabled[camera] || m_autoFocusFocuserOpened[camera]) {
+                m_autoFocusReconnectAfterMs[camera] = -1;
+                continue;
+            }
+            if (m_autoFocusReconnectAfterMs[camera] < 0) {
+                m_autoFocusReconnectAfterMs[camera] = nowMs + 10000;
+            }
+            if (nowMs >= m_autoFocusReconnectAfterMs[camera]) {
+                m_focuserManager->openAssignedDevice(static_cast<TelescopeSlot>(camera));
+                m_autoFocusReconnectAfterMs[camera] = nowMs + 10000;
+                setStatusMessage(QStringLiteral("相机 %1 焦点器断开，正在尝试重新连接")
+                                     .arg(camera + 1),
+                                 UiStatusLevel::Warning);
+            }
+        }
+    }
     auto& runtime = activeRuntime();
     const QTime now = QTime::currentTime();
     const int minuteKey = now.hour() * 60 + now.minute();
@@ -2277,6 +3745,12 @@ void DIMM::on1hzTick()
         if (m_seeingChart) {
             m_seeingChart->clear();
         }
+        if (m_longitudinalPsdChart) {
+            m_longitudinalPsdChart->clear();
+        }
+        if (m_transversePsdChart) {
+            m_transversePsdChart->clear();
+        }
     }
 
     if (runtime.hasValidAtmosphere && second != runtime.chartSecond) {
@@ -2290,6 +3764,131 @@ void DIMM::on1hzTick()
     }
 
     evaluateAutoAcquisitionSchedule();
+}
+
+void DIMM::verifyPendingFrequencySwitch()
+{
+    if (!m_frequencyVerificationPending || !m_cameraManager ||
+        QDateTime::currentMSecsSinceEpoch() < m_frequencyVerificationNotBeforeMs) {
+        return;
+    }
+
+    const double measuredCamera0Hz = m_cameraManager->measuredCaptureFrameRateHz(0);
+    const double measuredCamera1Hz = m_cameraManager->measuredCaptureFrameRateHz(1);
+    const double targetHz = m_frequencyVerificationTargetHz;
+    m_frequencyVerificationPending = false;
+    m_frequencyVerificationNotBeforeMs = -1;
+
+    if (ExposureFrequencySwitchController::acceptsMeasuredFrameRates(
+            targetHz, measuredCamera0Hz, measuredCamera1Hz)) {
+        m_pulseGeneratorFrequencyHz = targetHz;
+        if (m_settingsDialog) {
+            m_settingsDialog->setPulseGeneratorState(m_pulseGeneratorEnabled,
+                                                     m_pulseGeneratorPort,
+                                                     m_pulseGeneratorBaudRate,
+                                                     m_pulseGeneratorTerminalId,
+                                                     targetHz,
+                                                     m_pulseGeneratorPulseCount,
+                                                     m_pulseGeneratorDutyPercent,
+                                                     m_pulseGeneratorRemoteControl);
+            m_settingsDialog->setCommittedConfig(currentAppConfig());
+        }
+        ConfigChangeSet changes;
+        changes.pulseGenerator = true;
+        savePersistentSettings(currentAppConfig(), changes);
+
+        m_rateSwitchHardwareApplyMs =
+            qMax(m_rateSwitchHardwareApplyMs,
+                 QDateTime::currentMSecsSinceEpoch() - m_rateSwitchStartedMs);
+        if (m_rateSwitchTimingPending) {
+            RateSwitchTiming timing;
+            timing.pauseMs = m_rateSwitchPauseMs;
+            timing.hardwareApplyMs = m_rateSwitchHardwareApplyMs;
+            timing.firstValidPairMs = 0;
+            timing.success = true;
+            logRateSwitchTiming(timing,
+                                m_rateSwitchOldRateHz,
+                                m_rateSwitchNewRateHz,
+                                QStringLiteral("hardware_trigger"));
+            m_rateSwitchTimingPending = false;
+        }
+        m_rateSwitchInProgress = false;
+        if (m_resultSessionActive && m_resultWriter.isOpen()) {
+            const qint64 resumedAtMs = QDateTime::currentMSecsSinceEpoch();
+            writeAcquisitionResumeEvent(QStringLiteral("exposure_and_rate_change_complete"),
+                                        resumedAtMs,
+                                        currentDeviceStatusForResultLog(resumedAtMs));
+        }
+        setStatusMessage(QStringLiteral("自动曝光: 触发频率 %1 Hz 已由相机实际帧率确认（%2 / %3 fps）")
+                             .arg(targetHz, 0, 'f', 1)
+                             .arg(measuredCamera0Hz, 0, 'f', 1)
+                             .arg(measuredCamera1Hz, 0, 'f', 1),
+                         UiStatusLevel::Success);
+        return;
+    }
+
+    if (m_rateSwitchTimingPending) {
+        RateSwitchTiming timing;
+        timing.pauseMs = m_rateSwitchPauseMs;
+        timing.hardwareApplyMs = m_rateSwitchHardwareApplyMs;
+        timing.firstValidPairMs = 0;
+        timing.success = false;
+        logRateSwitchTiming(timing,
+                            m_rateSwitchOldRateHz,
+                            m_rateSwitchNewRateHz,
+                            QStringLiteral("hardware_trigger"));
+        m_rateSwitchTimingPending = false;
+    }
+    m_rateSwitchInProgress = false;
+    m_frequencyVerificationRollbackInProgress = true;
+    const double rollbackExposureUs[2] = {
+        m_frequencyVerificationPreviousExposureUs[0],
+        m_frequencyVerificationPreviousExposureUs[1],
+    };
+    QString rollbackReason;
+    bool rollbackSuccess = applyTrackingExposureAndFrameRate(rollbackExposureUs,
+                                                              &rollbackReason);
+    const double rollbackFrequencyHz = m_rateSwitchOldRateHz;
+    if (!m_pulseGenerator || !std::isfinite(rollbackFrequencyHz) || rollbackFrequencyHz <= 0.0) {
+        rollbackSuccess = false;
+        if (rollbackReason.isEmpty()) {
+            rollbackReason = QStringLiteral("自动曝光: 旧触发频率无效，无法回滚");
+        }
+    } else {
+        PulseGeneratorManager::Config rollbackPulseConfig = m_pulseGenerator->config();
+        rollbackPulseConfig.enabled = true;
+        rollbackPulseConfig.frequencyHz = rollbackFrequencyHz;
+        QString pulseRollbackReason;
+        const bool pulseRollbackSuccess =
+            m_pulseGenerator->configureAndStart(rollbackPulseConfig, &pulseRollbackReason) &&
+            m_pulseGenerator->isRunningAtFrequency(rollbackFrequencyHz);
+        if (!pulseRollbackSuccess) {
+            rollbackSuccess = false;
+            if (rollbackReason.isEmpty()) {
+                rollbackReason = pulseRollbackReason.isEmpty()
+                                     ? QStringLiteral("自动曝光: 旧触发频率恢复失败")
+                                     : pulseRollbackReason;
+            }
+        } else {
+            m_activeTriggerFrequencyHz = rollbackFrequencyHz;
+            if (m_imageProcessor) {
+                m_imageProcessor->setTargetFrameRateHz(rollbackFrequencyHz);
+            }
+        }
+    }
+    m_frequencyVerificationRollbackInProgress = false;
+    setStatusMessage(
+        rollbackSuccess
+            ? QStringLiteral("自动曝光: %1 Hz 验证失败（%2 / %3 fps），已回滚")
+                  .arg(targetHz, 0, 'f', 1)
+                  .arg(measuredCamera0Hz, 0, 'f', 1)
+                  .arg(measuredCamera1Hz, 0, 'f', 1)
+            : QStringLiteral("自动曝光: %1 Hz 验证失败（%2 / %3 fps），回滚失败：%4")
+                  .arg(targetHz, 0, 'f', 1)
+                  .arg(measuredCamera0Hz, 0, 'f', 1)
+                  .arg(measuredCamera1Hz, 0, 'f', 1)
+                  .arg(rollbackReason),
+        rollbackSuccess ? UiStatusLevel::Warning : UiStatusLevel::Error);
 }
 
 void DIMM::matchRoiTimeSlot()

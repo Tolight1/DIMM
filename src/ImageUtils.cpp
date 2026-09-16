@@ -40,6 +40,13 @@ cv::Mat grayscaleDetectionFrame(const cv::Mat& frame)
 
 cv::Mat fullFrameMono8Preview(const cv::Mat& grayscale)
 {
+    return fullFrameMono8Preview(grayscale, 12, static_cast<double>(4095U));
+}
+
+cv::Mat fullFrameMono8Preview(const cv::Mat& grayscale,
+                              int bitDepth,
+                              double maxPixelValue)
+{
     if (grayscale.empty() || grayscale.channels() != 1) {
         return cv::Mat();
     }
@@ -50,16 +57,32 @@ cv::Mat fullFrameMono8Preview(const cv::Mat& grayscale)
         return cv::Mat();
     }
 
-    // The camera delivers Mono12 values in the low 12 bits of a 16-bit word.
-    // Keep the proportional mapping integer-only so the endpoints remain
-    // exact without a floating-point rescale or a second min/max pass.
+    if (bitDepth <= 0 || bitDepth > 16) {
+        return cv::Mat();
+    }
+    const double metadataMax = std::isfinite(maxPixelValue) && maxPixelValue > 0.0
+                                   ? maxPixelValue
+                                   : (bitDepth == 16 ? 65535.0
+                                                     : (1ULL << bitDepth) - 1.0);
+    if (!std::isfinite(metadataMax) || metadataMax < 1.0 || metadataMax > 65535.0) {
+        return cv::Mat();
+    }
+    const std::uint32_t maximum = static_cast<std::uint32_t>(std::llround(metadataMax));
+    if (maximum == 0U) {
+        return cv::Mat();
+    }
+
+    // Preserve a fixed display range from the camera metadata. This is deliberately
+    // not a per-frame min/max normalization: saved images must remain comparable.
     cv::Mat mono8(grayscale.size(), CV_8UC1);
     for (int y = 0; y < grayscale.rows; ++y) {
         const std::uint16_t* source = grayscale.ptr<std::uint16_t>(y);
         uchar* destination = mono8.ptr<uchar>(y);
         for (int x = 0; x < grayscale.cols; ++x) {
-            const std::uint32_t mono12 = std::min<std::uint32_t>(source[x], 4095U);
-            const std::uint32_t scaled = (mono12 * 255U + 2047U) / 4095U;
+            const std::uint32_t sourceValue =
+                std::min<std::uint32_t>(source[x], maximum);
+            const std::uint32_t scaled =
+                (sourceValue * 255U + maximum / 2U) / maximum;
             destination[x] = static_cast<uchar>(scaled);
         }
     }

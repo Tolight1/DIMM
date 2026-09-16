@@ -2,8 +2,10 @@
 
 #include <QDebug>
 #include <QDateTime>
+#include <QElapsedTimer>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -204,8 +206,14 @@ void CameraManager::uninit()
             {
                 QMutexLocker stateLocker(&camera.stateMutex);
                 camera.isStreaming = false;
-                while (camera.activeCallbacks > 0) {
+                QElapsedTimer callbackDrainTimer;
+                callbackDrainTimer.start();
+                while (camera.activeCallbacks > 0 && callbackDrainTimer.elapsed() < 3000) {
                     camera.callbackDrained.wait(&camera.stateMutex, 300);
+                }
+                if (camera.activeCallbacks > 0) {
+                    qWarning() << "Timed out waiting for camera callbacks during close:"
+                               << camera.info.serialNumber;
                 }
             }
             camera.callbackHandler.reset();
@@ -449,8 +457,14 @@ bool CameraManager::closeDevice(int index)
         {
             QMutexLocker stateLocker(&camera.stateMutex);
             camera.isStreaming = false;
-            while (camera.activeCallbacks > 0) {
+            QElapsedTimer callbackDrainTimer;
+            callbackDrainTimer.start();
+            while (camera.activeCallbacks > 0 && callbackDrainTimer.elapsed() < 3000) {
                 camera.callbackDrained.wait(&camera.stateMutex, 300);
+            }
+            if (camera.activeCallbacks > 0) {
+                qWarning() << "Timed out waiting for camera callbacks during close:"
+                           << camera.info.serialNumber;
             }
         }
 
@@ -616,13 +630,26 @@ bool CameraManager::startAll()
 
 bool CameraManager::stopAll()
 {
-    bool success = true;
+    bool stoppedCamera[2] = {};
     for (int i = 0; i < 2; ++i) {
+        if (!isOpen(i)) {
+            continue;
+        }
+        stoppedCamera[i] = isStreaming(i);
         if (!stopAcquisition(i)) {
-            success = false;
+            bool recoverySucceeded = true;
+            for (int restartIndex = 0; restartIndex < 2; ++restartIndex) {
+                if (stoppedCamera[restartIndex] && !startAcquisition(restartIndex)) {
+                    recoverySucceeded = false;
+                }
+            }
+            if (!recoverySucceeded) {
+                qWarning() << "Partial camera-pair stop recovery failed.";
+            }
+            return false;
         }
     }
-    return success;
+    return true;
 }
 
 bool CameraManager::setExposure(int index, double us)
@@ -684,8 +711,14 @@ bool CameraManager::setFrameRate(int index, double fps)
         if (fc->IsImplemented("AcquisitionFrameRateEnable")) {
             fc->GetBoolFeature("AcquisitionFrameRateEnable")->SetValue(true);
         }
-        fc->GetFloatFeature("AcquisitionFrameRate")->SetValue(fps);
-        return true;
+        if (!isFeatureWritable(fc, "AcquisitionFrameRate")) {
+            return false;
+        }
+        CFloatFeaturePointer frameRateFeature = fc->GetFloatFeature("AcquisitionFrameRate");
+        frameRateFeature->SetValue(fps);
+        const double appliedFps = frameRateFeature->GetValue();
+        const double tolerance = std::max(0.05, std::abs(fps) * 0.05);
+        return std::isfinite(appliedFps) && std::abs(appliedFps - fps) <= tolerance;
     } catch (CGalaxyException& e) {
         emit cameraError(index, e.GetErrorCode(), QStringLiteral("设置帧率失败"));
         return false;
@@ -1201,6 +1234,21 @@ double CameraManager::getFrameRate(int index)
     }
 }
 
+double CameraManager::measuredCaptureFrameRateHz(int index) const
+{
+    if (index < 0 || index >= 2) {
+        return 0.0;
+    }
+
+    const auto& camera = m_cameras[index];
+    QMutexLocker stateLocker(&camera.stateMutex);
+    if (!camera.isOpen || camera.isClosing) {
+        return 0.0;
+    }
+    QMutexLocker frameLocker(&camera.frameMutex);
+    return camera.captureRate.rateHzAt(QDateTime::currentMSecsSinceEpoch());
+}
+
 double CameraManager::getTemperature(int index)
 {
     QMutexLocker apiLocker(&m_apiMutex);
@@ -1397,6 +1445,7 @@ void CameraManager::onFrameCaptured(int cameraIndex, CImageDataPointer& imageDat
             QMutexLocker locker(&camera.frameMutex);
             camera.latestFrame = frame;
             camera.latestFramePacket = packet;
+            camera.captureRate.record(receivedMs);
         }
 
         emit frameCaptured(cameraIndex, packet);

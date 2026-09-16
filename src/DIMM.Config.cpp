@@ -1,11 +1,15 @@
 #include "DIMM.h"
 
+#include "AcquisitionImagePolicy.h"
 #include "AppConfigPersistence.h"
 #include "AutoAcquisitionScheduler.h"
 #include "CameraManager.h"
 #include "CommManager.h"
 #include "ConfigApplicationController.h"
 #include "DimmRuntimeHelpers.h"
+#include "ExposureFrameRateRules.h"
+#include "FrameRateChangePolicy.h"
+#include "ExposureFrequencySwitchController.h"
 #include "HotPixelTemplateSettings.h"
 #include "ImageProcessor.h"
 #include "InitialStarDetectionConfig.h"
@@ -18,14 +22,17 @@
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDateTime>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QSignalBlocker>
 #include <QStringList>
+#include <QVector>
 
 void DIMM::setupSettingsCallbacks()
 {
@@ -45,25 +52,116 @@ void DIMM::setupSettingsCallbacks()
 void DIMM::setupCameraSettingsCallbacks()
 {
     m_settingsDialog->onApplyCamera = [this](double exposure, double gain, double continuousFrameRateHz) {
+        if (!std::isfinite(exposure) || exposure <= 0.0 ||
+            !std::isfinite(gain) ||
+            !std::isfinite(continuousFrameRateHz) || continuousFrameRateHz <= 0.0) {
+            setStatusMessage(QStringLiteral("相机参数无效，未应用任何设置"), UiStatusLevel::Warning);
+            return;
+        }
+
+        const double oldExposureUs[2] = {
+            m_cameraExposureUs[0],
+            m_cameraExposureUs[1],
+        };
+        const double oldGainDb = m_configGainDb;
+        const double oldConfigExposureUs = m_configExposureUs;
+        const double oldConfiguredFrameRateHz = m_configContinuousFrameRateHz;
+        const bool tracking =
+            m_captureState == CaptureState::Live &&
+            m_liveStartupPhase == LiveStartupPhase::Tracking;
+
+        const auto restoreDirectCameraParameters = [&]() {
+            for (int i = 0; i < 2; ++i) {
+                if (!m_cameraManager->isOpen(i)) {
+                    continue;
+                }
+                m_cameraManager->setExposure(i, oldExposureUs[i]);
+                m_cameraManager->setGain(i, oldGainDb);
+            }
+        };
+
+        QString reason;
+        if (tracking) {
+            const double targetExposureUs[2] = {exposure, exposure};
+            if (!applyTrackingExposureAndFrameRate(targetExposureUs, &reason)) {
+                setStatusMessage(reason.isEmpty()
+                                     ? QStringLiteral("Tracking 相机曝光/帧率应用失败")
+                                     : reason,
+                                 UiStatusLevel::Warning);
+                return;
+            }
+
+            for (int i = 0; i < 2; ++i) {
+                if (!m_cameraManager->isOpen(i) ||
+                    m_cameraManager->setGain(i, gain)) {
+                    continue;
+                }
+
+                QString rollbackReason;
+                const bool exposureRolledBack =
+                    applyTrackingExposureAndFrameRate(oldExposureUs, &rollbackReason);
+                restoreDirectCameraParameters();
+                m_configExposureUs = oldConfigExposureUs;
+                m_configContinuousFrameRateHz = oldConfiguredFrameRateHz;
+                setStatusMessage(
+                    exposureRolledBack
+                        ? QStringLiteral("相机%1增益设置失败，已回滚 Tracking 曝光").arg(i + 1)
+                        : QStringLiteral("相机%1增益设置失败，Tracking 曝光回滚失败: %2")
+                              .arg(i + 1)
+                              .arg(rollbackReason),
+                    UiStatusLevel::Error);
+                return;
+            }
+        } else {
+            bool applied = true;
+            for (int i = 0; i < 2; ++i) {
+                if (!m_cameraManager->isOpen(i)) {
+                    continue;
+                }
+                if (!m_cameraManager->setExposure(i, exposure) ||
+                    !m_cameraManager->setGain(i, gain)) {
+                    applied = false;
+                    reason = QStringLiteral("相机%1曝光或增益设置失败").arg(i + 1);
+                    break;
+                }
+            }
+            if (!applied) {
+                restoreDirectCameraParameters();
+                setStatusMessage(reason, UiStatusLevel::Warning);
+                return;
+            }
+
+            const bool hasUnconfiguredOpenCamera = [&]() {
+                for (int i = 0; i < 2; ++i) {
+                    if (m_cameraManager->isOpen(i) &&
+                        (!std::isfinite(m_lastContinuousFrameRateReadback[i]) ||
+                         m_lastContinuousFrameRateReadback[i] <= 0.0)) {
+                        return true;
+                    }
+                }
+                return false;
+            }();
+            const bool rateChangeRequired =
+                m_configTriggerMode == 0 &&
+                (hasUnconfiguredOpenCamera ||
+                 needsFrameRateChange(m_activeContinuousFrameRateHz,
+                                      continuousFrameRateHz));
+            if (rateChangeRequired &&
+                !applyContinuousCameraFrameRate(continuousFrameRateHz, &reason)) {
+                restoreDirectCameraParameters();
+                setStatusMessage(reason.isEmpty()
+                                     ? QStringLiteral("连续采集帧率应用失败，已恢复相机参数")
+                                     : reason,
+                                 UiStatusLevel::Warning);
+                return;
+            }
+        }
+
         m_configExposureUs = exposure;
         m_cameraExposureUs[0] = exposure;
         m_cameraExposureUs[1] = exposure;
         m_configGainDb = gain;
         m_configContinuousFrameRateHz = continuousFrameRateHz;
-        for (int i = 0; i < 2; ++i) {
-            if (m_cameraManager->isOpen(i)) {
-                m_cameraManager->setExposure(i, exposure);
-                m_cameraManager->setGain(i, gain);
-            }
-        }
-        QString reason;
-        if (!applyContinuousCameraFrameRate(&reason)) {
-            setStatusMessage(reason.isEmpty()
-                                 ? QStringLiteral("连续采集帧率应用失败")
-                                 : reason,
-                             UiStatusLevel::Warning);
-            return;
-        }
         setStatusMessage(QStringLiteral("相机参数已应用"), UiStatusLevel::Success);
     };
 }
@@ -74,6 +172,11 @@ void DIMM::setupAutoExposureSettingsCallbacks()
         [this](const AutoExposureConfig& config) {
             m_autoExposureConfig = config;
             resetAutoExposureState(false);
+            m_trackingImageIntervalMs = AcquisitionImagePolicy::trackingIntervalMsForExposureUs(
+                m_cameraExposureUs[0],
+                m_cameraExposureUs[1],
+                currentTrackingFrameRateHz(),
+                m_autoExposureConfig.autoExposureSampleIntervalMs);
             if (m_imageProcessor) {
                 m_imageProcessor->setAutoExposureMetricConfig(config.enabled,
                                                               config.hardSaturationDn,
@@ -121,6 +224,10 @@ void DIMM::setupEnvironmentSettingsCallbacks()
     m_settingsDialog->onApplyEnvironmentSensor = [this](const EnvironmentSensorConfig& config) {
         m_environmentSensorConfig = config;
         m_latestEnvironment = EnvironmentSensorData();
+        m_autoFocusSensorHadValidData = false;
+        m_autoFocusSensorOutageNotified = false;
+        m_autoFocusSensorAlertNotBeforeMs = QDateTime::currentMSecsSinceEpoch() +
+                                             kAutoFocusSensorStartupGraceMs;
         if (!m_environmentSensor) {
             return;
         }
@@ -160,7 +267,7 @@ void DIMM::setupPulseGeneratorSettingsCallbacks()
         m_pulseGeneratorDutyPercent = dutyPercent;
         m_pulseGeneratorRemoteControl = remoteControl;
         if (m_imageProcessor) {
-            m_imageProcessor->setTargetFrameRateHz(m_pulseGeneratorFrequencyHz);
+            m_imageProcessor->setTargetFrameRateHz(currentTrackingFrameRateHz());
         }
         if (!m_pulseGenerator) {
             return true;
@@ -202,6 +309,8 @@ void DIMM::setupPulseGeneratorSettingsCallbacks()
                              UiStatusLevel::Error);
             return false;
         }
+
+        m_activeTriggerFrequencyHz = frequencyHz;
 
         setStatusMessage(enabled
                              ? QStringLiteral("触发设置已下发到脉冲板 %1 @ %2 Hz")
@@ -288,7 +397,7 @@ void DIMM::setupPulseGeneratorSettingsCallbacks()
         m_pulseGeneratorDutyPercent = dutyPercent;
         m_pulseGeneratorRemoteControl = remoteControl;
         if (m_imageProcessor) {
-            m_imageProcessor->setTargetFrameRateHz(m_pulseGeneratorFrequencyHz);
+            m_imageProcessor->setTargetFrameRateHz(currentTrackingFrameRateHz());
         }
         if (!m_pulseGenerator) {
             return true;
@@ -309,6 +418,10 @@ void DIMM::setupPulseGeneratorSettingsCallbacks()
                                  : QStringLiteral("脉冲输出启动失败"),
                              UiStatusLevel::Error);
             return false;
+        }
+
+        if (m_captureState != CaptureState::Live) {
+            m_activeTriggerFrequencyHz = frequencyHz;
         }
 
         if (m_captureState == CaptureState::Live && m_configTriggerMode != 0) {
@@ -405,19 +518,25 @@ void DIMM::setupAutoAcquisitionSettingsCallbacks()
 
 void DIMM::setupProcessingSettingsCallbacks()
 {
-    m_settingsDialog->onApplyProcessing = [this](int backgroundKernelSize,
-                                                 double backgroundSigmaMultiplier,
+    m_settingsDialog->onApplyProcessing = [this](int backgroundThresholdClipIterations,
+                                                 double backgroundThresholdClipSigma,
+                                                 double backgroundThresholdSigmaMultiplier,
                                                  int centroidMode,
                                                  int peakKernelRadiusPx,
                                                  double strongHotPixelExcessDn,
                                                  int r0HistoryWindowFrames) {
-        m_imageProcessor->setBackgroundDenoiseKernelSize(backgroundKernelSize);
-        m_imageProcessor->setBackgroundDenoiseSigmaMultiplier(backgroundSigmaMultiplier);
+        m_imageProcessor->setBackgroundNoiseThresholdConfig(backgroundThresholdClipIterations,
+                                                             backgroundThresholdClipSigma,
+                                                             backgroundThresholdSigmaMultiplier);
         m_imageProcessor->setCentroidMode(centroidMode);
         m_imageProcessor->setPeakKernelCentroidConfig(peakKernelRadiusPx,
                                                       strongHotPixelExcessDn);
         m_imageProcessor->setAtmosphereHistoryWindowFrames(r0HistoryWindowFrames);
         setStatusMessage(QStringLiteral("图像处理参数已更新"), UiStatusLevel::Success);
+    };
+    m_settingsDialog->onApplyPsdAnalysis = [this](const CdimPsdAnalysisConfig& config) {
+        m_imageProcessor->setPsdAnalysisConfig(config);
+        setStatusMessage(QStringLiteral("PSD 方差去噪参数已更新"), UiStatusLevel::Success);
     };
     m_settingsDialog->onApplyRoiRecentering =
         [this](double thresholdPx, int requiredFrames, qint64 cooldownMs, double minimumShiftPx) {
@@ -520,14 +639,16 @@ void DIMM::setupOpticsSettingsCallbacks()
                double focalLengthCm,
                double zenithAngleDeg,
                double lambdaNm,
-               double pixelSizeUm) {
+               double pixelSizeUm,
+               double outerScaleM) {
             m_imageProcessor->setOpticalParams(apertureDiameterMm,
                                                baselineSeparationMm,
                                                baselineAngleDeg,
                                                focalLengthCm,
                                                zenithAngleDeg,
                                                lambdaNm,
-                                               pixelSizeUm);
+                                               pixelSizeUm,
+                                               outerScaleM);
         setStatusMessage(QStringLiteral("光学参数已更新"), UiStatusLevel::Success);
         };
 }
@@ -659,6 +780,10 @@ void DIMM::setupNetworkSettingsCallbacks()
 
         savePersistentSettings(config, changes);
 
+        const bool snapshotSaved =
+            !changes.any() || !m_resultSessionActive || !m_resultWriter.isOpen() ||
+            writeChangedResultSettingsSnapshot(config, changes);
+
         const int connectedCameras = openCameraCount();
         QString message;
         UiStatusLevel level = UiStatusLevel::Success;
@@ -668,6 +793,10 @@ void DIMM::setupNetworkSettingsCallbacks()
         } else {
             message = QStringLiteral("配置已下发到 %1 台在线相机").arg(connectedCameras);
             level = UiStatusLevel::Success;
+        }
+        if (!snapshotSaved) {
+            message += QStringLiteral("；设置快照保存失败，详情已写入采集 CSV");
+            level = UiStatusLevel::Warning;
         }
 
         m_settingsDialog->applyStatusLabel->setText(message);
@@ -684,13 +813,17 @@ AppConfig DIMM::currentAppConfig() const
     config.camera.continuousFrameRateHz = m_configContinuousFrameRateHz;
     config.autoExposure = m_autoExposureConfig;
     if (m_imageProcessor) {
-        config.processing.backgroundKernelSize = m_imageProcessor->backgroundDenoiseKernelSize();
-        config.processing.backgroundSigmaMultiplier = m_imageProcessor->backgroundDenoiseSigmaMultiplier();
+        config.processing.backgroundThresholdClipIterations =
+            m_imageProcessor->backgroundThresholdClipIterations();
+        config.processing.backgroundThresholdClipSigma = m_imageProcessor->backgroundThresholdClipSigma();
+        config.processing.backgroundThresholdSigmaMultiplier =
+            m_imageProcessor->backgroundThresholdSigmaMultiplier();
         config.processing.centroidMode = m_imageProcessor->centroidMethod();
         config.processing.peakKernelRadiusPx = m_imageProcessor->peakKernelRadiusPx();
         config.processing.strongHotPixelExcessDn = m_imageProcessor->strongHotPixelExcessDn();
         config.processing.r0HistoryWindowFrames =
             m_imageProcessor->atmosphereHistoryWindowFrames();
+        config.processing.psdAnalysis = m_imageProcessor->psdAnalysisConfig();
         config.optical.apertureDiameterMm = m_imageProcessor->apertureDiameterMm();
         config.optical.baselineSeparationMm = m_imageProcessor->baselineSeparationMm();
         config.optical.baselineAngleDeg = m_imageProcessor->baselineAngleDeg();
@@ -698,6 +831,7 @@ AppConfig DIMM::currentAppConfig() const
         config.optical.zenithAngleDeg = m_imageProcessor->zenithAngleDeg();
         config.optical.wavelengthNm = m_imageProcessor->wavelengthNm();
         config.optical.pixelSizeUm = m_imageProcessor->pixelSizeUm();
+        config.optical.outerScaleM = m_imageProcessor->outerScaleMeters();
     }
     config.roiRecentering.thresholdPx = m_roiRecenteringThresholdPx;
     config.roiRecentering.requiredFrames = m_roiRecenteringRequiredFrames;
@@ -761,6 +895,7 @@ void DIMM::applyStartupConfig(const AppConfig& config)
     m_cameraExposureUs[1] = config.camera.exposureUs;
     m_configGainDb = config.camera.gainDb;
     m_configContinuousFrameRateHz = config.camera.continuousFrameRateHz;
+    m_activeContinuousFrameRateHz = m_configContinuousFrameRateHz;
     m_configTriggerMode = config.trigger.mode;
     m_autoAcquisitionConfig = config.autoAcquisition;
 
@@ -822,27 +957,44 @@ void DIMM::applyStartupConfig(const AppConfig& config)
     m_pulseGeneratorBaudRate = config.pulseGenerator.baudRate;
     m_pulseGeneratorTerminalId = config.pulseGenerator.terminalId;
     m_pulseGeneratorFrequencyHz = config.pulseGenerator.frequencyHz;
+    m_activeTriggerFrequencyHz = m_pulseGeneratorFrequencyHz;
     m_pulseGeneratorPulseCount = config.pulseGenerator.pulseCount;
     m_pulseGeneratorDutyPercent = config.pulseGenerator.dutyPercent;
     m_pulseGeneratorRemoteControl = config.pulseGenerator.remoteControl;
 
+    if (m_configTriggerMode != 0 && m_pulseGeneratorEnabled) {
+        QString pulseReason;
+        if (!startHardwarePulseStage(m_pulseGeneratorFrequencyHz,
+                                     QStringLiteral("启动默认"),
+                                     &pulseReason)) {
+            setStatusMessage(
+                pulseReason.isEmpty()
+                    ? QStringLiteral("启动默认触发输出失败")
+                    : QStringLiteral("启动默认触发输出失败: %1").arg(pulseReason),
+                UiStatusLevel::Error);
+        }
+    }
+
     if (m_imageProcessor) {
-        m_imageProcessor->setBackgroundDenoiseKernelSize(config.processing.backgroundKernelSize);
-        m_imageProcessor->setBackgroundDenoiseSigmaMultiplier(
-            config.processing.backgroundSigmaMultiplier);
+        m_imageProcessor->setBackgroundNoiseThresholdConfig(
+            config.processing.backgroundThresholdClipIterations,
+            config.processing.backgroundThresholdClipSigma,
+            config.processing.backgroundThresholdSigmaMultiplier);
         m_imageProcessor->setCentroidMethod(config.processing.centroidMode);
         m_imageProcessor->setPeakKernelCentroidConfig(config.processing.peakKernelRadiusPx,
                                                       config.processing.strongHotPixelExcessDn);
         m_imageProcessor->setAtmosphereHistoryWindowFrames(
             config.processing.r0HistoryWindowFrames);
+        m_imageProcessor->setPsdAnalysisConfig(config.processing.psdAnalysis);
         m_imageProcessor->setOpticalParams(config.optical.apertureDiameterMm,
                                            config.optical.baselineSeparationMm,
                                            config.optical.baselineAngleDeg,
                                            config.optical.focalLengthCm,
                                            config.optical.zenithAngleDeg,
                                            config.optical.wavelengthNm,
-                                           config.optical.pixelSizeUm);
-        m_imageProcessor->setTargetFrameRateHz(m_pulseGeneratorFrequencyHz);
+                                           config.optical.pixelSizeUm,
+                                           config.optical.outerScaleM);
+        m_imageProcessor->setTargetFrameRateHz(currentTrackingFrameRateHz());
         m_imageProcessor->setAutoExposureMetricConfig(m_autoExposureConfig.enabled,
                                                       m_autoExposureConfig.hardSaturationDn,
                                                       m_autoExposureConfig.autoExposureSampleIntervalMs,
@@ -858,6 +1010,10 @@ void DIMM::applyStartupConfig(const AppConfig& config)
 
     if (m_environmentSensor) {
         m_latestEnvironment = EnvironmentSensorData();
+        m_autoFocusSensorHadValidData = false;
+        m_autoFocusSensorOutageNotified = false;
+        m_autoFocusSensorAlertNotBeforeMs = QDateTime::currentMSecsSinceEpoch() +
+                                             kAutoFocusSensorStartupGraceMs;
         if (m_environmentSensorConfig.enabled) {
             m_environmentSensor->start(m_environmentSensorConfig);
         } else {
@@ -890,6 +1046,10 @@ void DIMM::applyStartupConfig(const AppConfig& config)
         if (m_settingsDialog->autoAcquisitionRecoveryScanIntervalEdit) {
             m_settingsDialog->autoAcquisitionRecoveryScanIntervalEdit->setText(
                 QString::number(m_autoAcquisitionConfig.recoveryScanIntervalMinutes));
+        }
+        if (m_settingsDialog->autoAcquisitionAttemptDurationEdit) {
+            m_settingsDialog->autoAcquisitionAttemptDurationEdit->setText(
+                QString::number(m_autoAcquisitionConfig.starFindingAttemptDurationSec));
         }
         if (m_settingsDialog->autoAcquisitionTestOverrideCheck) {
             m_settingsDialog->autoAcquisitionTestOverrideCheck->setChecked(
@@ -1069,6 +1229,339 @@ bool DIMM::resolveHotPixelTemplatePathsForCameraExposure(int cameraIndex,
     }
     if (excessPath) {
         *excessPath = resolvedExcess;
+    }
+    return true;
+}
+
+bool DIMM::applyStarFindingExposure(QString* reason)
+{
+    bool exposureNeedsUpdate = false;
+    for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+        if (std::abs(m_cameraExposureUs[cameraIndex] -
+                     static_cast<double>(kStarFindingExposureUs)) > 0.5) {
+            exposureNeedsUpdate = true;
+            break;
+        }
+    }
+    if (!exposureNeedsUpdate) {
+        return true;
+    }
+    return applyExposureAndHotPixelTemplate(kStarFindingExposureUs, reason);
+}
+
+bool DIMM::applyTrackingExposureAndFrameRate(const double targetExposureUs[2],
+                                             QString* reason,
+                                             bool forceFrequencySwitch)
+{
+    if (m_frequencyVerificationPending && !m_frequencyVerificationRollbackInProgress) {
+        if (reason) {
+            *reason = QStringLiteral("自动曝光: 正在验证上一档触发频率");
+        }
+        return false;
+    }
+    if (!targetExposureUs || !m_cameraManager ||
+        m_captureState != CaptureState::Live ||
+        (m_liveStartupPhase != LiveStartupPhase::Tracking && !m_liveHardwareRoiActive)) {
+        if (reason) {
+            *reason = QStringLiteral("自动曝光: 当前不在可切换的 Tracking 阶段");
+        }
+        return false;
+    }
+
+    for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+        if (!std::isfinite(targetExposureUs[cameraIndex]) ||
+            targetExposureUs[cameraIndex] <= 0.0) {
+            if (reason) {
+                *reason = QStringLiteral("自动曝光: 目标曝光无效");
+            }
+            return false;
+        }
+    }
+
+    const double oldExposureUs[2] = {
+        m_cameraExposureUs[0],
+        m_cameraExposureUs[1],
+    };
+    const double oldRateHz = currentTrackingFrameRateHz();
+    const bool frequencySwitchEnabled =
+        forceFrequencySwitch || m_autoExposureConfig.exposureFrequencySwitchEnabled;
+    QVector<ExposureFrameRateWindow> exposureFrameRateWindows;
+    QString windowReason;
+    if (frequencySwitchEnabled &&
+        !parseExposureFrameRateWindows(m_autoExposureConfig.exposureFrameRateWindows,
+                                       &exposureFrameRateWindows,
+                                       &windowReason)) {
+        if (reason) {
+            *reason = QStringLiteral("自动曝光: ROI 曝光区间-频率无效：%1").arg(windowReason);
+        }
+        return false;
+    }
+    const ExposureFrequencySwitchPlan switchPlan = ExposureFrequencySwitchController::plan(
+        oldExposureUs[0], oldExposureUs[1], targetExposureUs[0], targetExposureUs[1],
+        oldRateHz, exposureFrameRateWindows, frequencySwitchEnabled);
+    const double targetRateHz = switchPlan.targetFrequencyHz;
+    const bool trackingRateChange =
+        switchPlan.action == ExposureFrequencySwitchAction::FrequencyAndExposure;
+    if (switchPlan.action == ExposureFrequencySwitchAction::NoChange) {
+        m_trackingImageIntervalMs = AcquisitionImagePolicy::trackingIntervalMsForExposureUs(
+            targetExposureUs[0],
+            targetExposureUs[1],
+            targetRateHz,
+            m_autoExposureConfig.autoExposureSampleIntervalMs);
+        return true;
+    }
+
+    qint64 switchStartedMs = -1;
+    QElapsedTimer switchTimer;
+    if (trackingRateChange) {
+        switchStartedMs = QDateTime::currentMSecsSinceEpoch();
+        switchTimer.start();
+        m_rateSwitchInProgress = true;
+        m_rateSwitchStartedMs = switchStartedMs;
+        m_rateSwitchOldRateHz = oldRateHz;
+        m_rateSwitchNewRateHz = targetRateHz;
+        m_rateSwitchPauseMs = 0;
+        m_rateSwitchHardwareApplyMs = 0;
+        m_rateSwitchTimingPending = true;
+        if (m_resultSessionActive && m_resultWriter.isOpen()) {
+            writeAcquisitionPauseEvent(QStringLiteral("exposure_and_rate_change"),
+                                       switchStartedMs,
+                                       currentDeviceStatusForResultLog(switchStartedMs));
+        }
+    }
+
+    QString operationReason;
+    bool success = true;
+    QVector<int> appliedExposureCameraIndexes;
+    const auto applyTargetExposures = [&]() {
+        for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+            const int targetExposure =
+                static_cast<int>(std::lround(targetExposureUs[cameraIndex]));
+            if (!applyExposureAndHotPixelTemplate(cameraIndex, targetExposure, &operationReason)) {
+                return false;
+            }
+            appliedExposureCameraIndexes.append(cameraIndex);
+        }
+        return true;
+    };
+
+    bool rollbackAlreadyAttempted = false;
+    bool rollbackSuccess = true;
+    switch (switchPlan.action) {
+    case ExposureFrequencySwitchAction::ExposureOnly:
+        success = applyTargetExposures();
+        break;
+    case ExposureFrequencySwitchAction::FrequencyAndExposure:
+        if (m_configTriggerMode == 0) {
+            success = applyContinuousCameraFrameRate(targetRateHz, &operationReason);
+            if (success) {
+                success = applyTargetExposures();
+            }
+        } else {
+            ExposureFrequencySwitchCallbacks callbacks;
+            callbacks.stopTriggerOutput = [&](QString* callbackReason) {
+                if (!m_pulseGeneratorEnabled || !m_pulseGenerator) {
+                    if (callbackReason) {
+                        *callbackReason = QStringLiteral("自动曝光: 硬件触发器未就绪，无法停止触发输出");
+                    }
+                    return false;
+                }
+                if (!m_pulseGenerator->stop(callbackReason)) {
+                    return false;
+                }
+                m_rateSwitchPauseMs = switchTimer.elapsed();
+                return true;
+            };
+            callbacks.applyFrequency = [&](double frequencyHz, QString* callbackReason) {
+                if (!m_pulseGeneratorEnabled || !m_pulseGenerator) {
+                    if (callbackReason) {
+                        *callbackReason = QStringLiteral("自动曝光: 硬件触发器未就绪，无法修改触发频率");
+                    }
+                    return false;
+                }
+                PulseGeneratorManager::Config pulseConfig = m_pulseGenerator->config();
+                pulseConfig.enabled = true;
+                pulseConfig.frequencyHz = frequencyHz;
+                if (!m_pulseGenerator->applyConfig(pulseConfig, callbackReason)) {
+                    return false;
+                }
+                if (std::abs(m_pulseGenerator->config().frequencyHz - frequencyHz) > 0.05) {
+                    if (callbackReason) {
+                        *callbackReason = QStringLiteral("自动曝光: 触发频率配置读回失败");
+                    }
+                    return false;
+                }
+                return true;
+            };
+            callbacks.applyExposures = [&](QString* callbackReason) {
+                const bool applied = applyTargetExposures();
+                if (!applied && callbackReason) {
+                    *callbackReason = operationReason;
+                }
+                return applied;
+            };
+            callbacks.rollback = [&](QString*) {
+                bool restored = true;
+                for (int rollbackIndex = appliedExposureCameraIndexes.size() - 1;
+                     rollbackIndex >= 0;
+                     --rollbackIndex) {
+                    QString rollbackReason;
+                    const int cameraIndex = appliedExposureCameraIndexes[rollbackIndex];
+                    restored = applyExposureAndHotPixelTemplate(
+                                   cameraIndex,
+                                   static_cast<int>(std::lround(oldExposureUs[cameraIndex])),
+                                   &rollbackReason) &&
+                               restored;
+                }
+                PulseGeneratorManager::Config rollbackPulseConfig = m_pulseGenerator->config();
+                rollbackPulseConfig.enabled = true;
+                rollbackPulseConfig.frequencyHz = oldRateHz;
+                QString rollbackReason;
+                restored = m_pulseGenerator->configureAndStart(rollbackPulseConfig,
+                                                                &rollbackReason) &&
+                           restored;
+                return restored;
+            };
+            callbacks.startTriggerOutput = [&](double frequencyHz, QString* callbackReason) {
+                PulseGeneratorManager::Config pulseConfig = m_pulseGenerator->config();
+                if (std::abs(pulseConfig.frequencyHz - frequencyHz) > 0.05) {
+                    if (callbackReason) {
+                        *callbackReason = QStringLiteral("自动曝光: 启动前触发频率异常");
+                    }
+                    return false;
+                }
+                if (!m_pulseGenerator->configureAndStart(pulseConfig, callbackReason)) {
+                    return false;
+                }
+                if (!m_pulseGenerator->isRunningAtFrequency(frequencyHz)) {
+                    if (callbackReason) {
+                        *callbackReason = QStringLiteral("自动曝光: 启动后触发频率验证失败");
+                    }
+                    return false;
+                }
+                m_rateSwitchHardwareApplyMs = switchTimer.elapsed();
+                return true;
+            };
+            callbacks.flushQueues = [&]() { m_cameraManager->flushPairQueues(); };
+            const ExposureFrequencySwitchResult result =
+                ExposureFrequencySwitchController::switchForExposure(
+                    switchPlan, callbacks, &operationReason);
+            success = result == ExposureFrequencySwitchResult::Applied;
+            rollbackAlreadyAttempted = result != ExposureFrequencySwitchResult::Applied;
+            rollbackSuccess = result == ExposureFrequencySwitchResult::RolledBack;
+        }
+        break;
+    case ExposureFrequencySwitchAction::NoChange:
+        break;
+    }
+
+    if (!success) {
+        const QString primaryReason = operationReason;
+        if (!rollbackAlreadyAttempted) {
+            for (int rollbackIndex = appliedExposureCameraIndexes.size() - 1;
+                 rollbackIndex >= 0;
+                 --rollbackIndex) {
+                const int cameraIndex = appliedExposureCameraIndexes[rollbackIndex];
+                QString rollbackReason;
+                rollbackSuccess = applyExposureAndHotPixelTemplate(
+                                      cameraIndex,
+                                      static_cast<int>(std::lround(oldExposureUs[cameraIndex])),
+                                      &rollbackReason) &&
+                                  rollbackSuccess;
+            }
+            if (trackingRateChange && m_configTriggerMode == 0) {
+                QString rollbackReason;
+                rollbackSuccess = applyContinuousCameraFrameRate(oldRateHz, &rollbackReason) &&
+                                  rollbackSuccess;
+            }
+        }
+        if (trackingRateChange) {
+            m_rateSwitchInProgress = false;
+        }
+        if (m_resultSessionActive && m_resultWriter.isOpen()) {
+            const qint64 failedAtMs = QDateTime::currentMSecsSinceEpoch();
+            writeHardwareErrorEvent(QStringLiteral("acquisition"),
+                                    -1,
+                                    0,
+                                    QStringLiteral("exposure_and_rate_change"),
+                                    primaryReason,
+                                    rollbackSuccess,
+                                    failedAtMs);
+            if (rollbackSuccess) {
+                writeAcquisitionResumeEvent(QStringLiteral("exposure_and_rate_rollback"),
+                                            failedAtMs,
+                                            currentDeviceStatusForResultLog(failedAtMs));
+            }
+        }
+        if (reason) {
+            *reason = primaryReason.isEmpty()
+                          ? QStringLiteral("自动曝光: 曝光/帧率切换失败，已尝试回滚")
+                          : primaryReason + QStringLiteral("；已尝试回滚");
+        }
+        if (trackingRateChange) {
+            RateSwitchTiming timing;
+            timing.pauseMs = 0;
+            timing.hardwareApplyMs = switchTimer.elapsed();
+            timing.firstValidPairMs = 0;
+            timing.success = false;
+            logRateSwitchTiming(timing, oldRateHz, targetRateHz,
+                                m_configTriggerMode == 0
+                                    ? QStringLiteral("continuous")
+                                    : QStringLiteral("hardware_trigger"));
+            m_rateSwitchTimingPending = false;
+        }
+        if (!rollbackSuccess) {
+            closeResultSessionForHardwareError();
+            updateCaptureState(CaptureState::Idle);
+            if (m_liveStartupOrigin == LiveStartupOrigin::AutoAcquisition) {
+                closeAutoAcquisitionCameras();
+            }
+        }
+        return false;
+    }
+
+    if (trackingRateChange && m_configTriggerMode != 0) {
+        m_activeTriggerFrequencyHz = targetRateHz;
+        if (m_imageProcessor) {
+            m_imageProcessor->setTargetFrameRateHz(targetRateHz);
+        }
+    }
+
+    m_trackingImageIntervalMs = AcquisitionImagePolicy::trackingIntervalMsForExposureUs(
+        targetExposureUs[0],
+        targetExposureUs[1],
+        targetRateHz,
+        m_autoExposureConfig.autoExposureSampleIntervalMs);
+    if (trackingRateChange && m_configTriggerMode != 0 &&
+        !m_frequencyVerificationRollbackInProgress) {
+        m_frequencyVerificationPending = true;
+        m_frequencyVerificationNotBeforeMs = QDateTime::currentMSecsSinceEpoch() + 1000;
+        m_frequencyVerificationTargetHz = targetRateHz;
+        m_frequencyVerificationPreviousExposureUs[0] = oldExposureUs[0];
+        m_frequencyVerificationPreviousExposureUs[1] = oldExposureUs[1];
+        return true;
+    }
+    if (trackingRateChange) {
+        m_rateSwitchHardwareApplyMs = switchTimer.elapsed();
+        m_rateSwitchInProgress = false;
+        if (m_rateSwitchTimingPending) {
+            RateSwitchTiming timing;
+            timing.pauseMs = m_rateSwitchPauseMs;
+            timing.hardwareApplyMs = m_rateSwitchHardwareApplyMs;
+            timing.firstValidPairMs = 0;
+            timing.success = true;
+            logRateSwitchTiming(timing, oldRateHz, targetRateHz,
+                                m_configTriggerMode == 0
+                                    ? QStringLiteral("continuous")
+                                    : QStringLiteral("hardware_trigger"));
+            m_rateSwitchTimingPending = false;
+        }
+        if (m_resultSessionActive && m_resultWriter.isOpen()) {
+            const qint64 resumedAtMs = QDateTime::currentMSecsSinceEpoch();
+            writeAcquisitionResumeEvent(QStringLiteral("exposure_and_rate_change_complete"),
+                                        resumedAtMs,
+                                        currentDeviceStatusForResultLog(resumedAtMs));
+        }
     }
     return true;
 }

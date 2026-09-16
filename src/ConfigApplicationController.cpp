@@ -17,6 +17,7 @@ ConfigApplicationCallbacks callbacksForChanges(const ConfigApplicationCallbacks&
     }
     if (!changes.processing) {
         filtered.applyProcessing = nullptr;
+        filtered.applyPsdAnalysis = nullptr;
     }
     if (!changes.roiRecentering) {
         filtered.applyRoiRecentering = nullptr;
@@ -74,12 +75,16 @@ void applyValidatedConfig(const AppConfig& config,
                           const ConfigApplicationCallbacks& callbacks)
 {
     if (callbacks.applyProcessing) {
-        callbacks.applyProcessing(config.processing.backgroundKernelSize,
-                                  config.processing.backgroundSigmaMultiplier,
+        callbacks.applyProcessing(config.processing.backgroundThresholdClipIterations,
+                                  config.processing.backgroundThresholdClipSigma,
+                                  config.processing.backgroundThresholdSigmaMultiplier,
                                   config.processing.centroidMode,
                                   config.processing.peakKernelRadiusPx,
                                   config.processing.strongHotPixelExcessDn,
                                   config.processing.r0HistoryWindowFrames);
+    }
+    if (callbacks.applyPsdAnalysis) {
+        callbacks.applyPsdAnalysis(config.processing.psdAnalysis);
     }
     if (callbacks.applyRoiRecentering) {
         callbacks.applyRoiRecentering(config.roiRecentering.thresholdPx,
@@ -110,7 +115,8 @@ void applyValidatedConfig(const AppConfig& config,
                               config.optical.focalLengthCm,
                               config.optical.zenithAngleDeg,
                               config.optical.wavelengthNm,
-                              config.optical.pixelSizeUm);
+                              config.optical.pixelSizeUm,
+                              config.optical.outerScaleM);
     }
     if (callbacks.applyAlignment) {
         callbacks.applyAlignment(config.alignment.autoRadius,

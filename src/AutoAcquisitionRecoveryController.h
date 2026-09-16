@@ -1,5 +1,7 @@
 #pragma once
 
+#include "AppConfig.h"
+
 #include <QtGlobal>
 #include <QString>
 
@@ -8,7 +10,6 @@ enum class AutoAcquisitionRecoveryPhase {
     WaitingImmediateScan,
     Scanning,
     Tracking,
-    WaitingInterval,
     AwaitingManualSelection
 };
 

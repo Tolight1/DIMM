@@ -1,5 +1,7 @@
 #include "CanvasWidgets.h"
 
+#include "AlignmentReticle.h"
+
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
@@ -168,7 +170,6 @@ void FullFrameCanvas::paintEvent(QPaintEvent*)
 {
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
-    painter.setRenderHint(QPainter::SmoothPixmapTransform);
     painter.fillRect(rect(), QColor(17, 17, 17));
 
     if (m_image.empty()) {
@@ -389,13 +390,62 @@ void FullFrameCanvas::drawAlignmentOverlay(QPainter& painter)
     painter.drawLine(QPointF(center.x(), imageRect.top()), QPointF(center.x(), imageRect.bottom()));
 
     if (radius > 1.0) {
-        painter.setPen(QPen(QColor(40, 92, 255, 220), 2.0));
+        painter.setPen(QPen(QColor(40, 112, 255, 150), 1.2));
         painter.drawEllipse(center, radius, radius);
+
+        const QVector<AlignmentReticle::Tick> ticks = AlignmentReticle::buildTicks();
+        const double scaleBandInnerRadius = radius + 14.0;
+        const double scaleBandOuterRadius = radius + 42.0;
+        painter.setPen(QPen(QColor(20, 45, 120, 165), 1.1));
+        painter.drawEllipse(center, scaleBandInnerRadius, scaleBandInnerRadius);
+        painter.setPen(QPen(QColor(40, 112, 255, 175), 1.1));
+        painter.drawEllipse(center, scaleBandOuterRadius, scaleBandOuterRadius);
+
+        const double labelRadius = (scaleBandInnerRadius + scaleBandOuterRadius) * 0.5;
+        const QFont tickFont(QStringLiteral("Consolas"), 8, QFont::DemiBold);
+        painter.setFont(tickFont);
+
+        for (int index = 0; index < ticks.size(); ++index) {
+            const AlignmentReticle::Tick& tick = ticks[index];
+            const double angle = tick.phaseRad - 1.57079632679489661923;
+            const QPointF direction(std::cos(angle), std::sin(angle));
+            const bool isMajor = tick.kind == AlignmentReticle::TickKind::Major;
+            const double tickStartRadius =
+                isMajor ? scaleBandInnerRadius - 2.0 : scaleBandInnerRadius + 7.0;
+            const QColor tickColor = isMajor ? QColor(125, 190, 255, 235)
+                                             : QColor(70, 125, 205, 170);
+
+            painter.setPen(QPen(tickColor, isMajor ? 1.8 : 1.0));
+            painter.drawLine(center + direction * tickStartRadius,
+                             center + direction * (scaleBandOuterRadius + 1.0));
+
+            if (isMajor) {
+                const QString label =
+                    AlignmentReticle::formatHourLabel(static_cast<int>(std::lround(tick.hour)));
+                const QPointF labelCenter = center + direction * labelRadius;
+                const QFontMetricsF metrics(tickFont);
+                const QRectF textRect(labelCenter.x() - metrics.horizontalAdvance(label) * 0.5 - 2.0,
+                                      labelCenter.y() - metrics.height() * 0.5 - 1.0,
+                                      metrics.horizontalAdvance(label) + 4.0,
+                                      metrics.height() + 2.0);
+                painter.setPen(QColor(190, 225, 255, 235));
+                painter.drawText(textRect, Qt::AlignCenter, label);
+            }
+        }
+
+        painter.setPen(QPen(QColor(110, 180, 255, 220), 1.2));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawEllipse(center, 6.0, 6.0);
+        painter.setFont(QFont(QStringLiteral("Consolas"), 8, QFont::DemiBold));
+        painter.setPen(QColor(180, 220, 255, 230));
+        painter.drawText(center + QPointF(9.0, -8.0), QStringLiteral("NCP"));
     }
 
     if (m_alignmentOverlay.hasSimulatedCurrentPolaris) {
         const QPointF simulated =
             imageToWidget(m_alignmentOverlay.simulatedCurrentPolarisPosition);
+        painter.setPen(QPen(QColor(120, 255, 160, 180), 1.2, Qt::DashLine));
+        painter.drawLine(center, simulated);
         painter.setPen(QPen(QColor(120, 255, 160), 2.0));
         painter.drawEllipse(simulated, 8.0, 8.0);
         painter.drawLine(simulated + QPointF(-12.0, 0.0),
@@ -462,52 +512,6 @@ void FullFrameCanvas::drawAlignmentOverlay(QPainter& painter)
                                   : m_alignmentOverlay.label;
         painter.setPen(QColor(255, 210, 90));
         painter.drawText(star + QPointF(10.0, -10.0), label);
-    } else {
-        painter.setPen(QColor(255, 190, 70));
-        painter.drawText(imageRect.adjusted(12.0, 28.0, -12.0, -12.0).topLeft(),
-                         QStringLiteral("未检测到北极星"));
-    }
-
-    if (m_alignmentOverlay.matchedStarCount > 0) {
-        painter.setPen(QColor(210, 235, 255));
-        painter.drawText(imageRect.adjusted(12.0, 12.0, -12.0, -12.0).topLeft(),
-                         QStringLiteral("匹配 %1 星 | RMS %2 px | %3\"/px")
-                             .arg(m_alignmentOverlay.matchedStarCount)
-                             .arg(m_alignmentOverlay.rmsPx, 0, 'f', 2)
-                             .arg(m_alignmentOverlay.plateScaleArcsecPx, 0, 'f', 3));
-    }
-
-    QStringList detailLines;
-    if (!m_alignmentOverlay.solveStateText.isEmpty()) {
-        detailLines << m_alignmentOverlay.solveStateText;
-    }
-    if (m_alignmentOverlay.polarisNcpDistancePx > 0.0) {
-        detailLines << QStringLiteral("NCP-Polaris %1 px / %2'")
-                           .arg(m_alignmentOverlay.polarisNcpDistancePx, 0, 'f', 1)
-                           .arg(m_alignmentOverlay.polarisNcpDistanceArcmin, 0, 'f', 2);
-    }
-    if (!m_alignmentOverlay.orbitSource.isEmpty()) {
-        detailLines << QStringLiteral("轨道: %1").arg(m_alignmentOverlay.orbitSource);
-    }
-    if (m_alignmentOverlay.solveTotalMs > 0.0) {
-        detailLines << QStringLiteral("耗时 %1 ms")
-                           .arg(m_alignmentOverlay.solveTotalMs, 0, 'f', 1);
-    }
-    if (m_alignmentOverlay.mirroredKnown) {
-        detailLines << QStringLiteral("镜像: %1")
-                           .arg(m_alignmentOverlay.mirrored ? QStringLiteral("是")
-                                                            : QStringLiteral("否"));
-    }
-    if (!m_alignmentOverlay.warningText.isEmpty()) {
-        detailLines << m_alignmentOverlay.warningText;
-    }
-    if (!detailLines.isEmpty()) {
-        painter.setFont(QFont("Microsoft YaHei", 8));
-        painter.setPen(m_alignmentOverlay.warningText.isEmpty()
-                           ? QColor(210, 235, 255)
-                           : QColor(255, 190, 70));
-        painter.drawText(imageRect.adjusted(12.0, 46.0, -12.0, -12.0).topLeft(),
-                         detailLines.join(QLatin1String(" | ")));
     }
 
     painter.restore();
@@ -910,7 +914,7 @@ ChartWidget::ChartWidget(SeriesKind kind, QWidget* parent)
     , m_kind(kind)
     , m_data(WINDOW_SECONDS, std::numeric_limits<double>::quiet_NaN())
 {
-    setMinimumSize(260, 220);
+    setMinimumSize(0, 0);
 }
 
 void ChartWidget::setSecondValue(int second, double value)
@@ -951,6 +955,13 @@ void ChartWidget::paintEvent(QPaintEvent*)
 
 void ChartWidget::drawSeriesChart(QPainter& painter, QRect rect)
 {
+    if (rect.width() < 150 || rect.height() < 100) {
+        painter.setPen(QColor(100, 100, 110));
+        painter.setFont(QFont("Microsoft YaHei", 9));
+        painter.drawText(rect, Qt::AlignCenter, QStringLiteral("窗口过小"));
+        return;
+    }
+
     const bool isR0 = m_kind == SeriesKind::R0;
     const QColor lineColor = isR0 ? QColor(79, 195, 247) : QColor(139, 195, 74);
     const QString title = isR0 ? QStringLiteral("r0") : QStringLiteral("Seeing");
@@ -966,7 +977,14 @@ void ChartWidget::drawSeriesChart(QPainter& painter, QRect rect)
     painter.setFont(QFont("Microsoft YaHei", 11, QFont::Bold));
     painter.drawText(rect.x() + 16, rect.y() + 26, title);
 
-    const QRect chartRect(rect.x() + 46, rect.y() + 42, rect.width() - 64, rect.height() - 70);
+    const int leftMargin = rect.width() < 240 ? 38 : 46;
+    const int topMargin = rect.height() < 150 ? 32 : 42;
+    const int rightMargin = 18;
+    const int bottomMargin = rect.height() < 150 ? 42 : 70;
+    const QRect chartRect(rect.x() + leftMargin,
+                          rect.y() + topMargin,
+                          std::max(1, rect.width() - leftMargin - rightMargin),
+                          std::max(1, rect.height() - topMargin - bottomMargin));
     painter.fillRect(chartRect, QColor(30, 30, 48));
     drawAxes(painter, chartRect, m_data, minY, maxY, unit);
 
@@ -1117,4 +1135,184 @@ double ChartWidget::niceCeil(double value)
     }
 
     return niceNormalized * scale;
+}
+
+PsdChartWidget::PsdChartWidget(const QString& title, QWidget* parent)
+    : QWidget(parent),
+      m_title(title)
+{
+    setMinimumSize(0, 0);
+}
+
+void PsdChartWidget::setResult(const CdimPsdChannelResult& result, double fsActualHz)
+{
+    m_result = result;
+    m_fsActualHz = fsActualHz;
+    m_hasData = result.frequencyHz.size() > 1 && result.psd.size() == result.frequencyHz.size();
+    update();
+}
+
+void PsdChartWidget::clear()
+{
+    m_result = CdimPsdChannelResult();
+    m_fsActualHz = 0.0;
+    m_hasData = false;
+    update();
+}
+
+void PsdChartWidget::drawCurve(QPainter& painter,
+                               const QVector<double>& x,
+                               const QVector<double>& y,
+                               QRect chartRect,
+                               double xMax,
+                               double logMin,
+                               double logMax,
+                               const QColor& color,
+                               Qt::PenStyle style,
+                               qreal width) const
+{
+    if (x.isEmpty() || x.size() != y.size()) {
+        return;
+    }
+    QPainterPath path;
+    bool started = false;
+    painter.setPen(QPen(color, width, style));
+    for (int i = 0; i < x.size(); ++i) {
+        if (!std::isfinite(x.at(i)) || !std::isfinite(y.at(i)) || y.at(i) <= 0.0) {
+            started = false;
+            continue;
+        }
+        const double normalizedX = std::clamp(x.at(i) / std::max(1.0e-12, xMax), 0.0, 1.0);
+        const double logValue = std::log10(y.at(i));
+        const double normalizedY = std::clamp((logValue - logMin)
+                                                  / std::max(1.0e-12, logMax - logMin),
+                                              0.0,
+                                              1.0);
+        const QPointF point(chartRect.left() + normalizedX * chartRect.width(),
+                            chartRect.bottom() - normalizedY * chartRect.height());
+        if (!started) {
+            path.moveTo(point);
+            started = true;
+        } else {
+            path.lineTo(point);
+        }
+    }
+    painter.drawPath(path);
+}
+
+void PsdChartWidget::paintEvent(QPaintEvent*)
+{
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.fillRect(rect(), QColor(17, 17, 17));
+    const QRect outer = rect().adjusted(1, 1, -2, -2);
+    painter.setPen(QPen(QColor(52, 52, 82), 1));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRoundedRect(outer, 8, 8);
+    painter.setPen(QColor(220, 220, 230));
+    painter.setFont(QFont("Microsoft YaHei", 9, QFont::Bold));
+    painter.drawText(outer.left() + 10, outer.top() + 18, m_title);
+
+    if (outer.width() < 180 || outer.height() < 105) {
+        painter.setPen(QColor(100, 100, 110));
+        painter.setFont(QFont("Microsoft YaHei", 9));
+        painter.drawText(outer, Qt::AlignCenter, QStringLiteral("窗口过小"));
+        return;
+    }
+
+    if (!m_hasData) {
+        painter.setPen(QColor(100, 100, 110));
+        painter.setFont(QFont("Microsoft YaHei", 9));
+        painter.drawText(outer, Qt::AlignCenter, QStringLiteral("暂无 PSD 数据"));
+        return;
+    }
+
+    const QRect chartRect(outer.left() + 42,
+                          outer.top() + 28,
+                          std::max(20, outer.width() - 56),
+                          std::max(20, outer.height() - 58));
+    const double xMax = m_result.frequencyHz.last() > 0.0
+                            ? m_result.frequencyHz.last()
+                            : std::max(1.0, m_fsActualHz * 0.5);
+    double logMin = std::numeric_limits<double>::infinity();
+    double logMax = -std::numeric_limits<double>::infinity();
+    const auto addRange = [&](const QVector<double>& values) {
+        for (double value : values) {
+            if (std::isfinite(value) && value > 0.0) {
+                const double logValue = std::log10(value);
+                logMin = std::min(logMin, logValue);
+                logMax = std::max(logMax, logValue);
+            }
+        }
+    };
+    addRange(m_result.psd);
+    addRange(m_result.fittedTotalPsd);
+    addRange(m_result.fittedAtmosphericPsd);
+    if (m_result.noisePsdN0 > 0.0) {
+        const double logNoise = std::log10(m_result.noisePsdN0);
+        logMin = std::min(logMin, logNoise);
+        logMax = std::max(logMax, logNoise);
+    }
+    if (!std::isfinite(logMin) || !std::isfinite(logMax)) {
+        return;
+    }
+    if (logMax - logMin < 1.0) {
+        const double center = 0.5 * (logMin + logMax);
+        logMin = center - 0.5;
+        logMax = center + 0.5;
+    } else {
+        logMin -= 0.2;
+        logMax += 0.2;
+    }
+
+    painter.fillRect(chartRect, QColor(30, 30, 48));
+    if (m_result.noiseBandValid) {
+        const double left = chartRect.left()
+                            + std::clamp(m_result.selectedNoiseStartHz / xMax, 0.0, 1.0)
+                                  * chartRect.width();
+        const double right = chartRect.left()
+                             + std::clamp(m_result.selectedNoiseEndHz / xMax, 0.0, 1.0)
+                                   * chartRect.width();
+        painter.fillRect(QRectF(left, chartRect.top(), std::max(1.0, right - left),
+                                chartRect.height()), QColor(74, 112, 74, 55));
+    }
+    painter.setPen(QPen(QColor(56, 56, 78), 1));
+    for (int i = 1; i <= 3; ++i) {
+        const int y = chartRect.top() + chartRect.height() * i / 4;
+        painter.drawLine(chartRect.left(), y, chartRect.right(), y);
+    }
+    for (int i = 1; i <= 4; ++i) {
+        const int x = chartRect.left() + chartRect.width() * i / 5;
+        painter.drawLine(x, chartRect.top(), x, chartRect.bottom());
+    }
+    painter.setPen(QPen(QColor(112, 112, 140), 1.2));
+    painter.drawLine(chartRect.bottomLeft(), chartRect.bottomRight());
+    painter.drawLine(chartRect.bottomLeft(), chartRect.topLeft());
+    painter.setFont(QFont("Consolas", 8));
+    painter.setPen(QColor(170, 170, 190));
+    painter.drawText(QRect(chartRect.left() - 40, chartRect.top() - 6, 38, 16),
+                     Qt::AlignRight, QStringLiteral("10^%1").arg(logMax, 0, 'f', 1));
+    painter.drawText(QRect(chartRect.left() - 40, chartRect.bottom() - 10, 38, 16),
+                     Qt::AlignRight, QStringLiteral("10^%1").arg(logMin, 0, 'f', 1));
+    painter.drawText(QRect(chartRect.left(), chartRect.bottom() + 6, 70, 16),
+                     Qt::AlignLeft, QStringLiteral("0 Hz"));
+    painter.drawText(QRect(chartRect.right() - 90, chartRect.bottom() + 6, 90, 16),
+                     Qt::AlignRight, QStringLiteral("%1 Hz").arg(xMax, 0, 'f', 1));
+
+    drawCurve(painter, m_result.frequencyHz, m_result.psd, chartRect,
+              xMax, logMin, logMax, QColor(79, 195, 247), Qt::SolidLine, 1.4);
+    drawCurve(painter, m_result.frequencyHz, m_result.fittedTotalPsd, chartRect,
+              xMax, logMin, logMax, QColor(255, 190, 85), Qt::SolidLine, 1.2);
+    drawCurve(painter, m_result.frequencyHz, m_result.fittedAtmosphericPsd, chartRect,
+              xMax, logMin, logMax, QColor(139, 195, 74), Qt::SolidLine, 1.2);
+    if (m_result.noisePsdN0 > 0.0) {
+        QVector<double> noise(m_result.frequencyHz.size(), m_result.noisePsdN0);
+        drawCurve(painter, m_result.frequencyHz, noise, chartRect,
+                  xMax, logMin, logMax, QColor(210, 210, 210), Qt::DashLine, 1.0);
+    }
+    painter.setPen(QColor(160, 160, 175));
+    painter.setFont(QFont("Microsoft YaHei", 8));
+    painter.drawText(outer.left() + 10,
+                     outer.bottom() - 8,
+                     m_result.qcStatus.isEmpty() ? QStringLiteral("PSD") : m_result.qcStatus);
 }

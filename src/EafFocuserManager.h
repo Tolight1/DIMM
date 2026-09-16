@@ -27,11 +27,21 @@ struct EafDeviceDescriptor {
     bool serialSupported = false;
 };
 
+/// Resolve a persisted EAF mapping against the devices currently enumerated.
+/// A stored serial number is authoritative; legacy id/index fallback is used
+/// only when no serial number was persisted.
+int resolveSavedEafDeviceIndex(const QVector<EafDeviceDescriptor>& devices,
+                               const QString& savedSerialHex,
+                               int savedDeviceId,
+                               int savedEnumerationIndex);
+
 struct EafDeviceState {
     bool sdkLoaded = false;
     bool present = false;
     bool opened = false;
     bool moving = false;
+    bool positionValid = false;
+    bool motionValid = false;
     bool handControl = false;
     bool temperatureValid = false;
     int currentPosition = 0;
@@ -91,7 +101,9 @@ public slots:
     void closeAssignedDevice(TelescopeSlot slot);
     void requestStateRefresh(TelescopeSlot slot);
     void moveAbsolute(TelescopeSlot slot, int target);
+    void moveAbsoluteForAutoFocus(TelescopeSlot slot, int target);
     void moveRelative(TelescopeSlot slot, int delta);
+    void moveRelativeForAutoFocus(TelescopeSlot slot, int delta);
     void stopMotion(TelescopeSlot slot);
     void resetPosition(TelescopeSlot slot, int value);
     void setMaxStep(TelescopeSlot slot, int value);
@@ -100,6 +112,7 @@ public slots:
     void setBeep(TelescopeSlot slot, bool value);
     void setLed(TelescopeSlot slot, bool value);
     void setMotionAllowed(bool allowed, QString reason);
+    void setManualMotionAllowed(TelescopeSlot slot, bool allowed, QString reason);
 
 signals:
     void sdkAvailabilityChanged(bool available, QString detail);
@@ -112,11 +125,16 @@ signals:
     void deviceRemoved(TelescopeSlot slot, QString serialHex);
 
 private:
+    void ensureInitialized();
+    void restoreSavedMappings(const QVector<EafDeviceDescriptor>& devices);
+
     EafSdkLoader* m_sdk = nullptr;
     EafFocuserWorker* m_worker = nullptr;
     QThread* m_workerThread = nullptr;
     bool m_workerShutdownTimedOut = false;
     bool m_motionAllowed = true;
     QString m_motionDisallowedReason;
+    bool m_manualMotionAllowed[2] = {true, true};
+    QString m_manualMotionDisallowedReason[2];
     EafDeviceDescriptor m_slotMapping[2];
 };

@@ -104,7 +104,6 @@ void DIMM::onCameraConnected(int index, QString serial, QString model)
 
 void DIMM::onCameraDisconnected(int index)
 {
-    Q_UNUSED(index);
     if (m_captureState == CaptureState::Live &&
         m_configTriggerMode != 0 &&
         !m_liveStartupConfirmed) {
@@ -114,6 +113,20 @@ void DIMM::onCameraDisconnected(int index)
                 .arg(index + 1));
         return;
     }
+    if (m_captureState == CaptureState::Live && m_resultSessionActive) {
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        writeHardwareErrorEvent(QStringLiteral("camera"),
+                                 index,
+                                 0,
+                                 QStringLiteral("disconnected"),
+                                 QStringLiteral("相机断开连接"),
+                                 true,
+                                 nowMs);
+        writeAcquisitionPauseEvent(QStringLiteral("camera_disconnected"),
+                                   nowMs,
+                                   currentDeviceStatusForResultLog(nowMs));
+        stopLiveCapture();
+    }
     m_connectingCameras = false;
     refreshCameraUi();
     refreshActionStates();
@@ -121,13 +134,30 @@ void DIMM::onCameraDisconnected(int index)
         updateCaptureState(CaptureState::Paused);
         setStatusMessage(QStringLiteral("相机断开，采集已暂停"), UiStatusLevel::Warning);
     } else {
+        if (m_captureState == CaptureState::Live) {
+            updateCaptureState(CaptureState::Paused);
+        }
         setStatusMessage(QStringLiteral("相机已断开"), UiStatusLevel::Warning);
     }
 }
 
 void DIMM::onCameraError(int index, int errorCode, QString message)
 {
-    Q_UNUSED(errorCode);
+    if (m_captureState == CaptureState::Live && m_resultSessionActive) {
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        writeHardwareErrorEvent(QStringLiteral("camera"),
+                                 index,
+                                 errorCode,
+                                 QStringLiteral("camera_error"),
+                                 message,
+                                 true,
+                                 nowMs);
+        writeAcquisitionPauseEvent(QStringLiteral("camera_error"),
+                                   nowMs,
+                                   currentDeviceStatusForResultLog(nowMs));
+        stopLiveCapture();
+        updateCaptureState(CaptureState::Paused);
+    }
     m_connectingCameras = false;
     refreshActionStates();
     setStatusMessage(QStringLiteral("相机%1错误: %2").arg(index + 1).arg(message), UiStatusLevel::Error);
@@ -179,7 +209,7 @@ void DIMM::handleLiveFramePacket(int cameraIndex, const CameraFrame& packet)
     }
     if (cameraIndex >= 0 && cameraIndex < 2 && m_configTriggerMode == 0) {
         const qint64 continuousFrameIntervalMs =
-            qMax<qint64>(1, static_cast<qint64>(std::llround(1000.0 / std::max(0.1, m_configContinuousFrameRateHz))));
+            qMax<qint64>(1, static_cast<qint64>(std::llround(1000.0 / std::max(0.1, currentTrackingFrameRateHz()))));
         const qint64 lastAcceptedMs = m_lastAcceptedContinuousFrameMs[cameraIndex];
         if (lastAcceptedMs >= 0 && (frameReceivedMs - lastAcceptedMs) < continuousFrameIntervalMs) {
             return;
@@ -205,6 +235,22 @@ void DIMM::handleLiveFramePacket(int cameraIndex, const CameraFrame& packet)
             m_lastAcceptedLiveFrameId[cameraIndex] = packet.frameId;
         }
         ++runtime.frameCountPerCamera[cameraIndex];
+        if (!frameLooksLikeHardwareRoi) {
+            // Keep only new full-frame packets for the search phase. Tracking image saves are
+            // armed by the auto-exposure cooldown edge and consume the next 64x64 ROI packet.
+            runtime.latestFullFrame[cameraIndex] = frame.clone();
+            runtime.latestFullFrameId[cameraIndex] = packet.frameId;
+            runtime.latestFullFrameReceivedMs[cameraIndex] = frameReceivedMs;
+        }
+        if (m_liveStartupPhase == LiveStartupPhase::LocatePair) {
+            saveLiveFullFrameImage(cameraIndex, packet);
+        } else if (m_liveStartupPhase == LiveStartupPhase::Tracking &&
+                   frameLooksLikeHardwareRoi &&
+                   m_trackingImageSaveOnNextRoiFrame[cameraIndex] &&
+                   nowMs >= m_trackingImageSaveNextRetryMs[cameraIndex]) {
+            // The image processor returns the threshold-subtracted calculation image for
+            // this frame; tracking saves must not write the raw ROI packet.
+        }
     }
 
     ++runtime.frameCount;
@@ -214,7 +260,7 @@ void DIMM::handleLiveFramePacket(int cameraIndex, const CameraFrame& packet)
             frameLooksLikeHardwareRoi);
     }
     if (runtime.frameCount == 1 && m_liveStartupPhase == LiveStartupPhase::Tracking) {
-        setStatusMessage(QStringLiteral("状态: 实时采集中，已收到图像帧，预览按30秒刷新"),
+        setStatusMessage(QStringLiteral("状态: 实时采集中，已收到图像帧；自动曝光每次进入冷却时保存两路 64x64 ROI 图像"),
                          UiStatusLevel::Success);
     }
     maybeSeedRoiFromFrame(cameraIndex, frame);

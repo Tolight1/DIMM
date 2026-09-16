@@ -3,6 +3,9 @@
 #include "CameraManager.h"
 #include "CanvasWidgets.h"
 #include "DimmRuntimeHelpers.h"
+#include "ExposureFrameRateRules.h"
+#include "FocuserControlWidget.h"
+#include "FrameRateChangePolicy.h"
 #include "FullFrameStarDetector.h"
 #include "ImageProcessor.h"
 #include "LivePreviewPolicy.h"
@@ -15,6 +18,7 @@
 #include <cmath>
 
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QLabel>
 #include <QPointF>
 
@@ -56,21 +60,6 @@ void DIMM::clearStableCandidateTrackers()
     for (int cameraIndex = 0; cameraIndex < kCameraCount; ++cameraIndex) {
         m_stableCandidateTrackers[cameraIndex].clear();
     }
-}
-
-bool DIMM::isCentroidNearCurrentRoiEdge(int cameraIndex, double x, double y) const
-{
-    if (!m_imageProcessor || cameraIndex < 0 || cameraIndex >= 2) {
-        return false;
-    }
-
-    const RoiRect roi = m_imageProcessor->getCurrentRoi(cameraIndex);
-    const double localX = x - static_cast<double>(roi.x);
-    const double localY = y - static_cast<double>(roi.y);
-    return localX <= static_cast<double>(kRoiEdgeUpdateMarginPx) ||
-           localY <= static_cast<double>(kRoiEdgeUpdateMarginPx) ||
-           localX >= static_cast<double>(roi.w - 1 - kRoiEdgeUpdateMarginPx) ||
-           localY >= static_cast<double>(roi.h - 1 - kRoiEdgeUpdateMarginPx);
 }
 
 bool DIMM::isCentroidTooFarFromCurrentRoiCenter(int cameraIndex) const
@@ -142,10 +131,31 @@ void DIMM::requestLiveFullFrameRelocalization(const QString& reason)
     }
 
     auto& runtime = activeRuntime();
-    runtime.liveRelocalizationStartedMs = QDateTime::currentMSecsSinceEpoch();
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    runtime.liveRelocalizationStartedMs = nowMs;
+    ++m_searchAttempt;
+    m_searchAttemptStartedMs = nowMs;
+    writeSearchLifecycleEventsOnce(reason.isEmpty()
+                                       ? QStringLiteral("relocalization")
+                                       : reason,
+                                   QStringLiteral("search_relocalization"),
+                                   nowMs);
+    stopAutoFocusForTrackingExit(QStringLiteral("Tracking 正在重新定位"));
+    m_liveHardwareRoiActive = false;
+    m_liveStartupPhase = LiveStartupPhase::LocatePair;
     resetLiveFrameAcceptanceGates();
     QString switchReason;
     const bool fullFrameReady = applyLiveFullFrameForRelocalization(&switchReason);
+    if (!fullFrameReady && m_configTriggerMode == 0 &&
+        m_resultSessionActive && m_resultWriter.isOpen()) {
+        writeHardwareErrorEvent(QStringLiteral("camera"),
+                                -1,
+                                0,
+                                QStringLiteral("search_full_frame_switch"),
+                                switchReason,
+                                true,
+                                nowMs);
+    }
 
     if (!fullFrameReady &&
         m_configTriggerMode != 0) {
@@ -172,6 +182,9 @@ void DIMM::requestLiveFullFrameRelocalization(const QString& reason)
         runtime.hasLastTargetPosition[cameraIndex] = false;
         runtime.lastLivePreviewUpdateMs[cameraIndex] = -1;
         runtime.liveRelocalizationPreviewFrame[cameraIndex].release();
+        runtime.latestFullFrame[cameraIndex].release();
+        runtime.latestFullFrameId[cameraIndex] = 0;
+        runtime.latestFullFrameReceivedMs[cameraIndex] = -1;
     }
     if (m_cam1RoiCanvas) {
         m_cam1RoiCanvas->clear();
@@ -188,8 +201,6 @@ void DIMM::requestLiveFullFrameRelocalization(const QString& reason)
     ui->lblROITimeCurrent->setText(QStringLiteral("全画幅重定位"));
     ui->lblROITimeNext->setText(QStringLiteral("等待两路重新锁定 ROI"));
 
-    m_liveHardwareRoiActive = false;
-    m_liveStartupPhase = LiveStartupPhase::LocatePair;
     if (!fullFrameReady) {
         setStatusMessage(switchReason.isEmpty()
                              ? QStringLiteral("状态: 回全画幅重新定位失败")
@@ -234,14 +245,18 @@ void DIMM::handleLiveRoiCentroidLoss(int cameraIndex)
     }
 
     if (m_imageProcessor) {
-        m_imageProcessor->finalizeActiveAtmosphereWindow(
-            QStringLiteral("相机%1星点丢失，未达到完整 r0 计算窗口").arg(cameraIndex + 1));
+        m_imageProcessor->discardActiveAtmosphereWindow();
     }
+    noteStarTrackingState(false,
+                          runtime.latestFullFrameReceivedMs[cameraIndex] > 0
+                              ? runtime.latestFullFrameReceivedMs[cameraIndex]
+                              : nowMs,
+                          QStringLiteral("相机%1星点丢失").arg(cameraIndex + 1));
     if (m_liveStartupOrigin == LiveStartupOrigin::AutoAcquisition) {
         m_autoAcquisitionRecovery.noteStarLost(nowMs);
     }
     requestLiveFullFrameRelocalization(
-        QStringLiteral("状态: 相机%1星点离开 ROI，已切回全画幅重新定位")
+        QStringLiteral("状态: 相机%1连续未获得有效质心，已切回全画幅重新定位")
             .arg(cameraIndex + 1));
 }
 
@@ -251,6 +266,7 @@ bool DIMM::isUsableCentroidSample(int cameraIndex,
                                   double peakValue,
                                   double totalFlux,
                                   double background,
+                                  double noiseSigma,
                                   double threshold,
                                   quint64 signalPixelCount,
                                   bool requireCentered) const
@@ -272,6 +288,12 @@ bool DIMM::isUsableCentroidSample(int cameraIndex,
         return false;
     }
     if (totalFlux <= 80.0) {
+        return false;
+    }
+    const double effectiveNoise = std::max(noiseSigma, 1.0);
+    const double snr = totalFlux /
+                       (effectiveNoise * std::sqrt(static_cast<double>(signalPixelCount)));
+    if (!std::isfinite(snr) || snr < m_autoExposureConfig.trackingLostSnr) {
         return false;
     }
     if (x < 0.0 || y < 0.0 || x >= frameSize.width() || y >= frameSize.height()) {
@@ -454,30 +476,150 @@ bool DIMM::configureLiveCameras(QString* reason)
         }
     }
 
-    if (!applyContinuousCameraFrameRate(reason)) {
+    if (!applyContinuousCameraFrameRate(kFullFrameLocalizationPulseHz, reason)) {
         return false;
+    }
+
+    if (m_configTriggerMode != 0) {
+        m_activeTriggerFrequencyHz = kFullFrameLocalizationPulseHz;
+        if (m_imageProcessor) {
+            m_imageProcessor->setTargetFrameRateHz(kFullFrameLocalizationPulseHz);
+        }
     }
 
     return true;
 }
 
-bool DIMM::applyContinuousCameraFrameRate(QString* reason)
+bool DIMM::applyContinuousCameraFrameRate(double targetFrameRateHz, QString* reason)
 {
+    if (!std::isfinite(targetFrameRateHz) || targetFrameRateHz <= 0.0) {
+        if (reason) {
+            *reason = QStringLiteral("连续采集目标帧率无效");
+        }
+        return false;
+    }
     if (!m_cameraManager || m_configTriggerMode != 0) {
+        m_activeContinuousFrameRateHz = targetFrameRateHz;
         return true;
     }
 
-    const bool restartLiveContinuousCapture = m_captureState == CaptureState::Live;
-    bool liveCaptureStopped = false;
-    if (restartLiveContinuousCapture) {
-        if (!m_cameraManager->stopAll()) {
+    const double previousFrameRateHz = m_activeContinuousFrameRateHz;
+    const bool rateChanged = needsFrameRateChange(previousFrameRateHz, targetFrameRateHz);
+    if (!rateChanged && m_captureState == CaptureState::Live) {
+        bool recoveryRequired = false;
+        for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+            recoveryRequired = recoveryRequired ||
+                               (m_cameraManager->isOpen(cameraIndex) &&
+                                !m_cameraManager->isStreaming(cameraIndex));
+        }
+        if (recoveryRequired && !m_cameraManager->startAll()) {
             if (reason) {
-                *reason = QStringLiteral("暂停连续采集以设置帧率失败");
+                *reason = QStringLiteral("连续采集回滚后相机恢复失败");
             }
             return false;
         }
+        if (recoveryRequired) {
+            for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+                if (m_cameraManager->isOpen(cameraIndex) &&
+                    !m_cameraManager->isStreaming(cameraIndex)) {
+                    if (reason) {
+                        *reason = QStringLiteral("连续采集回滚后相机仍处于停止状态");
+                    }
+                    return false;
+                }
+            }
+        }
+        m_activeContinuousFrameRateHz = targetFrameRateHz;
+        if (m_imageProcessor) {
+            m_imageProcessor->setTargetFrameRateHz(targetFrameRateHz);
+        }
+        return true;
+    }
+    const bool ownsRateSwitch = rateChanged &&
+                                m_captureState == CaptureState::Live &&
+                                m_resultSessionActive &&
+                                !m_rateSwitchInProgress;
+    const qint64 switchStartedMs = QDateTime::currentMSecsSinceEpoch();
+    QElapsedTimer rateSwitchTimer;
+    if (ownsRateSwitch || (rateChanged && m_rateSwitchInProgress)) {
+        rateSwitchTimer.start();
+    }
+    if (ownsRateSwitch) {
+        m_rateSwitchStartedMs = switchStartedMs;
+        m_rateSwitchOldRateHz = previousFrameRateHz;
+        m_rateSwitchNewRateHz = targetFrameRateHz;
+        m_rateSwitchPauseMs = 0;
+        m_rateSwitchHardwareApplyMs = 0;
+        m_rateSwitchTimingPending = true;
+    }
+    if (ownsRateSwitch) {
+        m_rateSwitchInProgress = true;
+        writeAcquisitionPauseEvent(QStringLiteral("continuous_frame_rate_change"),
+                                   switchStartedMs,
+                                   currentDeviceStatusForResultLog(switchStartedMs));
+    }
+
+    const auto areOpenCamerasStreaming = [&]() {
+        for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+            if (m_cameraManager->isOpen(cameraIndex) &&
+                !m_cameraManager->isStreaming(cameraIndex)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const auto finishOwnedRateSwitchFailure = [&](const QString& message) {
+        const bool acquisitionRecovered = areOpenCamerasStreaming();
+        const QString failureMessage = acquisitionRecovered
+                                           ? message
+                                           : message + QStringLiteral("；相机未恢复采集");
+        if (ownsRateSwitch) {
+            RateSwitchTiming timing;
+            timing.pauseMs = rateSwitchTimer.elapsed();
+            timing.hardwareApplyMs = rateSwitchTimer.elapsed();
+            timing.firstValidPairMs = 0;
+            timing.success = false;
+            logRateSwitchTiming(timing,
+                                previousFrameRateHz,
+                                targetFrameRateHz,
+                                QStringLiteral("continuous"));
+            m_rateSwitchTimingPending = false;
+            m_rateSwitchInProgress = false;
+            if (m_resultSessionActive && m_resultWriter.isOpen()) {
+                const qint64 failedAtMs = QDateTime::currentMSecsSinceEpoch();
+                writeHardwareErrorEvent(QStringLiteral("camera"),
+                                        -1,
+                                        0,
+                                        QStringLiteral("continuous_frame_rate_change"),
+                                        failureMessage,
+                                        acquisitionRecovered,
+                                        failedAtMs);
+                if (acquisitionRecovered) {
+                    writeAcquisitionResumeEvent(QStringLiteral("continuous_frame_rate_rollback"),
+                                                failedAtMs,
+                                                currentDeviceStatusForResultLog(failedAtMs));
+                }
+            }
+        }
+        if (reason) {
+            *reason = failureMessage;
+        }
+        return false;
+    };
+
+    const bool restartLiveContinuousCapture = rateChanged &&
+                                              m_captureState == CaptureState::Live;
+    bool liveCaptureStopped = false;
+    if (restartLiveContinuousCapture) {
+        if (!m_cameraManager->stopAll()) {
+            return finishOwnedRateSwitchFailure(
+                QStringLiteral("暂停连续采集以设置帧率失败"));
+        }
         liveCaptureStopped = true;
-        resetLiveFrameAcceptanceGates();
+        if (ownsRateSwitch || m_rateSwitchInProgress) {
+            m_rateSwitchPauseMs = rateSwitchTimer.elapsed();
+        }
     }
 
     const auto restartLiveCapture = [&]() {
@@ -496,40 +638,64 @@ bool DIMM::applyContinuousCameraFrameRate(QString* reason)
         if (reason) {
             *reason = message + restartReason;
         }
-        return false;
+        return finishOwnedRateSwitchFailure(message + restartReason);
     };
 
     for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
         if (!m_cameraManager->isOpen(cameraIndex)) {
             continue;
         }
-        if (!m_cameraManager->setFrameRate(cameraIndex, m_configContinuousFrameRateHz)) {
+        if (!m_cameraManager->setFrameRate(cameraIndex, targetFrameRateHz)) {
             return failWithRestart(QStringLiteral("相机%1连续采集帧率设置失败").arg(cameraIndex + 1));
         }
 
         const double actualFrameRate = m_cameraManager->getFrameRate(cameraIndex);
         m_lastContinuousFrameRateReadback[cameraIndex] = actualFrameRate;
-        const double tolerance = std::max(0.05, m_configContinuousFrameRateHz * 0.05);
+        const double tolerance = std::max(0.05, targetFrameRateHz * 0.05);
         if (actualFrameRate <= 0.0 ||
-            std::abs(actualFrameRate - m_configContinuousFrameRateHz) > tolerance) {
+            std::abs(actualFrameRate - targetFrameRateHz) > tolerance) {
             return failWithRestart(QStringLiteral("相机%1连续采集帧率读回异常: 目标 %2 fps，实际 %3 fps。")
                                        .arg(cameraIndex + 1)
-                                       .arg(m_configContinuousFrameRateHz, 0, 'f', 2)
+                                       .arg(targetFrameRateHz, 0, 'f', 2)
                                        .arg(actualFrameRate, 0, 'f', 2));
         }
     }
 
     if (!restartLiveCapture()) {
-        if (reason) {
-            *reason = QStringLiteral("设置连续采集帧率后恢复采集失败");
-        }
-        return false;
+        return finishOwnedRateSwitchFailure(
+            QStringLiteral("设置连续采集帧率后恢复采集失败"));
     }
-    if (restartLiveContinuousCapture) {
-        advanceLiveAcquisitionGeneration();
+    m_activeContinuousFrameRateHz = targetFrameRateHz;
+    if (m_imageProcessor) {
+        m_imageProcessor->setTargetFrameRateHz(targetFrameRateHz);
+    }
+    if (ownsRateSwitch) {
+        m_rateSwitchHardwareApplyMs = rateSwitchTimer.elapsed();
+        RateSwitchTiming timing;
+        timing.pauseMs = m_rateSwitchPauseMs;
+        timing.hardwareApplyMs = m_rateSwitchHardwareApplyMs;
+        timing.firstValidPairMs = 0;
+        timing.success = true;
+        logRateSwitchTiming(timing,
+                            previousFrameRateHz,
+                            targetFrameRateHz,
+                            QStringLiteral("continuous"));
+        m_rateSwitchTimingPending = false;
+        const qint64 resumedAtMs = QDateTime::currentMSecsSinceEpoch();
+        writeAcquisitionResumeEvent(QStringLiteral("continuous_frame_rate_change_complete"),
+                                    resumedAtMs,
+                                    currentDeviceStatusForResultLog(resumedAtMs));
+        m_rateSwitchInProgress = false;
     }
 
     return true;
+}
+
+double DIMM::currentTrackingFrameRateHz() const
+{
+    return m_configTriggerMode == 0
+               ? m_activeContinuousFrameRateHz
+               : m_activeTriggerFrequencyHz;
 }
 
 void DIMM::advanceLiveAcquisitionGeneration()
@@ -568,6 +734,7 @@ bool DIMM::startDualCameraLocalization(QString* reason)
         return false;
     }
 
+    stopAutoFocusForTrackingExit(QStringLiteral("进入全画幅定位"));
     m_liveStartupPhase = LiveStartupPhase::LocatePair;
     return true;
 }
@@ -609,7 +776,7 @@ bool DIMM::applyLiveHardwareRois(const RoiRect rois[2], QString* reason, RoiRect
             appliedRois[0] = liveRois[0];
             appliedRois[1] = liveRois[1];
         }
-        const bool rateReady = applyContinuousCameraFrameRate(reason);
+        const bool rateReady = applyContinuousCameraFrameRate(m_activeContinuousFrameRateHz, reason);
         if (rateReady) {
             advanceLiveAcquisitionGeneration();
         }
@@ -700,7 +867,7 @@ bool DIMM::applyLiveHardwareRois(const RoiRect rois[2], QString* reason, RoiRect
         appliedRois[0] = liveRois[0];
         appliedRois[1] = liveRois[1];
     }
-    const bool rateReady = applyContinuousCameraFrameRate(reason);
+    const bool rateReady = applyContinuousCameraFrameRate(m_activeContinuousFrameRateHz, reason);
     if (rateReady) {
         advanceLiveAcquisitionGeneration();
     }
@@ -758,19 +925,85 @@ bool DIMM::applyLiveFullFrameForRelocalization(QString* reason)
         }
     }
 
+    bool pulseResponseTimeout = false;
+    if (success && m_configTriggerMode != 0) {
+        QString pulseReason;
+        const bool pulseStarted = startFullFrameLocalizationPulse(&pulseReason);
+        const bool pulseVerified =
+            pulseStarted && (!m_pulseGeneratorEnabled ||
+                             (m_pulseGenerator &&
+                              m_pulseGenerator->isRunningAtFrequency(
+                                  kFullFrameLocalizationPulseHz)));
+        if (!pulseStarted && !isPulseBoardResponseTimeout(pulseReason)) {
+            success = false;
+            if (reason) {
+                *reason = pulseReason.isEmpty()
+                              ? QStringLiteral("全画幅重定位低频触发启动失败。")
+                              : pulseReason;
+            }
+        } else if (!pulseVerified && pulseStarted) {
+            success = false;
+            if (reason) {
+                *reason = QStringLiteral("全画幅重定位低频触发状态校验失败");
+            }
+        } else {
+            pulseResponseTimeout = !pulseStarted;
+            m_activeTriggerFrequencyHz = kFullFrameLocalizationPulseHz;
+            if (m_imageProcessor) {
+                m_imageProcessor->setTargetFrameRateHz(kFullFrameLocalizationPulseHz);
+            }
+        }
+    } else if (success) {
+        for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+            if (!m_cameraManager->isOpen(cameraIndex)) {
+                continue;
+            }
+            if (!m_cameraManager->setFrameRate(cameraIndex, kFullFrameLocalizationPulseHz)) {
+                success = false;
+                if (reason) {
+                    *reason = QStringLiteral("相机%1全画幅重定位帧率设置失败").arg(cameraIndex + 1);
+                }
+                break;
+            }
+            const double actualFrameRate = m_cameraManager->getFrameRate(cameraIndex);
+            m_lastContinuousFrameRateReadback[cameraIndex] = actualFrameRate;
+            const double tolerance = std::max(0.05, kFullFrameLocalizationPulseHz * 0.05);
+            if (!std::isfinite(actualFrameRate) ||
+                std::abs(actualFrameRate - kFullFrameLocalizationPulseHz) > tolerance) {
+                success = false;
+                if (reason) {
+                    *reason = QStringLiteral("相机%1全画幅重定位帧率读回异常").arg(cameraIndex + 1);
+                }
+                break;
+            }
+        }
+        if (success) {
+            m_activeContinuousFrameRateHz = kFullFrameLocalizationPulseHz;
+            if (m_imageProcessor) {
+                m_imageProcessor->setTargetFrameRateHz(kFullFrameLocalizationPulseHz);
+            }
+        }
+    }
+
+    if (success && m_autoExposureConfig.enabled && !applyStarFindingExposure(reason)) {
+        success = false;
+    }
+
+    if (triggerGated &&
+        !m_cameraManager->setPairTriggerSource(QString::fromLatin1(kHardwareTriggerLine)) &&
+        success) {
+        if (reason) {
+            *reason = QStringLiteral("全画幅重定位后恢复 Line0 触发源失败");
+        }
+        success = false;
+    }
+
     const bool resumed = m_cameraManager->resumePairAfterRoiUpdate(pauseState);
     if (!resumed && reason && success) {
         *reason = QStringLiteral("切换全画幅后恢复采集失败");
     }
     if (resumed) {
         m_cameraManager->flushPairQueues();
-    }
-
-    if (triggerGated &&
-        !m_cameraManager->setPairTriggerSource(QString::fromLatin1(kHardwareTriggerLine)) &&
-        reason && success && resumed) {
-        *reason = QStringLiteral("全画幅重定位后恢复 Line0 触发源失败");
-        success = false;
     }
 
     if (!success || !resumed) {
@@ -781,48 +1014,18 @@ bool DIMM::applyLiveFullFrameForRelocalization(QString* reason)
     }
 
     if (m_configTriggerMode != 0) {
-        QString pulseReason;
-
-        const bool pulseStarted =
-            startFullFrameLocalizationPulse(&pulseReason);
-
-        if (!pulseStarted) {
-            if (!isPulseBoardResponseTimeout(pulseReason)) {
-                if (reason) {
-                    *reason =
-                        pulseReason.isEmpty()
-                            ? QStringLiteral(
-                                  "全画幅重定位低频触发启动失败。")
-                            : pulseReason;
-                }
-
-                return false;
-            }
-
+        if (pulseResponseTimeout) {
             m_pulseBoardResponseTimedOut = true;
-
             setPulseBoardResponseTimeoutStatus(
                 QStringLiteral(
                     "状态: 全画幅重定位脉冲板应答超时，继续等待双相机新的全画幅图像确认触发是否生效"));
         }
-
         beginHardwareTriggerStartupStage(
             HardwareTriggerStartupStage::WaitingFullFramePair);
-
-        if (reason) {
-            reason->clear();
-        }
-
-        return true;
     }
-    for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
-        if (m_cameraManager->isOpen(cameraIndex) &&
-            !m_cameraManager->setFrameRate(cameraIndex, kFullFrameLocalizationPulseHz)) {
-            if (reason) {
-                *reason = QStringLiteral("相机%1全画幅重定位帧率设置失败").arg(cameraIndex + 1);
-            }
-            return false;
-        }
+
+    if (reason) {
+        reason->clear();
     }
     return true;
 }
@@ -853,11 +1056,9 @@ bool DIMM::selectLiveRelocalizationCentroid(
     }
 
     double actualThreshold = 0.0;
-    double otsuThreshold = 0.0;
     QVector<InitialStarCandidate> candidates =
-        detectInitialStarCandidates(fullFrame, peakValue, &actualThreshold, &otsuThreshold);
+        detectInitialStarCandidates(fullFrame, peakValue, &actualThreshold, nullptr);
     candidates = stabilizeInitialCandidates(cameraIndex, candidates);
-    setFullFrameThresholdDisplay(cameraIndex, otsuThreshold, actualThreshold);
     if (candidates.isEmpty()) {
         if (failureReason) {
             *failureReason =
@@ -962,6 +1163,11 @@ bool DIMM::maybeSeedRoiFromFrame(int cameraIndex, const cv::Mat& frame)
         return false;
     }
 
+    if (m_liveStartupOrigin == LiveStartupOrigin::AutoAcquisition &&
+        m_autoAcquisitionRecovery.phase() == AutoAcquisitionRecoveryPhase::AwaitingManualSelection) {
+        return false;
+    }
+
     const bool liveLocatePhase =
         m_captureState == CaptureState::Live && m_liveStartupPhase != LiveStartupPhase::Tracking;
     if (m_captureState == CaptureState::Live) {
@@ -1057,11 +1263,9 @@ bool DIMM::maybeSeedRoiFromFrame(int cameraIndex, const cv::Mat& frame)
             UiStatusLevel::Info);
     } else {
         double actualThreshold = 0.0;
-        double otsuThreshold = 0.0;
         QVector<InitialStarCandidate> candidates =
-            detectInitialStarCandidates(grayscale, &peakValue, &actualThreshold, &otsuThreshold);
+            detectInitialStarCandidates(grayscale, &peakValue, &actualThreshold, nullptr);
         candidates = stabilizeInitialCandidates(cameraIndex, candidates);
-        setFullFrameThresholdDisplay(cameraIndex, otsuThreshold, actualThreshold);
         if (candidates.isEmpty()) {
             if (runtime.pendingInitialCandidateSelectionRequired[cameraIndex]) {
                 if (targetCanvas) {
@@ -1141,6 +1345,11 @@ void DIMM::handleLiveRelocalizationWatchdog(qint64 nowMs)
         return;
     }
 
+    if (m_liveStartupOrigin == LiveStartupOrigin::AutoAcquisition &&
+        m_autoAcquisitionRecovery.phase() == AutoAcquisitionRecoveryPhase::AwaitingManualSelection) {
+        return;
+    }
+
     auto& runtime = activeRuntime();
     const bool relocalizationActive =
         runtime.liveRelocalizationStartedMs >= 0 ||
@@ -1156,7 +1365,13 @@ void DIMM::handleLiveRelocalizationWatchdog(qint64 nowMs)
         runtime.liveRelocalizationStartedMs = nowMs;
         return;
     }
-    if ((nowMs - runtime.liveRelocalizationStartedMs) < kLiveRelocalizationMaxDurationMs) {
+    const qint64 attemptDurationMs =
+        m_liveStartupOrigin == LiveStartupOrigin::AutoAcquisition
+            ? qBound<qint64>(static_cast<qint64>(1000),
+                            static_cast<qint64>(m_autoAcquisitionConfig.starFindingAttemptDurationSec) * 1000,
+                            static_cast<qint64>(600000))
+            : kLiveRelocalizationMaxDurationMs;
+    if ((nowMs - runtime.liveRelocalizationStartedMs) < attemptDurationMs) {
         return;
     }
 
@@ -1169,7 +1384,7 @@ void DIMM::handleLiveRelocalizationWatchdog(qint64 nowMs)
             runtime.pendingInitialCandidateSelectionRequired[1];
         if (noCameraHasPendingRoi || manualSelectionRequired) {
             clearPendingLiveRelocalizationRois();
-            stopAutoAcquisitionScanUntilNextInterval(
+            prepareAutoAcquisitionRelocalization(
                 manualSelectionRequired
                     ? QStringLiteral("自动采集检测到多个候选星，等待人工选择")
                     : QStringLiteral("自动采集全画幅未找到星点，等待下一次扫描"),
@@ -1180,11 +1395,27 @@ void DIMM::handleLiveRelocalizationWatchdog(qint64 nowMs)
 
     clearPendingLiveRelocalizationRois();
     runtime.liveRelocalizationStartedMs = nowMs;
+    ++m_searchAttempt;
+    m_searchAttemptStartedMs = nowMs;
+    writeSearchLifecycleEventsOnce(QStringLiteral("search_timeout"),
+                                   QStringLiteral("search_timeout"),
+                                   nowMs);
+    stopAutoFocusForTrackingExit(QStringLiteral("Tracking 搜索超时，正在重新定位"));
     m_liveStartupPhase = LiveStartupPhase::LocatePair;
     m_liveHardwareRoiActive = false;
     resetLiveFrameAcceptanceGates();
     QString switchReason;
     const bool fullFrameReady = applyLiveFullFrameForRelocalization(&switchReason);
+    if (!fullFrameReady && m_configTriggerMode == 0 &&
+        m_resultSessionActive && m_resultWriter.isOpen()) {
+        writeHardwareErrorEvent(QStringLiteral("camera"),
+                                -1,
+                                0,
+                                QStringLiteral("search_full_frame_switch"),
+                                switchReason,
+                                true,
+                                nowMs);
+    }
 
     if (!fullFrameReady &&
         m_configTriggerMode != 0) {
@@ -1335,6 +1566,69 @@ bool DIMM::isFullFrameLocalizationPulseRunning() const
     return pulseConfigsMatch(m_pulseGenerator->config(), pulseConfig);
 }
 
+bool DIMM::setLiveHardwareTriggerLine(const QString& inputLine, QString* reason)
+{
+    if (m_configTriggerMode == 0) {
+        return true;
+    }
+    if (!m_cameraManager) {
+        if (reason) {
+            *reason = QStringLiteral("相机管理器未初始化");
+        }
+        return false;
+    }
+
+    const QString hardwareLine = QString::fromLatin1(kHardwareTriggerLine);
+    const QString pausedLine = QString::fromLatin1(kPausedTriggerLine);
+    QString rollbackLine;
+    if (inputLine == hardwareLine) {
+        rollbackLine = pausedLine;
+    } else if (inputLine == pausedLine) {
+        rollbackLine = hardwareLine;
+    }
+
+    const auto rollback = [&]() {
+        if (rollbackLine.isEmpty()) {
+            return false;
+        }
+        bool prepared = true;
+        for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+            prepared = m_cameraManager->prepareTriggerInputLine(cameraIndex, rollbackLine) &&
+                       prepared;
+        }
+        return prepared && m_cameraManager->setPairTriggerSource(rollbackLine);
+    };
+    const auto reportFailure = [&](const QString& detail) {
+        const bool rolledBack = rollback();
+        if (reason) {
+            *reason = detail + (rolledBack
+                                    ? QStringLiteral("；已回滚至 %1").arg(rollbackLine)
+                                    : QStringLiteral("；触发源回滚失败"));
+        }
+        return false;
+    };
+
+    for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+        if (!m_cameraManager->prepareTriggerInputLine(cameraIndex, inputLine)) {
+            return reportFailure(
+                QStringLiteral("准备相机%1触发输入线失败").arg(cameraIndex + 1));
+        }
+    }
+    if (!m_cameraManager->setPairTriggerSource(inputLine)) {
+        return reportFailure(QStringLiteral("切换双相机触发源失败: %1").arg(inputLine));
+    }
+    return true;
+}
+
+bool DIMM::restoreRoiTrackingFrequency(QString* reason)
+{
+    const double targetExposureUs[2] = {
+        m_cameraExposureUs[0],
+        m_cameraExposureUs[1],
+    };
+    return applyTrackingExposureAndFrameRate(targetExposureUs, reason, true);
+}
+
 bool DIMM::commitPairedInitialRoisIfReady()
 {
     if (!m_imageProcessor) {
@@ -1358,6 +1652,19 @@ bool DIMM::commitPairedInitialRoisIfReady()
     QString reason;
     if (m_captureState == CaptureState::Live && !applyLiveHardwareRois(pairedRois, &reason, actualRois)) {
         m_liveHardwareRoiActive = false;
+        if (m_resultSessionActive && m_resultWriter.isOpen()) {
+            const qint64 failedAtMs = QDateTime::currentMSecsSinceEpoch();
+            writeHardwareErrorEvent(QStringLiteral("camera"),
+                                    -1,
+                                    0,
+                                    QStringLiteral("initial_roi_apply"),
+                                    reason,
+                                    true,
+                                    failedAtMs);
+            writeAcquisitionPauseEvent(QStringLiteral("initial_roi_apply"),
+                                       failedAtMs,
+                                       currentDeviceStatusForResultLog(failedAtMs));
+        }
         clearPendingLiveRelocalizationRois();
         setStatusMessage(reason.isEmpty()
                              ? QStringLiteral("状态: 双相机初始 ROI 写入失败")
@@ -1366,39 +1673,42 @@ bool DIMM::commitPairedInitialRoisIfReady()
         return false;
     }
 
-    bool roiPulseResponseTimeout = false;
-
     if (m_captureState == CaptureState::Live) {
-        if (!switchToRoiTrackingPulse(&reason)) {
-            if (!isPulseBoardResponseTimeout(reason)) {
-                m_liveHardwareRoiActive = false;
-                clearPendingLiveRelocalizationRois();
+        m_liveHardwareRoiActive = true;
+        if (!restoreRoiTrackingFrequency(&reason)) {
+            m_liveHardwareRoiActive = false;
+            clearPendingLiveRelocalizationRois();
 
-                m_hardwareTriggerStartupStage =
-                    HardwareTriggerStartupStage::None;
+            m_hardwareTriggerStartupStage =
+                HardwareTriggerStartupStage::None;
 
-                if (m_hardwareTriggerStartupTimer) {
-                    m_hardwareTriggerStartupTimer->stop();
-                }
+            if (m_hardwareTriggerStartupTimer) {
+                m_hardwareTriggerStartupTimer->stop();
+            }
 
+            if (m_configTriggerMode != 0) {
                 handleHardwareTriggerStartupFailure(
                     reason.isEmpty()
                         ? QStringLiteral("ROI 高频触发切换失败")
                         : reason);
-
-                return false;
+            } else {
+                setStatusMessage(reason.isEmpty()
+                                     ? QStringLiteral("ROI 跟踪帧率恢复失败")
+                                     : reason,
+                                 UiStatusLevel::Warning);
             }
 
-            roiPulseResponseTimeout = true;
-            m_pulseBoardResponseTimedOut = true;
+            return false;
         }
 
         /*
-         * switchToRoiTrackingPulse() 已经返回。
+         * ROI 跟踪频率已经读回确认。
          * Qt 当前线程中的图像回调尚未处理，因此此时记录帧数基线。
          */
-        beginHardwareTriggerStartupStage(
-            HardwareTriggerStartupStage::WaitingRoiTrackingPair);
+        if (m_configTriggerMode != 0) {
+            beginHardwareTriggerStartupStage(
+                HardwareTriggerStartupStage::WaitingRoiTrackingPair);
+        }
     }
 
     m_imageProcessor->setPairRois(actualRois);
@@ -1422,26 +1732,58 @@ bool DIMM::commitPairedInitialRoisIfReady()
     }
     runtime.pendingInitialCandidateSelectionRequired[0] = false;
     runtime.pendingInitialCandidateSelectionRequired[1] = false;
+    const bool enteringTracking = m_liveStartupPhase != LiveStartupPhase::Tracking;
     m_liveHardwareRoiActive = m_captureState == CaptureState::Live;
     m_liveStartupPhase = LiveStartupPhase::Tracking;
+    if (enteringTracking) {
+        m_autoFocusReferenceCalibrationStarted[0] = false;
+        m_autoFocusReferenceCalibrationStarted[1] = false;
+    }
+    if (m_focuserControlWidget) {
+        m_focuserControlWidget->setAutoFocusTrackingAvailable(isTrackingForAutoFocus());
+    }
+    if (enteringTracking && isTrackingForAutoFocus() && m_autoFocusController &&
+        m_latestEnvironment.valid) {
+        for (int camera = 0; camera < 2; ++camera) {
+            m_autoFocusController->primeTemperatureBaseline(
+                camera, m_latestEnvironment.temperatureC, true);
+        }
+    }
+    if (isTrackingForAutoFocus() && m_focuserManager) {
+        m_focuserManager->requestStateRefresh(TelescopeSlot::Telescope1);
+        m_focuserManager->requestStateRefresh(TelescopeSlot::Telescope2);
+    }
+    if (isTrackingForAutoFocus()) {
+        startAutoFocusReferenceCalibration();
+        startAutoFocusForAutoAcquisition();
+    }
+    const qint64 trackingSourceMs =
+        qMax(runtime.latestFullFrameReceivedMs[0], runtime.latestFullFrameReceivedMs[1]);
+    if (m_captureState == CaptureState::Live && !m_rateSwitchInProgress) {
+        const qint64 resumedAtMs = QDateTime::currentMSecsSinceEpoch();
+        writeAcquisitionResumeEvent(QStringLiteral("star_found_roi_tracking"),
+                                    resumedAtMs,
+                                    currentDeviceStatusForResultLog(resumedAtMs));
+    }
+    const qint64 searchEndedAtMs = trackingSourceMs > 0
+                                       ? trackingSourceMs
+                                       : QDateTime::currentMSecsSinceEpoch();
+    if (enteringTracking) {
+        writeSearchEndedEvent(QStringLiteral("star_found_roi_tracking"), searchEndedAtMs);
+    }
+    noteStarTrackingState(true, searchEndedAtMs, QStringLiteral("双相机 ROI 已锁定"));
+    m_searchEventGate.markTracking();
     applyRoiSummary(actualRois[0], QStringLiteral("相机1"));
     showDeferredLiveRelocalizationPreview();
-    if (roiPulseResponseTimeout) {
-        setPulseBoardResponseTimeoutStatus(
-            QStringLiteral(
-                "状态: ROI 已写入，脉冲板未返回高频切换应答；正在等待双相机新的 ROI 图像确认触发是否生效"));
-    } else {
-        setStatusMessage(
-            QStringLiteral(
-                "状态: ROI 已写入并已发起高频触发，等待双相机新的 ROI 图像确认"),
-            UiStatusLevel::Warning);
-    }
+    setStatusMessage(
+        QStringLiteral("状态: ROI 已写入并已核对跟踪帧率，等待双相机新的 ROI 图像确认"),
+        UiStatusLevel::Warning);
     return true;
 }
 
 bool DIMM::startHardwarePulseStage(double frequencyHz, const QString& stageLabel, QString* reason)
 {
-    if (m_configTriggerMode == 0 || !m_pulseGeneratorEnabled) {
+    if (m_configTriggerMode == 0) {
         return true;
     }
     if (!m_pulseGenerator) {
@@ -1462,6 +1804,7 @@ bool DIMM::startHardwarePulseStage(double frequencyHz, const QString& stageLabel
     pulseConfig.remoteControl = m_pulseGeneratorRemoteControl;
 
     if (m_pulseGenerator->isRunning() && pulseConfigsMatch(m_pulseGenerator->config(), pulseConfig)) {
+        m_pulseGeneratorEnabled = true;
         setStatusMessage(QStringLiteral("状态: 复用当前脉冲输出: %1 @ %2 Hz")
                              .arg(m_pulseGeneratorPort)
                              .arg(frequencyHz, 0, 'f', 1),
@@ -1479,6 +1822,7 @@ bool DIMM::startHardwarePulseStage(double frequencyHz, const QString& stageLabel
         return false;
     }
 
+    m_pulseGeneratorEnabled = true;
     setStatusMessage(QStringLiteral("状态: %1触发已启用: %2 @ %3 Hz")
                          .arg(stageLabel, m_pulseGeneratorPort)
                          .arg(frequencyHz, 0, 'f', 1),
@@ -1495,7 +1839,7 @@ bool DIMM::startFullFrameLocalizationPulse(QString* reason)
 
 bool DIMM::switchToRoiTrackingPulse(QString* reason)
 {
-    return startHardwarePulseStage(m_pulseGeneratorFrequencyHz,
+    return startHardwarePulseStage(m_activeTriggerFrequencyHz,
                                    QStringLiteral("ROI 高频跟踪"),
                                    reason);
 }
@@ -1536,6 +1880,21 @@ void DIMM::updateMinuteRoi(bool force)
             applyRoiSummary(actualRoi0, QStringLiteral("相机1"));
         } else {
             m_liveHardwareRoiActive = false;
+            if (m_resultSessionActive && m_resultWriter.isOpen()) {
+                const qint64 failedAtMs = QDateTime::currentMSecsSinceEpoch();
+                writeHardwareErrorEvent(QStringLiteral("camera"),
+                                        -1,
+                                        0,
+                                        QStringLiteral("roi_update"),
+                                        reason,
+                                        true,
+                                        failedAtMs);
+                writeAcquisitionPauseEvent(QStringLiteral("roi_update"),
+                                           failedAtMs,
+                                           currentDeviceStatusForResultLog(failedAtMs));
+            }
+            stopLiveCapture();
+            updateCaptureState(CaptureState::Paused);
             setStatusMessage(reason, UiStatusLevel::Warning);
             return;
         }

@@ -10,6 +10,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Qt6 COMPONENTS Widgets Network REQUIRED) # Qt COMPONENTS
 aux_source_directory(./src srcs)
 list(FILTER srcs EXCLUDE REGEX "opencv_test\\.cpp$") # exclude test file from main target
+list(FILTER srcs EXCLUDE REGEX "DIMM\\.Simulation\\.cpp$") # legacy TU; target DIMM.h has no simulation members
+list(FILTER srcs EXCLUDE REGEX "ExposureFrameRateSwitchPolicy\\.cpp$")
+list(FILTER srcs EXCLUDE REGEX "MonitoringStatusEvaluator\\.cpp$")
+list(FILTER srcs EXCLUDE REGEX "SimulationValidation(Core|Dialog|Settings)\\.cpp$")
 list(APPEND srcs
     src/AppConfig.h
     src/AppConfigPersistence.h

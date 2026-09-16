@@ -18,8 +18,10 @@
 #include <QEventLoop>
 #include <QMetaObject>
 #include <QObject>
+#include <QPointer>
 #include <QScopeGuard>
 #include <QThread>
+#include <QTimer>
 
 namespace {
 constexpr unsigned short kRegFrequencyL16 = 0xAFCC;
@@ -33,6 +35,7 @@ constexpr unsigned short kOutputTypePulse = 0x0001;
 constexpr unsigned short kControlSourceRemote = 0x0100;
 constexpr unsigned short kControlSourceLocal = 0x0000;
 constexpr unsigned long kPulseWorkerShutdownTimeoutMs = 3000;
+constexpr int kPulseWorkerOperationTimeoutMs = 3000;
 constexpr int kRegisterWriteAttempts = 3;
 constexpr ULONGLONG kRegisterResponseTimeoutMs = 2000;
 constexpr unsigned long kRegisterRetryDelayMs = 50;
@@ -171,6 +174,7 @@ PulseGeneratorManager::PulseGeneratorManager()
 
 PulseGeneratorManager::~PulseGeneratorManager()
 {
+    disconnect();
     shutdownWorkerThread();
 }
 
@@ -235,21 +239,33 @@ bool PulseGeneratorManager::runWorkerOperation(const QString& operationName,
         m_operationInProgress.store(false);
     });
 
-    bool completed = false;
-    bool success = false;
-    QString workerError;
+    struct OperationResult {
+        bool completed = false;
+        bool success = false;
+        QString error;
+    };
+    const auto result = std::make_shared<OperationResult>();
     QEventLoop loop;
+    const QPointer<QEventLoop> loopGuard(&loop);
+    QTimer timeout;
+    timeout.setSingleShot(true);
+    QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
     const bool posted = QMetaObject::invokeMethod(m_workerContext,
-        [operation, &completed, &success, &workerError, &loop]() {
+        [operation, result, loopGuard]() {
             QString localError;
             const bool localSuccess = operation(&localError);
+            if (!loopGuard) {
+                return;
+            }
             QMetaObject::invokeMethod(
-                &loop,
-                [&completed, &success, &workerError, localSuccess, localError, &loop]() {
-                    success = localSuccess;
-                    workerError = localError;
-                    completed = true;
-                    loop.quit();
+                loopGuard,
+                [result, localSuccess, localError, loopGuard]() {
+                    result->success = localSuccess;
+                    result->error = localError;
+                    result->completed = true;
+                    if (loopGuard) {
+                        loopGuard->quit();
+                    }
                 },
                 Qt::QueuedConnection);
         },
@@ -262,18 +278,20 @@ bool PulseGeneratorManager::runWorkerOperation(const QString& operationName,
         return false;
     }
 
+    timeout.start(kPulseWorkerOperationTimeoutMs);
     loop.exec();
-    if (!completed) {
+    if (!result->completed) {
         if (errorMessage) {
-            *errorMessage = QStringLiteral("Pulse generator %1 operation did not complete.")
-                                .arg(operationName);
+            *errorMessage = QStringLiteral("Pulse generator %1 operation timed out after %2 ms.")
+                                .arg(operationName)
+                                .arg(kPulseWorkerOperationTimeoutMs);
         }
         return false;
     }
-    if (!success && errorMessage) {
-        *errorMessage = workerError;
+    if (!result->success && errorMessage) {
+        *errorMessage = result->error;
     }
-    return success;
+    return result->success;
 }
 
 bool PulseGeneratorManager::validateConfig(const Config& config, QString* errorMessage) const
@@ -323,12 +341,11 @@ bool PulseGeneratorManager::configureDevice(const Config& config, bool enableOut
         return false;
     }
 
-    void* rawHandle = nullptr;
-    if (!openPort(config.portName, config.baudRate, &rawHandle, errorMessage)) {
+    if (!ensureConnected(config, errorMessage)) {
         return false;
     }
 
-    HANDLE handle = static_cast<HANDLE>(rawHandle);
+    HANDLE handle = static_cast<HANDLE>(m_portHandle);
     const unsigned short deviceAddress = static_cast<unsigned short>(config.terminalId & 0x00FF);
     const unsigned short controlSource = config.remoteControl ? kControlSourceRemote : kControlSourceLocal;
     const unsigned short dutyValue = static_cast<unsigned short>(std::round(config.dutyPercent * 10.0));
@@ -345,7 +362,9 @@ bool PulseGeneratorManager::configureDevice(const Config& config, bool enableOut
     if (success && enableOutput) {
         success = writeRegister16(handle, deviceAddress, kRegOutputEnable, 0x0001, errorMessage);
     }
-    closePort(handle);
+    if (!success) {
+        closeConnection();
+    }
     return success;
 }
 
@@ -355,55 +374,66 @@ bool PulseGeneratorManager::setControlSourceDevice(const Config& config, QString
         return false;
     }
 
-    void* rawHandle = nullptr;
-    if (!openPort(config.portName, config.baudRate, &rawHandle, errorMessage)) {
+    if (!ensureConnected(config, errorMessage)) {
         return false;
     }
 
-    HANDLE handle = static_cast<HANDLE>(rawHandle);
+    HANDLE handle = static_cast<HANDLE>(m_portHandle);
     const unsigned short deviceAddress = static_cast<unsigned short>(config.terminalId & 0x00FF);
     const unsigned short controlSource = config.remoteControl ? kControlSourceRemote : kControlSourceLocal;
     const bool success = writeRegister16(handle, deviceAddress, kRegControlSource, controlSource, errorMessage);
-    closePort(handle);
+    if (!success) {
+        closeConnection();
+    }
     return success;
 }
 
-bool PulseGeneratorManager::stopDevice(const Config& config, QString* errorMessage)
+bool PulseGeneratorManager::stopOutputDevice(QString* errorMessage)
 {
-    if (config.portName.trimmed().isEmpty()) {
+    if (!m_portHandle) {
         return true;
     }
 
-    void* rawHandle = nullptr;
-    if (!openPort(config.portName, config.baudRate, &rawHandle, errorMessage)) {
-        return false;
+    HANDLE handle = static_cast<HANDLE>(m_portHandle);
+    const unsigned short deviceAddress = static_cast<unsigned short>(m_config.terminalId & 0x00FF);
+    const bool success = writeRegister16(handle, deviceAddress, kRegOutputEnable, 0x0000, errorMessage);
+    if (!success) {
+        closeConnection();
+    }
+    return success;
+}
+
+bool PulseGeneratorManager::ensureConnected(const Config& config, QString* errorMessage)
+{
+    if (m_portHandle && m_connectedPortName == config.portName &&
+        m_connectedBaudRate == config.baudRate) {
+        return true;
     }
 
-    HANDLE handle = static_cast<HANDLE>(rawHandle);
-    const unsigned short deviceAddress = static_cast<unsigned short>(config.terminalId & 0x00FF);
-    const bool success = writeRegister16(handle, deviceAddress, kRegOutputEnable, 0x0000, errorMessage);
-    closePort(handle);
-    return success;
+    closeConnection();
+    void* handle = nullptr;
+    if (!openPort(config.portName, config.baudRate, &handle, errorMessage)) {
+        return false;
+    }
+    m_portHandle = handle;
+    m_connectedPortName = config.portName;
+    m_connectedBaudRate = config.baudRate;
+    return true;
+}
+
+void PulseGeneratorManager::closeConnection()
+{
+    closePort(m_portHandle);
+    m_portHandle = nullptr;
+    m_connectedPortName.clear();
+    m_connectedBaudRate = 0;
 }
 
 bool PulseGeneratorManager::applyConfig(const Config& config, QString* errorMessage)
 {
     if (!config.enabled) {
-        const bool shouldStopOutput = m_running || m_config.enabled;
-        const Config previousConfig = m_config;
         m_config = config;
-        if (!shouldStopOutput) {
-            m_running = false;
-            return true;
-        }
-        const bool stopped = runWorkerOperation(
-            QStringLiteral("stop"),
-            [this, previousConfig](QString* workerError) {
-                return stopDevice(previousConfig, workerError);
-            },
-            errorMessage);
-        m_running = false;
-        return stopped;
+        return disconnect(errorMessage);
     }
 
     m_config = config;
@@ -467,16 +497,27 @@ bool PulseGeneratorManager::configureAndStart(const Config& config, QString* err
 
 bool PulseGeneratorManager::stop(QString* errorMessage)
 {
-    const Config requestConfig = m_config;
-    if (requestConfig.portName.trimmed().isEmpty()) {
-        m_running = false;
-        return true;
-    }
+    return stopOutput(errorMessage);
+}
 
+bool PulseGeneratorManager::stopOutput(QString* errorMessage)
+{
     const bool success = runWorkerOperation(
-        QStringLiteral("stop"),
-        [this, requestConfig](QString* workerError) {
-            return stopDevice(requestConfig, workerError);
+        QStringLiteral("stopOutput"),
+        [this](QString* workerError) { return stopOutputDevice(workerError); },
+        errorMessage);
+    m_running = false;
+    return success;
+}
+
+bool PulseGeneratorManager::disconnect(QString* errorMessage)
+{
+    const bool success = runWorkerOperation(
+        QStringLiteral("disconnect"),
+        [this](QString* workerError) {
+            const bool stopped = stopOutputDevice(workerError);
+            closeConnection();
+            return stopped;
         },
         errorMessage);
     m_running = false;
@@ -486,6 +527,12 @@ bool PulseGeneratorManager::stop(QString* errorMessage)
 bool PulseGeneratorManager::isRunning() const
 {
     return m_running;
+}
+
+bool PulseGeneratorManager::isRunningAtFrequency(double frequencyHz, double toleranceHz) const
+{
+    return m_running && std::isfinite(frequencyHz) && std::isfinite(m_config.frequencyHz) &&
+           std::abs(m_config.frequencyHz - frequencyHz) <= std::max(0.0, toleranceHz);
 }
 
 const PulseGeneratorManager::Config& PulseGeneratorManager::config() const

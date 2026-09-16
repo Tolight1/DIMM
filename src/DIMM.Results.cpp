@@ -3,14 +3,19 @@
 #include "CameraManager.h"
 #include "CommManager.h"
 #include "CommProtocol.h"
+#include "AcquisitionImagePolicy.h"
+#include "AppConfigSnapshot.h"
 #include "DimmRuntimeHelpers.h"
 #include "ImageProcessor.h"
+#include "ImageUtils.h"
 #include "PathUtils.h"
 #include "PulseGeneratorManager.h"
 #include "SettingsDialog.h"
 
 #include <QDateTime>
 #include <QDir>
+#include <QFileInfo>
+#include <QDebug>
 #include <QStringList>
 #include <QVector>
 
@@ -40,8 +45,8 @@ std::uint32_t DIMM::monitoringDeviceStatus(const CaptureRuntimeContext& runtime,
     const double timeoutRateHz = frameRateValid
                                      ? frameRateHz
                                      : (m_configTriggerMode == 0
-                                            ? m_configContinuousFrameRateHz
-                                            : m_pulseGeneratorFrequencyHz);
+                                            ? m_activeContinuousFrameRateHz
+                                            : m_activeTriggerFrequencyHz);
     const double safeTimeoutRateHz =
         std::max(0.1, std::isfinite(timeoutRateHz) ? timeoutRateHz : 0.1);
     const qint64 expectedFrameIntervalMs =
@@ -124,169 +129,576 @@ std::uint32_t DIMM::monitoringDeviceStatus(const CaptureRuntimeContext& runtime,
     return status;
 }
 
+QDateTime DIMM::nextResultRecordTimestamp(const QDateTime& candidate)
+{
+    QDateTime timestamp = candidate.isValid() ? candidate : QDateTime::currentDateTime();
+    qint64 timestampMs = timestamp.toMSecsSinceEpoch();
+    if (m_lastResultRecordTimestampMs >= 0 &&
+        timestampMs < m_lastResultRecordTimestampMs) {
+        timestamp = timestamp.addMSecs(m_lastResultRecordTimestampMs - timestampMs);
+        timestampMs = m_lastResultRecordTimestampMs;
+    }
+    m_lastResultRecordTimestampMs = timestampMs;
+    return timestamp;
+}
+
+std::uint32_t DIMM::currentDeviceStatusForResultLog(qint64 nowMs)
+{
+    const double frameRate = currentTrackingFrameRateHz();
+    return monitoringDeviceStatus(activeRuntime(),
+                                  nowMs,
+                                  frameRate,
+                                  std::isfinite(frameRate) && frameRate > 0.0);
+}
+
+bool DIMM::beginResultSession(AcquisitionCsvSessionType resultSessionType)
+{
+    if (m_resultSessionActive) {
+        return m_resultWriter.isOpen();
+    }
+    if (m_resultWriter.isOpen()) {
+        setStatusMessage(QStringLiteral("结果会话状态异常：已有打开的结果文件"),
+                         UiStatusLevel::Error);
+        return false;
+    }
+
+    m_resultSessionType = resultSessionType;
+    m_resultSessionStartedAt = QDateTime::currentDateTime();
+    m_resultSessionId.clear();
+    m_autoFocusLogWriter.close();
+    m_autoFocusLogWriter.setEnabled(m_autoFocusConfig.dataLoggingEnabled);
+    m_autoFocusRunSequence[0] = 0;
+    m_autoFocusRunSequence[1] = 0;
+    m_autoFocusRunActive[0] = false;
+    m_autoFocusRunActive[1] = false;
+    for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+        m_autoFocusStartupPending[cameraIndex] =
+            resultSessionType == AcquisitionCsvSessionType::Auto &&
+            m_autoFocusConfig.masterEnabled && m_autoFocusConfig.cameraEnabled[cameraIndex];
+        m_autoFocusStartupTriggered[cameraIndex] = false;
+    }
+    m_resultSettingsSnapshotSequence = 0;
+    m_lastResultRecordTimestampMs = -1;
+    m_captureStopRequested = false;
+    m_starTrackingState = StarTrackingState::Unknown;
+    m_searchEventGate.reset();
+    m_searchAttempt = 1;
+    m_searchAttemptStartedMs = m_resultSessionStartedAt.toMSecsSinceEpoch();
+    clearTrackingImageSaveAfterAutoExposureCooldown();
+    m_trackingImageIntervalMs = AcquisitionImagePolicy::trackingIntervalMsForExposureUs(
+        m_cameraExposureUs[0],
+        m_cameraExposureUs[1],
+        currentTrackingFrameRateHz(),
+        m_autoExposureConfig.autoExposureSampleIntervalMs);
+    for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+        lastSearchImageSavedMs[cameraIndex] = -1;
+        lastTrackingImageSavedMs[cameraIndex] = -1;
+        m_lastPeriodicTrackingRoiImageSavedMs[cameraIndex] = -1;
+        lastSearchImageSavedFrameId[cameraIndex] = 0;
+        lastTrackingImageSavedFrameId[cameraIndex] = 0;
+    }
+    initResultFile();
+    if (!m_resultWriter.isOpen()) {
+        return false;
+    }
+    if (!writeResultSettingsSnapshot(currentAppConfig(),
+                                     QStringLiteral("SettingsSnapshot"),
+                                     QStringLiteral("initial"),
+                                     AppConfigSnapshot::initialFileName())) {
+        QString closeError;
+        m_resultWriter.close(&closeError);
+        m_resultFilePath.clear();
+        m_resultSessionId.clear();
+        return false;
+    }
+    m_resultSessionActive = true;
+    writeResultSessionEvent(
+        QStringLiteral("SessionStarted"),
+        resultSessionType == AcquisitionCsvSessionType::Auto
+            ? QStringLiteral("auto_start")
+            : QStringLiteral("manual_start"),
+        QStringLiteral("Searching"),
+        -1);
+    return true;
+}
+
+bool DIMM::ensureResultFileOpen()
+{
+    if (m_captureStopRequested || m_captureState != CaptureState::Live) {
+        return false;
+    }
+    return m_resultSessionActive && m_resultWriter.isOpen();
+}
+
+void DIMM::writeResultSessionEvent(const QString& recordType,
+                                   const QString& reason,
+                                   const QString& acquisitionState,
+                                   qint64 sourceTimestampMs,
+                                   std::uint32_t deviceStatus)
+{
+    if (!m_resultSessionActive || !m_resultWriter.isOpen()) {
+        return;
+    }
+
+    const QDateTime savedAt = QDateTime::currentDateTime();
+    const QDateTime timestamp = nextResultRecordTimestamp(savedAt);
+    const QDateTime sourceTimestamp = sourceTimestampMs > 0
+                                          ? QDateTime::fromMSecsSinceEpoch(sourceTimestampMs)
+                                          : savedAt;
+    m_resultWriter.enqueueLine(AcquisitionCsv::formatEventRecord(
+        recordType,
+        m_resultSessionId,
+        timestamp,
+        savedAt,
+        sourceTimestamp,
+        m_liveAcquisitionGeneration,
+        deviceStatus,
+        acquisitionState,
+        m_searchAttempt,
+        reason));
+}
+
+bool DIMM::writeResultSettingsSnapshot(const AppConfig& config,
+                                       const QString& recordType,
+                                       const QString& settingsReason,
+                                       const QString& relativeFileName)
+{
+    if (!m_resultWriter.isOpen() || m_resultFilePath.isEmpty()) {
+        return false;
+    }
+
+    const QFileInfo resultFileInfo(m_resultFilePath);
+    QString error;
+    if (!AppConfigSnapshot::write(resultFileInfo.absolutePath(),
+                                  relativeFileName,
+                                  config,
+                                  &error)) {
+        const QDateTime savedAt = QDateTime::currentDateTime();
+        const QString acquisitionState = m_captureState == CaptureState::Paused
+                                             ? QStringLiteral("Paused")
+                                             : (m_starTrackingState == StarTrackingState::Tracked
+                                                    ? QStringLiteral("Tracking")
+                                                    : QStringLiteral("Searching"));
+        const bool initial = recordType == QStringLiteral("SettingsSnapshot");
+        m_resultWriter.enqueueLine(AcquisitionCsv::formatSettingsRecord(
+            initial ? QStringLiteral("SettingsSnapshotFailed")
+                    : QStringLiteral("SettingsChangedFailed"),
+            m_resultSessionId,
+            nextResultRecordTimestamp(savedAt),
+            savedAt,
+            m_liveAcquisitionGeneration,
+            acquisitionState,
+            m_searchAttempt,
+            QString(),
+            QStringLiteral("%1; %2")
+                .arg(initial ? QStringLiteral("initial_failed")
+                             : QStringLiteral("changed_failed"),
+                     error)));
+        setStatusMessage(QStringLiteral("设置快照保存失败: %1").arg(error), UiStatusLevel::Error);
+        return false;
+    }
+
+    const QDateTime savedAt = QDateTime::currentDateTime();
+    const QString acquisitionState = m_captureState == CaptureState::Paused
+                                         ? QStringLiteral("Paused")
+                                         : (m_starTrackingState == StarTrackingState::Tracked
+                                                ? QStringLiteral("Tracking")
+                                                : QStringLiteral("Searching"));
+    m_resultWriter.enqueueLine(AcquisitionCsv::formatSettingsRecord(
+        recordType,
+        m_resultSessionId,
+        nextResultRecordTimestamp(savedAt),
+        savedAt,
+        m_liveAcquisitionGeneration,
+        acquisitionState,
+        m_searchAttempt,
+        relativeFileName,
+        settingsReason));
+    return true;
+}
+
+bool DIMM::writeChangedResultSettingsSnapshot(const AppConfig& config,
+                                              const ConfigChangeSet& changes)
+{
+    if (!changes.any() || !m_resultSessionActive || !m_resultWriter.isOpen()) {
+        return true;
+    }
+
+    const int sequence = m_resultSettingsSnapshotSequence + 1;
+    if (!writeResultSettingsSnapshot(config,
+                                     QStringLiteral("SettingsChanged"),
+                                     AppConfigSnapshot::changeState(changes),
+                                     AppConfigSnapshot::changedFileName(sequence))) {
+        return false;
+    }
+    m_resultSettingsSnapshotSequence = sequence;
+    return true;
+}
+
+void DIMM::writeSearchStartedEvent(const QString& reason, qint64 sourceTimestampMs)
+{
+    clearTrackingImageSaveAfterAutoExposureCooldown();
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    writeResultSessionEvent(QStringLiteral("SearchStart"),
+                             reason,
+                             QStringLiteral("Searching"),
+                             sourceTimestampMs,
+                             currentDeviceStatusForResultLog(nowMs));
+}
+
+void DIMM::writeSearchEndedEvent(const QString& reason, qint64 sourceTimestampMs)
+{
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    writeResultSessionEvent(QStringLiteral("SearchEnd"),
+                             reason,
+                             QStringLiteral("Tracking"),
+                             sourceTimestampMs,
+                             currentDeviceStatusForResultLog(nowMs));
+}
+
+void DIMM::writeSearchLifecycleEventsOnce(const QString& searchReason,
+                                          const QString& pauseReason,
+                                          qint64 sourceTimestampMs)
+{
+    if (!m_resultSessionActive || !m_resultWriter.isOpen() ||
+        !m_searchEventGate.tryBeginSearch()) {
+        return;
+    }
+
+    writeSearchStartedEvent(searchReason, sourceTimestampMs);
+    Q_UNUSED(pauseReason);
+}
+
+void DIMM::writeHardwareErrorEvent(const QString& source,
+                                   int deviceIndex,
+                                   int errorCode,
+                                   const QString& operation,
+                                   const QString& detail,
+                                   bool recoverable,
+                                   qint64 sourceTimestampMs)
+{
+    const QString reason =
+        QStringLiteral("source=%1;device=%2;code=%3;operation=%4;recoverable=%5;detail=%6")
+            .arg(source)
+            .arg(deviceIndex + 1)
+            .arg(errorCode)
+            .arg(operation)
+            .arg(recoverable ? QStringLiteral("true") : QStringLiteral("false"))
+            .arg(detail);
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    writeResultSessionEvent(QStringLiteral("HardwareError"),
+                             reason,
+                             QStringLiteral("Paused"),
+                             sourceTimestampMs,
+                             currentDeviceStatusForResultLog(nowMs));
+}
+
+void DIMM::writeAcquisitionPauseEvent(const QString& reason,
+                                      qint64 sourceTimestampMs,
+                                      std::uint32_t deviceStatus)
+{
+    writeResultSessionEvent(QStringLiteral("AcquisitionPaused"),
+                             reason,
+                             QStringLiteral("Paused"),
+                             sourceTimestampMs,
+                             deviceStatus);
+}
+
+void DIMM::writeAcquisitionResumeEvent(const QString& reason,
+                                       qint64 sourceTimestampMs,
+                                       std::uint32_t deviceStatus)
+{
+    writeResultSessionEvent(QStringLiteral("AcquisitionResumed"),
+                             reason,
+                             QStringLiteral("Tracking"),
+                             sourceTimestampMs,
+                             deviceStatus);
+}
+
+void DIMM::noteStarTrackingState(bool tracked,
+                                 qint64 sourceTimestampMs,
+                                 const QString& reason)
+{
+    if (m_captureStopRequested || !m_resultSessionActive || !m_resultWriter.isOpen()) {
+        return;
+    }
+
+    Q_UNUSED(sourceTimestampMs);
+    Q_UNUSED(reason);
+    m_starTrackingState = tracked ? StarTrackingState::Tracked
+                                  : StarTrackingState::Lost;
+}
+
+void DIMM::armTrackingImageSaveAfterAutoExposureCooldown(qint64 cooldownUntilMs)
+{
+    if (m_captureStopRequested || !m_resultSessionActive || !m_resultWriter.isOpen() ||
+        m_captureState != CaptureState::Live || m_liveStartupPhase != LiveStartupPhase::Tracking) {
+        return;
+    }
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+        m_trackingImageSaveOnNextRoiFrame[cameraIndex] = true;
+        m_trackingImageSaveNextRetryMs[cameraIndex] = nowMs;
+    }
+    m_trackingImageSaveCooldownUntilMs =
+        std::max(cooldownUntilMs, nowMs + 1);
+}
+
+void DIMM::clearTrackingImageSaveAfterAutoExposureCooldown()
+{
+    for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+        m_trackingImageSaveOnNextRoiFrame[cameraIndex] = false;
+        m_trackingImageSaveNextRetryMs[cameraIndex] = -1;
+    }
+    m_trackingImageSaveCooldownUntilMs = -1;
+}
+
+bool DIMM::saveLiveFullFrameImage(int cameraIndex,
+                                  const CameraFrame& packet,
+                                  bool forceTrackingCooldownSave)
+{
+    if (m_captureStopRequested ||
+        !m_resultSessionActive || !m_resultWriter.isOpen() ||
+        m_captureState != CaptureState::Live || cameraIndex < 0 || cameraIndex >= 2 ||
+        packet.image.empty()) {
+        return false;
+    }
+
+    const bool searching = m_liveStartupPhase == LiveStartupPhase::LocatePair;
+    const bool tracking = m_liveStartupPhase == LiveStartupPhase::Tracking;
+    if ((!searching && !tracking) || (tracking && !forceTrackingCooldownSave)) {
+        return false;
+    }
+    const AcquisitionImagePolicy::Phase imagePhase =
+        searching ? AcquisitionImagePolicy::Phase::Searching
+                  : AcquisitionImagePolicy::Phase::Tracking;
+    if (!AcquisitionImagePolicy::isEligibleFrameForPhase(imagePhase,
+                                                         packet.image.cols,
+                                                         packet.image.rows,
+                                                         kFixedRoiSize)) {
+        return false;
+    }
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (tracking && m_trackingImageSaveCooldownUntilMs >= 0 &&
+        nowMs >= m_trackingImageSaveCooldownUntilMs) {
+        // A failed request may be retried on every valid ROI frame, but never beyond
+        // the cooldown that armed it. The next cooldown edge will arm a new request.
+        clearTrackingImageSaveAfterAutoExposureCooldown();
+        return false;
+    }
+    qint64& lastSavedMs = searching ? lastSearchImageSavedMs[cameraIndex]
+                                    : lastTrackingImageSavedMs[cameraIndex];
+    quint64& lastSavedFrameId = searching ? lastSearchImageSavedFrameId[cameraIndex]
+                                          : lastTrackingImageSavedFrameId[cameraIndex];
+    if (searching) {
+        const qint64 periodMs = AcquisitionImagePolicy::intervalMs(
+            imagePhase,
+            m_autoAcquisitionConfig.recoveryScanIntervalMinutes,
+            0);
+        if (!AcquisitionImagePolicy::isDue(lastSavedMs, nowMs, periodMs)) {
+            return false;
+        }
+    } else if (packet.frameId > 0 && packet.frameId == lastSavedFrameId) {
+        return false;
+    }
+
+    const cv::Mat grayscale = ImageUtils::grayscaleDetectionFrame(packet.image);
+    const cv::Mat mono8 = ImageUtils::fullFrameMono8Preview(
+        grayscale,
+        packet.bitDepth,
+        packet.maxPixelValue);
+    double minValue = 0.0;
+    double maxValue = 0.0;
+    if (!grayscale.empty()) {
+        cv::minMaxLoc(grayscale, &minValue, &maxValue);
+    }
+    qInfo() << "live image source"
+            << "camera" << cameraIndex
+            << "dimensions" << packet.image.cols << "x" << packet.image.rows
+            << "type" << packet.image.type()
+            << "bitDepth" << packet.bitDepth
+            << "min" << minValue
+            << "max" << maxValue;
+    if (mono8.empty()) {
+        setStatusMessage(QStringLiteral("图像保存失败：不支持的像素格式或位深元数据"),
+                         UiStatusLevel::Warning);
+        return false;
+    }
+
+    const QFileInfo sessionInfo(m_resultFilePath);
+    QDir sessionDir(sessionInfo.absolutePath());
+    if (!sessionDir.mkpath(QStringLiteral("images"))) {
+        setStatusMessage(QStringLiteral("图像目录创建失败"), UiStatusLevel::Warning);
+        return false;
+    }
+
+    const QDateTime savedAt = QDateTime::currentDateTime();
+    const QString imageKind = searching ? QStringLiteral("search_full_frame")
+                                        : QStringLiteral("tracking_roi");
+    const QString stateLabel = searching ? QStringLiteral("Searching")
+                                         : QStringLiteral("Tracking");
+    const QString stamp = savedAt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd_HHmmss_zzz"));
+    const QString baseName = QStringLiteral("camera%1_%2_%3_state-%4_frame-%5.bmp")
+                                 .arg(cameraIndex + 1)
+                                 .arg(imageKind)
+                                 .arg(stamp)
+                                 .arg(stateLabel)
+                                 .arg(packet.frameId);
+    QString imagePath = sessionDir.filePath(QStringLiteral("images/%1").arg(baseName));
+    int suffix = 1;
+    while (QFileInfo::exists(imagePath)) {
+        imagePath = sessionDir.filePath(QStringLiteral("images/%1_%2.bmp")
+                                            .arg(baseName.chopped(4))
+                                            .arg(suffix++));
+    }
+
+    try {
+        if (!cv::imwrite(imagePath.toStdString(), mono8)) {
+            setStatusMessage(QStringLiteral("BMP 保存失败"), UiStatusLevel::Warning);
+            return false;
+        }
+    } catch (const cv::Exception& error) {
+        qWarning() << "live BMP save failed:" << error.what();
+        setStatusMessage(QStringLiteral("BMP 保存失败: %1").arg(error.what()),
+                         UiStatusLevel::Warning);
+        return false;
+    }
+
+    lastSavedMs = nowMs;
+    lastSavedFrameId = packet.frameId;
+    return true;
+}
+
 void DIMM::initResultFile()
 {
     if (m_resultWriter.isOpen()) {
         return;
     }
 
-    QDir rootDir(m_dataPath);
-    if (!rootDir.exists()) {
-        rootDir.mkpath(QStringLiteral("."));
+    if (!m_resultSessionStartedAt.isValid()) {
+        m_resultSessionStartedAt = QDateTime::currentDateTime();
+    }
+    const QString filename = AcquisitionCsv::makeUniqueSessionFilePath(
+        m_dataPath,
+        m_resultSessionType,
+        m_resultSessionStartedAt);
+    const QFileInfo fileInfo(filename);
+    QDir sessionDir(fileInfo.absolutePath());
+    if (!sessionDir.mkpath(QStringLiteral(".")) ||
+        !sessionDir.mkpath(QStringLiteral("images"))) {
+        setStatusMessage(QStringLiteral("结果会话目录创建失败"), UiStatusLevel::Error);
+        return;
     }
 
-    const QString modeDirPath = rootDir.filePath(resultSubdirectoryName());
-    QDir modeDir(modeDirPath);
-    if (!modeDir.exists()) {
-        rootDir.mkpath(resultSubdirectoryName());
-    }
-
-    const QString timestampText = QDateTime::currentDateTime().toString(
-        QStringLiteral("yyyy-MM-dd_HHmmss"));
-    const QString filename = QStringLiteral("%1/DIMM_%2_measurements_%3.txt")
-                                 .arg(modeDirPath,
-                                      captureModeName(),
-                                      timestampText);
-    m_detailResultFilePath = QStringLiteral("%1/DIMM_%2_paired_centroids_%3.txt")
-                                 .arg(modeDirPath,
-                                      captureModeName(),
-                                      timestampText);
-    m_syncDiagnosticFilePath = QStringLiteral("%1/DIMM_%2_sync_diagnostics_%3.txt")
-                                   .arg(modeDirPath,
-                                        captureModeName(),
-                                        timestampText);
+    m_resultSessionId = sessionDir.dirName();
+    m_detailResultFilePath.clear();
+    m_syncDiagnosticFilePath.clear();
     resetSyncDiagnostics();
     m_resultFileState = m_captureState;
     ResultFileConfig config;
     config.filePath = filename;
-    const double apertureMm = m_imageProcessor ? m_imageProcessor->apertureDiameterMm() : 0.0;
-    const double baselineMm = m_imageProcessor ? m_imageProcessor->baselineSeparationMm() : 0.0;
-    const double baselineAngleDeg = m_imageProcessor ? m_imageProcessor->baselineAngleDeg() : 0.0;
-    const double focalCm = m_imageProcessor ? m_imageProcessor->focalLengthCm() : 0.0;
-    const double zenithDeg = m_imageProcessor ? m_imageProcessor->zenithAngleDeg() : 0.0;
-    const double wavelengthNm = m_imageProcessor ? m_imageProcessor->wavelengthNm() : 0.0;
-    const double pixelUm = m_imageProcessor ? m_imageProcessor->pixelSizeUm() : 0.0;
-    config.headerLine =
-        QStringLiteral("# capture_mode=%1, capture_label=%2\n"
-                       "# aperture_mm=%3,baseline_mm=%4,baseline_angle_deg=%5,"
-                       "focal_cm=%6,zenith_deg=%7,wavelength_nm=%8,pixel_um=%9\n"
-                       "timestamp,mode,frame,paired_samples,dropped_unpaired_samples,"
-                       "roi_acquisition_generation,roi_update_count,roi_update_reason,"
-                       "roi1_x,roi1_y,roi1_w,roi1_h,roi2_x,roi2_y,roi2_w,roi2_h,ms_since_last_roi_update,"
-                       "continuous_frame_rate_target_hz,camera1_frame_rate_readback_hz,camera2_frame_rate_readback_hz,"
-                       "camera1_peak_dn,camera2_peak_dn,camera1_snr,camera2_snr,"
-                       "camera1_valid_ratio,camera2_valid_ratio,"
-                       "camera1_exposure_us,camera2_exposure_us,"
-                       "camera1_hot_pixel_template_exposure_us,camera2_hot_pixel_template_exposure_us,"
-                       "ae_enabled,ae_state,ae_camera1_state,ae_camera2_state,"
-                       "ae_reason,ae_camera1_reason,ae_camera2_reason,"
-                       "ae_sequence_id,ae_target_exposure_us,"
-                       "ae_camera1_target_exposure_us,ae_camera2_target_exposure_us,"
-                       "ae_frames_since_adjust,ae_ui_state,ae_adjust_direction,"
-                       "ae_cooldown_remaining_ms,ae_adjustment_session_active,ae_step_us,"
-                       "r0_cm,seeing_arcsec,theta0_arcsec,tau0_ms,tau0_state,tau0_resolution_ms,"
-                       "var_longitudinal_px2,var_transverse_px2,"
-                       "sigma_longitudinal_rad2,sigma_transverse_rad2,"
-                       "r0_longitudinal_cm,r0_transverse_cm,variance_sample_count,"
-                       "r0_partial_window,r0_risk_flag,r0_target_sample_count,r0_risk_reason,"
-                       "sync_residual_us,sync_jitter_us,sync_jitter_avg_us,sync_jitter_max_us,"
-                       "env_temperature_c,env_humidity_rh,env_pressure_hpa,env_sensor_valid,"
-                       "comm_connected,reporting_enabled")
-            .arg(captureModeName(), captureModeLabel())
-            .arg(apertureMm, 0, 'f', 3)
-            .arg(baselineMm, 0, 'f', 3)
-            .arg(baselineAngleDeg, 0, 'f', 3)
-            .arg(focalCm, 0, 'f', 3)
-            .arg(zenithDeg, 0, 'f', 3)
-            .arg(wavelengthNm, 0, 'f', 3)
-            .arg(pixelUm, 0, 'f', 3);
+    config.headerLine = AcquisitionCsv::headerLine();
     QString error;
     if (m_resultWriter.open(config, &error)) {
         m_resultFilePath = filename;
-        if (m_parameterValidationEnabled) {
-            initDetailResultFile();
-        }
-        if (m_syncDiagnosticLoggingEnabled) {
-            initSyncDiagnosticFile();
-        }
     } else {
-        setStatusMessage(QStringLiteral("结果文件创建失败"), UiStatusLevel::Error);
+        setStatusMessage(QStringLiteral("结果文件创建失败: %1").arg(error), UiStatusLevel::Error);
     }
 }
 
 void DIMM::initDetailResultFile()
 {
-    if (!m_parameterValidationEnabled) {
-        return;
-    }
-    if (m_detailResultWriter.isOpen() || m_detailResultFilePath.isEmpty()) {
-        return;
-    }
-
-    ResultFileConfig config;
-    config.filePath = m_detailResultFilePath;
-    const double apertureMm = m_imageProcessor ? m_imageProcessor->apertureDiameterMm() : 0.0;
-    const double baselineMm = m_imageProcessor ? m_imageProcessor->baselineSeparationMm() : 0.0;
-    const double baselineAngleDeg = m_imageProcessor ? m_imageProcessor->baselineAngleDeg() : 0.0;
-    const double focalCm = m_imageProcessor ? m_imageProcessor->focalLengthCm() : 0.0;
-    const double zenithDeg = m_imageProcessor ? m_imageProcessor->zenithAngleDeg() : 0.0;
-    const double wavelengthNm = m_imageProcessor ? m_imageProcessor->wavelengthNm() : 0.0;
-    const double pixelUm = m_imageProcessor ? m_imageProcessor->pixelSizeUm() : 0.0;
-    config.headerLine =
-        QStringLiteral("# capture_mode=%1, capture_label=%2\n"
-                       "# aperture_mm=%3,baseline_mm=%4,baseline_angle_deg=%5,"
-                       "focal_cm=%6,zenith_deg=%7,wavelength_nm=%8,pixel_um=%9\n"
-                       "timestamp,mode,frame,pair_index,cam1_frame_id,cam2_frame_id,pair_serial,"
-                       "cam1_timestamp,cam2_timestamp,"
-                       "cam1_centroid_x,cam1_centroid_y,cam2_centroid_x,cam2_centroid_y,"
-                       "longitudinal_px,transverse_px,sync_residual_us")
-            .arg(captureModeName(), captureModeLabel())
-            .arg(apertureMm, 0, 'f', 3)
-            .arg(baselineMm, 0, 'f', 3)
-            .arg(baselineAngleDeg, 0, 'f', 3)
-            .arg(focalCm, 0, 'f', 3)
-            .arg(zenithDeg, 0, 'f', 3)
-            .arg(wavelengthNm, 0, 'f', 3)
-            .arg(pixelUm, 0, 'f', 3);
-    QString error;
-    if (!m_detailResultWriter.open(config, &error)) {
-        setStatusMessage(QStringLiteral("质心明细文件创建失败"), UiStatusLevel::Error);
-    }
+    // Paired details remain available in CaptureRuntimeContext for validation, but
+    // the session contract has exactly one CSV file.
 }
 
 void DIMM::initSyncDiagnosticFile()
 {
-    if (!m_syncDiagnosticLoggingEnabled) {
-        return;
-    }
-    if (m_syncDiagnosticWriter.isOpen() || m_syncDiagnosticFilePath.isEmpty()) {
-        return;
-    }
-
-    ResultFileConfig config;
-    config.filePath = m_syncDiagnosticFilePath;
-    config.headerLine =
-        QStringLiteral("# capture_mode=%1, capture_label=%2\n"
-                       "timestamp_ms,event,camera,frame_id,camera_timestamp,received_ms,"
-                       "live_generation,boundary_count,boundary_gap_count,expected_next_frame_id,"
-                       "peer_frame_id,frame_id_offset,aligned_frame_id,peer_aligned_frame_id,"
-                       "dropped_unpaired_samples,note")
-            .arg(captureModeName(), captureModeLabel());
-
-    QString error;
-    if (!m_syncDiagnosticWriter.open(config, &error)) {
-        setStatusMessage(QStringLiteral("同步诊断日志创建失败"), UiStatusLevel::Error);
-    }
+    // Synchronous diagnostics use the application log; they are not independent
+    // result files and therefore cannot create a second session artifact.
 }
 
-void DIMM::closeResultFile()
+void DIMM::closeResultFile(ResultSessionEndReason reason)
 {
-    m_resultWriter.close();
+    if (m_rateSwitchTimingPending) {
+        RateSwitchTiming timing;
+        timing.pauseMs = m_rateSwitchPauseMs;
+        timing.hardwareApplyMs = m_rateSwitchHardwareApplyMs;
+        timing.firstValidPairMs = 0;
+        timing.success = false;
+        logRateSwitchTiming(timing,
+                            m_rateSwitchOldRateHz,
+                            m_rateSwitchNewRateHz,
+                            m_configTriggerMode == 0
+                                ? QStringLiteral("continuous")
+                                : QStringLiteral("hardware_trigger"));
+    }
+    m_rateSwitchInProgress = false;
+    m_rateSwitchTimingPending = false;
+    if (m_resultSessionActive && m_resultWriter.isOpen()) {
+        QString reasonText;
+        switch (reason) {
+        case ResultSessionEndReason::AutoWindowEnd:
+            reasonText = QStringLiteral("auto_end");
+            break;
+        case ResultSessionEndReason::UnrecoverableError:
+            reasonText = QStringLiteral("hardware_error");
+            break;
+        case ResultSessionEndReason::Destruction:
+            reasonText = QStringLiteral("destruction");
+            break;
+        case ResultSessionEndReason::ManualStop:
+        default:
+            reasonText = QStringLiteral("manual_end");
+            break;
+        }
+        writeResultSessionEvent(
+            QStringLiteral("SessionEnded"),
+            reasonText,
+            QStringLiteral("Ended"),
+            -1);
+    }
+    QString resultError;
+    if (!m_resultWriter.close(&resultError)) {
+        setStatusMessage(QStringLiteral("结果 CSV 写入失败: %1").arg(resultError),
+                         UiStatusLevel::Error);
+    }
     m_detailResultWriter.close();
     m_syncDiagnosticWriter.close();
+    m_autoFocusLogWriter.close();
+    m_autoFocusRunActive[0] = false;
+    m_autoFocusRunActive[1] = false;
+    m_autoFocusRealtimeMetricsSampler.reset();
     m_detailResultFilePath.clear();
     m_syncDiagnosticFilePath.clear();
     m_resultFileState = CaptureState::Idle;
+    m_starTrackingState = StarTrackingState::Unknown;
+    m_searchEventGate.reset();
+    m_resultSessionActive = false;
+    m_lastResultRecordTimestampMs = -1;
+}
+
+void DIMM::closeResultSessionForHardwareError()
+{
+    closeResultFile(ResultSessionEndReason::UnrecoverableError);
+}
+
+void DIMM::logRateSwitchTiming(const RateSwitchTiming& timing,
+                               double oldRateHz,
+                               double newRateHz,
+                               const QString& mode)
+{
+    qInfo() << "acquisition rate switch"
+            << "mode" << mode
+            << "oldRateHz" << oldRateHz
+            << "newRateHz" << newRateHz
+            << "exposureAUs" << m_cameraExposureUs[0]
+            << "exposureBUs" << m_cameraExposureUs[1]
+            << "pauseMs" << timing.pauseMs
+            << "hardwareApplyMs" << timing.hardwareApplyMs
+            << "firstValidPairMs" << timing.firstValidPairMs
+            << "outcome" << (timing.success ? QStringLiteral("success")
+                                             : QStringLiteral("rollback_or_failure"));
 }
 
 void DIMM::saveResultRow(int frame)
@@ -297,173 +709,82 @@ void DIMM::saveResultRow(int frame)
         return;
     }
 
-    if (!m_resultWriter.isOpen()) {
-        initResultFile();
-    }
-    if (!m_resultWriter.isOpen()) {
+    auto& runtime = activeRuntime();
+    if (m_captureStopRequested) {
         return;
     }
-    if (m_resultFileState != m_captureState) {
-        closeResultFile();
-        initResultFile();
-        if (!m_resultWriter.isOpen()) {
-            return;
-        }
+    if (m_captureState != CaptureState::Live ||
+        m_liveStartupPhase != LiveStartupPhase::Tracking ||
+        !m_resultSessionActive || !AcquisitionCsv::allowsData(m_starTrackingState) ||
+        !runtime.hasValidCentroid[0] || !runtime.hasValidCentroid[1] ||
+        !runtime.hasValidAtmosphere || !ensureResultFileOpen()) {
+        return;
     }
 
-    auto& runtime = activeRuntime();
-    RoiRect currentRois[2];
-    if (m_imageProcessor) {
-        currentRois[0] = m_imageProcessor->getCurrentRoi(0);
-        currentRois[1] = m_imageProcessor->getCurrentRoi(1);
-    }
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-    const qint64 msSinceLastRoiUpdate = m_lastRoiUpdateMs >= 0 ? nowMs - m_lastRoiUpdateMs : -1;
-    const QString roiUpdateReason = csvSafeField(m_lastRoiUpdateReason);
-
+    const QDateTime savedAt = QDateTime::currentDateTime();
     const AtmosphericParams& atmosphere = runtime.latestAtmosphere;
-
-    const QString tau0ValueText =
-        atmosphere.tau0Valid
-            ? QString::number(atmosphere.tau0, 'f', 3)
-            : QString();
-
-    const QString tau0StateText =
-        !atmosphere.tau0Valid
-            ? QStringLiteral("invalid")
-            : (atmosphere.tau0UnderResolved
-                   ? QStringLiteral("under_resolved")
-                   : QStringLiteral("resolved"));
-
-    const QString tau0ResolutionText =
-        atmosphere.tau0Valid
-            ? QString::number(atmosphere.tau0ResolutionMs, 'f', 3)
-            : QString();
-
-    const QStringList fields = {
-        QDateTime::currentDateTime().toString(Qt::ISODateWithMs),
-        captureModeName(),
-        QString::number(frame),
-        QString::number(runtime.pairedSampleCount),
-        QString::number(runtime.droppedUnpairedSampleCount),
-        QString::number(m_liveAcquisitionGeneration),
-        QString::number(m_roiUpdateCount),
-        roiUpdateReason,
-        QString::number(currentRois[0].x),
-        QString::number(currentRois[0].y),
-        QString::number(currentRois[0].w),
-        QString::number(currentRois[0].h),
-        QString::number(currentRois[1].x),
-        QString::number(currentRois[1].y),
-        QString::number(currentRois[1].w),
-        QString::number(currentRois[1].h),
-        QString::number(msSinceLastRoiUpdate),
-        QString::number(m_configContinuousFrameRateHz, 'f', 3),
-        QString::number(m_lastContinuousFrameRateReadback[0], 'f', 3),
-        QString::number(m_lastContinuousFrameRateReadback[1], 'f', 3),
-        QString::number(m_latestAutoExposurePeakDn[0], 'f', 1),
-        QString::number(m_latestAutoExposurePeakDn[1], 'f', 1),
-        QString::number(m_latestAutoExposureSnr[0], 'f', 2),
-        QString::number(m_latestAutoExposureSnr[1], 'f', 2),
-        QString::number(m_latestAutoExposureValidRatio[0], 'f', 3),
-        QString::number(m_latestAutoExposureValidRatio[1], 'f', 3),
-        QString::number(m_cameraExposureUs[0], 'f', 0),
-        QString::number(m_cameraExposureUs[1], 'f', 0),
-        QString::number(m_hotPixelTemplateExposureUs[0]),
-        QString::number(m_hotPixelTemplateExposureUs[1]),
-        m_autoExposureConfig.enabled ? QStringLiteral("1") : QStringLiteral("0"),
-        autoExposureStateName(m_autoExposureState),
-        autoExposureStateName(m_cameraAutoExposureState[0]),
-        autoExposureStateName(m_cameraAutoExposureState[1]),
-        csvSafeField(m_autoExposureReason),
-        csvSafeField(m_cameraAutoExposureReason[0]),
-        csvSafeField(m_cameraAutoExposureReason[1]),
-        QString::number(m_autoExposureSequenceId),
-        QString::number(m_autoExposureTargetExposureUs),
-        QString::number(m_cameraAutoExposureTargetExposureUs[0]),
-        QString::number(m_cameraAutoExposureTargetExposureUs[1]),
-        QString::number(m_autoExposureFramesSinceAdjust),
-        csvSafeField(autoExposureUiStatusText()),
-        csvSafeField(autoExposureAdjustDirectionText()),
-        QString::number(m_autoExposureCooldownRemainingMs),
-        m_autoExposureAdjustmentSessionActive ? QStringLiteral("1") : QStringLiteral("0"),
-        QString::number(m_autoExposureConfig.autoExposureStepUs, 'f', 0),
-        QString::number(runtime.latestAtmosphere.r0, 'f', 3),
-        QString::number(runtime.latestAtmosphere.seeing, 'f', 3),
-        QString::number(runtime.latestAtmosphere.theta0, 'f', 3),
-        tau0ValueText,
-        tau0StateText,
-        tau0ResolutionText,
-        QString::number(runtime.latestAtmosphere.longitudinalVariancePx2, 'g', 12),
-        QString::number(runtime.latestAtmosphere.transverseVariancePx2, 'g', 12),
-        QString::number(runtime.latestAtmosphere.longitudinalVarianceRad2, 'g', 12),
-        QString::number(runtime.latestAtmosphere.transverseVarianceRad2, 'g', 12),
-        QString::number(runtime.latestAtmosphere.r0LongitudinalCm, 'f', 3),
-        QString::number(runtime.latestAtmosphere.r0TransverseCm, 'f', 3),
-        QString::number(runtime.latestAtmosphere.sampleCount),
-        runtime.latestAtmosphere.partialWindow ? QStringLiteral("1") : QStringLiteral("0"),
-        runtime.latestAtmosphere.riskFlag ? QStringLiteral("1") : QStringLiteral("0"),
-        QString::number(runtime.latestAtmosphere.targetSampleCount),
-        csvSafeField(runtime.latestAtmosphere.riskReason),
-        QString::number(runtime.latestSyncResidualUs, 'f', 3),
-        QString::number(runtime.latestSyncJitterUs, 'f', 3),
-        QString::number(runtime.averageSyncJitterUs, 'f', 3),
-        QString::number(runtime.maxSyncJitterUs, 'f', 3),
-        QString::number(m_latestEnvironment.temperatureC, 'f', 1),
-        QString::number(m_latestEnvironment.humidityRh, 'f', 1),
-        QString::number(m_latestEnvironment.pressureHpa, 'f', 1),
-        m_latestEnvironment.valid ? QStringLiteral("1") : QStringLiteral("0"),
-        m_commConnected ? QStringLiteral("1") : QStringLiteral("0"),
-        m_reporting ? QStringLiteral("1") : QStringLiteral("0")
-    };
-
-    m_resultWriter.enqueue(MeasurementRecord{fields});
+    const double frameRate = currentTrackingFrameRateHz();
+    const std::uint32_t deviceStatus = monitoringDeviceStatus(
+        runtime, nowMs, frameRate, std::isfinite(frameRate) && frameRate > 0.0);
+    AcquisitionCsvDataRecord record;
+    record.timestamp = nextResultRecordTimestamp(savedAt);
+    record.sessionId = m_resultSessionId;
+    record.sourceTimestamp = QDateTime::fromMSecsSinceEpoch(
+        runtime.latestAtmosphereTimestampMs > 0
+            ? static_cast<qint64>(runtime.latestAtmosphereTimestampMs)
+            : nowMs);
+    record.savedAt = savedAt;
+    record.sourceGeneration = m_liveAcquisitionGeneration;
+    record.temperature = m_latestEnvironment.temperatureC;
+    record.humidity = m_latestEnvironment.humidityRh;
+    record.pressure = m_latestEnvironment.pressureHpa;
+    record.r0 = atmosphere.r0;
+    record.seeing = atmosphere.seeing;
+    record.theta0 = atmosphere.theta0;
+    record.tau0 = atmosphere.tau0Valid ? atmosphere.tau0 : std::numeric_limits<double>::quiet_NaN();
+    record.peakBrightnessA = runtime.peakBrightness[0];
+    record.peakBrightnessB = runtime.peakBrightness[1];
+    record.exposureTimeA = m_cameraExposureUs[0];
+    record.exposureTimeB = m_cameraExposureUs[1];
+    record.frameRate = frameRate;
+    record.deviceStatus = QString::number(deviceStatus);
+    record.acquisitionState = QStringLiteral("Tracking");
+    record.searchAttempt = m_searchAttempt;
+    // Keep the primary CSV row cadence and the two camera columns intact,
+    // while consuming independent live metric groups for each camera.
+    const auto realtimeMetricsA =
+        m_autoFocusRealtimeMetricsSampler.takeCompletedMetrics(0, nowMs);
+    if (realtimeMetricsA.has_value()) {
+        record.autoFocusHfrA = realtimeMetricsA->hfr;
+        record.autoFocusRmsA = realtimeMetricsA->rms;
+        record.hasAutoFocusMetricsA = true;
+    }
+    const auto realtimeMetricsB =
+        m_autoFocusRealtimeMetricsSampler.takeCompletedMetrics(1, nowMs);
+    if (realtimeMetricsB.has_value()) {
+        record.autoFocusHfrB = realtimeMetricsB->hfr;
+        record.autoFocusRmsB = realtimeMetricsB->rms;
+        record.hasAutoFocusMetricsB = true;
+    }
+    m_resultWriter.enqueueLine(AcquisitionCsv::formatDataRecord(record));
     saveDetailResultRows(frame, runtime.pendingPairedCentroidDetails);
     runtime.pendingPairedCentroidDetails.clear();
 }
 
 void DIMM::saveDetailResultRows(int frame, const QVector<PairedCentroidDetail>& details)
 {
-    if (!m_parameterValidationEnabled) {
-        return;
-    }
-    if (details.isEmpty()) {
-        return;
-    }
-    if (!m_detailResultWriter.isOpen()) {
-        initDetailResultFile();
-    }
-    if (!m_detailResultWriter.isOpen()) {
-        return;
-    }
-
-    for (int i = 0; i < details.size(); ++i) {
-        const PairedCentroidDetail& detail = details[i];
-        const QStringList fields = {
-            QDateTime::fromMSecsSinceEpoch(detail.timestampMs).toString(Qt::ISODateWithMs),
-            captureModeName(),
-            QString::number(frame),
-            QString::number(i + 1),
-            QString::number(detail.frameId1),
-            QString::number(detail.frameId2),
-            QString::number(detail.pairedSampleCount),
-            QString::number(detail.cameraTimestamp1),
-            QString::number(detail.cameraTimestamp2),
-            QString::number(detail.centroid1X, 'f', 6),
-            QString::number(detail.centroid1Y, 'f', 6),
-            QString::number(detail.centroid2X, 'f', 6),
-            QString::number(detail.centroid2Y, 'f', 6),
-            QString::number(detail.longitudinal, 'f', 6),
-            QString::number(detail.transverse, 'f', 6),
-            QString::number(detail.syncResidualUs, 'f', 3)
-        };
-        m_detailResultWriter.enqueue(MeasurementRecord{fields});
-    }
+    Q_UNUSED(frame);
+    Q_UNUSED(details);
 }
 
 void DIMM::flushPendingWrites()
 {
-    m_resultWriter.flush();
+    QString resultError;
+    if (!m_resultWriter.flush(&resultError)) {
+        setStatusMessage(QStringLiteral("结果 CSV 写入失败: %1").arg(resultError),
+                         UiStatusLevel::Error);
+    }
     m_detailResultWriter.flush();
     m_syncDiagnosticWriter.flush();
 }
@@ -491,17 +812,6 @@ void DIMM::recordSyncDiagnosticEvent(const QString& event,
         cameraIndex >= 2) {
         return;
     }
-    if (!m_syncDiagnosticWriter.isOpen()) {
-        if (m_syncDiagnosticFilePath.isEmpty()) {
-            initResultFile();
-        } else {
-            initSyncDiagnosticFile();
-        }
-    }
-    if (!m_syncDiagnosticWriter.isOpen()) {
-        return;
-    }
-
     const bool captureEvent = event == QStringLiteral("capture");
     quint64& lastFrameId = captureEvent
                                ? m_diagnosticLastCapturedFrameId[cameraIndex]
@@ -522,25 +832,18 @@ void DIMM::recordSyncDiagnosticEvent(const QString& event,
     }
     ++packetCount;
 
-    const QStringList fields{
-        QString::number(QDateTime::currentMSecsSinceEpoch()),
-        csvSafeField(event),
-        QString::number(cameraIndex + 1),
-        QString::number(packet.frameId),
-        QString::number(packet.cameraTimestamp),
-        QString::number(packet.receivedMs),
-        QString::number(m_liveAcquisitionGeneration),
-        QString::number(packetCount),
-        QString::number(gapCount),
-        QString::number(expectedNextFrameId),
-        QString(),
-        QString(),
-        QString(),
-        QString(),
-        QString(),
-        csvSafeField(note)
-    };
-    m_syncDiagnosticWriter.enqueue(MeasurementRecord{fields});
+    qInfo() << "sync diagnostic"
+            << event
+            << "sync_residual_us sync_jitter_us sync_jitter_avg_us sync_jitter_max_us"
+            << "camera" << cameraIndex + 1
+            << "frame" << packet.frameId
+            << "cameraTimestamp" << packet.cameraTimestamp
+            << "receivedMs" << packet.receivedMs
+            << "generation" << m_liveAcquisitionGeneration
+            << "packetCount" << packetCount
+            << "gapCount" << gapCount
+            << "expectedNextFrameId" << expectedNextFrameId
+            << note;
 }
 
 void DIMM::recordSyncUnpairedDropDiagnostic(int droppedCameraIndex,
@@ -559,17 +862,6 @@ void DIMM::recordSyncUnpairedDropDiagnostic(int droppedCameraIndex,
         droppedCameraIndex >= 2) {
         return;
     }
-    if (!m_syncDiagnosticWriter.isOpen()) {
-        if (m_syncDiagnosticFilePath.isEmpty()) {
-            initResultFile();
-        } else {
-            initSyncDiagnosticFile();
-        }
-    }
-    if (!m_syncDiagnosticWriter.isOpen()) {
-        return;
-    }
-
     const bool droppedCam0 = droppedCameraIndex == 0;
     const quint64 frameId = droppedCam0 ? cam0FrameId : cam1FrameId;
     const quint64 peerFrameId = droppedCam0 ? cam1FrameId : cam0FrameId;
@@ -577,25 +869,15 @@ void DIMM::recordSyncUnpairedDropDiagnostic(int droppedCameraIndex,
     const qint64 alignedFrameId = droppedCam0 ? alignedFrameId0 : alignedFrameId1;
     const qint64 peerAlignedFrameId = droppedCam0 ? alignedFrameId1 : alignedFrameId0;
 
-    const QStringList fields{
-        QString::number(QDateTime::currentMSecsSinceEpoch()),
-        QStringLiteral("unpaired_drop"),
-        QString::number(droppedCameraIndex + 1),
-        QString::number(frameId),
-        QString::number(cameraTimestamp),
-        QString(),
-        QString::number(m_liveAcquisitionGeneration),
-        QString(),
-        QString(),
-        QString(),
-        QString::number(peerFrameId),
-        QString::number(frameIdOffset),
-        QString::number(alignedFrameId),
-        QString::number(peerAlignedFrameId),
-        QString::number(droppedUnpairedSamples),
-        QStringLiteral("older_unpaired")
-    };
-    m_syncDiagnosticWriter.enqueue(MeasurementRecord{fields});
+    qInfo() << "sync unpaired drop"
+            << "camera" << droppedCameraIndex + 1
+            << "frame" << frameId
+            << "peerFrame" << peerFrameId
+            << "frameIdOffset" << frameIdOffset
+            << "alignedFrame" << alignedFrameId
+            << "peerAlignedFrame" << peerAlignedFrameId
+            << "droppedSamples" << droppedUnpairedSamples
+            << "cameraTimestamp" << cameraTimestamp;
 }
 
 QString DIMM::csvSafeField(QString value) const
@@ -639,7 +921,7 @@ void DIMM::reportMeasurement()
         const double cameraAFrameRate = m_lastContinuousFrameRateReadback[0];
         const double cameraBFrameRate = m_lastContinuousFrameRateReadback[1];
         const double frameRateTolerance =
-            std::max(0.05, std::abs(m_configContinuousFrameRateHz) * 0.05);
+            std::max(0.05, std::abs(m_activeContinuousFrameRateHz) * 0.05);
         frameRateValid = std::isfinite(cameraAFrameRate) && cameraAFrameRate > 0.0 &&
                          std::isfinite(cameraBFrameRate) && cameraBFrameRate > 0.0 &&
                          std::abs(cameraAFrameRate - cameraBFrameRate) <= frameRateTolerance;
@@ -647,7 +929,7 @@ void DIMM::reportMeasurement()
             frameRateHz = (cameraAFrameRate + cameraBFrameRate) * 0.5;
         }
     } else {
-        frameRateHz = m_pulseGeneratorFrequencyHz;
+        frameRateHz = m_activeTriggerFrequencyHz;
         frameRateValid = std::isfinite(frameRateHz) && frameRateHz > 0.0;
     }
     const float exposureTimeCameraAUs = finiteFloatOrNaN(

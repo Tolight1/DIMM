@@ -1,16 +1,5 @@
 #include "AutoAcquisitionRecoveryController.h"
 
-#include <algorithm>
-
-namespace {
-
-qint64 intervalMsFromMinutes(int minutes)
-{
-    return static_cast<qint64>(std::clamp(minutes, 1, 120)) * 60 * 1000;
-}
-
-} // namespace
-
 void AutoAcquisitionRecoveryController::reset()
 {
     m_phase = AutoAcquisitionRecoveryPhase::Idle;
@@ -43,17 +32,12 @@ bool AutoAcquisitionRecoveryController::shouldAttemptScan(const QString& windowI
                                                           qint64 nowMs,
                                                           int intervalMinutes) const
 {
+    Q_UNUSED(intervalMinutes);
     if (windowId.isEmpty() || windowId != m_windowId) {
         return false;
     }
-    if (m_phase == AutoAcquisitionRecoveryPhase::WaitingImmediateScan) {
-        return true;
-    }
-    if (m_phase != AutoAcquisitionRecoveryPhase::WaitingInterval) {
-        return false;
-    }
-    return m_lastScanFinishedMs < 0 ||
-           nowMs >= m_lastScanFinishedMs + intervalMsFromMinutes(intervalMinutes);
+    Q_UNUSED(nowMs);
+    return m_phase == AutoAcquisitionRecoveryPhase::WaitingImmediateScan;
 }
 
 void AutoAcquisitionRecoveryController::noteScanStarted(const QString& windowId,
@@ -72,7 +56,7 @@ void AutoAcquisitionRecoveryController::noteTrackingStarted(const QString& windo
 
 void AutoAcquisitionRecoveryController::noteScanFoundNoStar(qint64 nowMs)
 {
-    m_phase = AutoAcquisitionRecoveryPhase::WaitingInterval;
+    m_phase = AutoAcquisitionRecoveryPhase::WaitingImmediateScan;
     m_lastScanFinishedMs = nowMs;
 }
 
@@ -95,11 +79,8 @@ void AutoAcquisitionRecoveryController::noteManualStop()
 
 qint64 AutoAcquisitionRecoveryController::nextScanDueMs(int intervalMinutes) const
 {
-    if (m_phase == AutoAcquisitionRecoveryPhase::WaitingImmediateScan) {
-        return m_lastScanFinishedMs;
-    }
-    if (m_lastScanFinishedMs < 0) {
-        return -1;
-    }
-    return m_lastScanFinishedMs + intervalMsFromMinutes(intervalMinutes);
+    Q_UNUSED(intervalMinutes);
+    return m_phase == AutoAcquisitionRecoveryPhase::WaitingImmediateScan
+               ? m_lastScanFinishedMs
+               : -1;
 }

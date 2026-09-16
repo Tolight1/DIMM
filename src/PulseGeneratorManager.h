@@ -29,14 +29,19 @@ public:
     bool setControlSource(const Config& config, bool remoteControl, QString* errorMessage = nullptr);
     bool configureAndStart(const Config& config, QString* errorMessage = nullptr);
     bool stop(QString* errorMessage = nullptr);
+    bool stopOutput(QString* errorMessage = nullptr);
+    bool disconnect(QString* errorMessage = nullptr);
     bool isRunning() const;
+    bool isRunningAtFrequency(double frequencyHz, double toleranceHz = 0.05) const;
     const Config& config() const;
 
 private:
     bool validateConfig(const Config& config, QString* errorMessage) const;
     bool configureDevice(const Config& config, bool enableOutput, QString* errorMessage);
     bool setControlSourceDevice(const Config& config, QString* errorMessage);
-    bool stopDevice(const Config& config, QString* errorMessage);
+    bool stopOutputDevice(QString* errorMessage);
+    bool ensureConnected(const Config& config, QString* errorMessage);
+    void closeConnection();
     bool runWorkerOperation(const QString& operationName,
                             const std::function<bool(QString*)>& operation,
                             QString* errorMessage);
@@ -57,6 +62,9 @@ private:
 
     Config m_config;
     bool m_running = false;
+    void* m_portHandle = nullptr;
+    QString m_connectedPortName;
+    int m_connectedBaudRate = 0;
     std::atomic_bool m_operationInProgress{false};
     QThread* m_workerThread = nullptr;
     QObject* m_workerContext = nullptr;

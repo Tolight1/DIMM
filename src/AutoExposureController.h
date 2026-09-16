@@ -24,6 +24,31 @@ enum class AutoExposureState {
     TrendConflict
 };
 
+inline bool shouldReleaseAutoFocusPreExposure(bool awaitingPreExposure,
+                                              AutoExposureState state,
+                                              bool hasValidHfr,
+                                              qint64 startedMs,
+                                              qint64 nowMs,
+                                              int sampleWindowSec)
+{
+    if (!awaitingPreExposure || !hasValidHfr) {
+        return false;
+    }
+    if (state == AutoExposureState::Fluctuating ||
+        state == AutoExposureState::TrendConflict) {
+        return true;
+    }
+    const bool isStillAdjusting =
+        state == AutoExposureState::BrightWarning ||
+        state == AutoExposureState::BrightAdjusting ||
+        state == AutoExposureState::DarkWarning ||
+        state == AutoExposureState::DarkAdjusting;
+    if (!isStillAdjusting || startedMs < 0 || nowMs < startedMs) {
+        return false;
+    }
+    return nowMs - startedMs >= qint64(std::max(1, sampleWindowSec)) * 1000;
+}
+
 struct AutoExposureFrameSample {
     int cameraIndex = -1;
     double peakDn = 0.0;
@@ -319,7 +344,8 @@ private:
         if (action.direction == AutoExposureAdjustDirection::Increase) {
             return AutoExposureState::DarkAdjusting;
         }
-        if (action.reason == "MAX_EXPOSURE_DARK_HOLD") {
+        if (action.reason == "MAX_EXPOSURE_DARK_HOLD" ||
+            action.reason == "MAX_EXPOSURE_STAR_LOST") {
             return AutoExposureState::StarLost;
         }
         if (action.reason == "STABLE_HOLD") {
