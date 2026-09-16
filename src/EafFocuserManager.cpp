@@ -1,5 +1,6 @@
 #include "EafFocuserManager.h"
 #include "EafSdkLoader.h"
+#include "FocuserMotionPolicy.h"
 
 #include <QThread>
 #include <QTimer>
@@ -11,6 +12,36 @@
 
 namespace {
 constexpr unsigned long kEafWorkerShutdownTimeoutMs = 3000;
+}
+
+int resolveSavedEafDeviceIndex(const QVector<EafDeviceDescriptor>& devices,
+                               const QString& savedSerialHex,
+                               int savedDeviceId,
+                               int savedEnumerationIndex)
+{
+    const QString serial = savedSerialHex.trimmed();
+    if (!serial.isEmpty()) {
+        for (int i = 0; i < devices.size(); ++i) {
+            if (!devices.at(i).serialHex.isEmpty() &&
+                devices.at(i).serialHex.compare(serial, Qt::CaseInsensitive) == 0) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    if (savedDeviceId >= 0) {
+        for (int i = 0; i < devices.size(); ++i) {
+            if (devices.at(i).id == savedDeviceId) {
+                return i;
+            }
+        }
+    }
+
+    if (savedEnumerationIndex >= 0 && savedEnumerationIndex < devices.size()) {
+        return savedEnumerationIndex;
+    }
+    return -1;
 }
 
 // ============================================================
@@ -42,7 +73,9 @@ public slots:
     void doCloseDevice(TelescopeSlot slot);
     void doPollState(TelescopeSlot slot);
     void doMoveAbsolute(TelescopeSlot slot, int target);
+    void doMoveAbsoluteForAutoFocus(TelescopeSlot slot, int target);
     void doMoveRelative(TelescopeSlot slot, int delta);
+    void doMoveRelativeForAutoFocus(TelescopeSlot slot, int delta);
     void doStopMotion(TelescopeSlot slot);
     void doResetPosition(TelescopeSlot slot, int value);
     void doSetMaxStep(TelescopeSlot slot, int value);
@@ -51,6 +84,7 @@ public slots:
     void doSetBeep(TelescopeSlot slot, bool value);
     void doSetLed(TelescopeSlot slot, bool value);
     void doSetMotionAllowed(bool allowed);
+    void doSetManualMotionAllowed(TelescopeSlot slot, bool allowed);
     void doRequestStateRefresh(TelescopeSlot slot);
 
 signals:
@@ -67,11 +101,13 @@ private:
     void startPolling(TelescopeSlot slot, int intervalMs);
     void stopPolling(TelescopeSlot slot);
     bool checkMotionAllowed(TelescopeSlot slot, const QString& command);
+    bool checkAutoFocusMotionAllowed(TelescopeSlot slot, const QString& command);
 
     EafSdkLoader* m_sdk;
     QTimer* m_pollTimers[2] = {nullptr, nullptr};
     SlotState m_slots[2];
     bool m_initialized = false;
+    bool m_globalMotionAllowed = true;
 };
 
 EafFocuserWorker::EafFocuserWorker(EafSdkLoader* sdk, QObject* parent)
@@ -99,6 +135,7 @@ void EafFocuserWorker::doInitialize()
 
     m_initialized = true;
     emit sdkAvailabilityChanged(true, m_sdk->sdkVersion());
+    doRefreshDevices();
 }
 
 void EafFocuserWorker::doShutdown()
@@ -270,6 +307,7 @@ EafDeviceState EafFocuserWorker::readDeviceState(int deviceId)
     int position = 0;
     if (m_sdk->EAFGetPosition(deviceId, &position) == EAF_SUCCESS) {
         state.currentPosition = position;
+        state.positionValid = true;
     }
 
     // Moving
@@ -278,6 +316,7 @@ EafDeviceState EafFocuserWorker::readDeviceState(int deviceId)
     if (err == EAF_SUCCESS) {
         state.moving = moving;
         state.handControl = handControl;
+        state.motionValid = true;
     } else if (err == EAF_ERROR_REMOVED) {
         state.lastError = QStringLiteral("Device removed");
         state.opened = false;
@@ -384,6 +423,19 @@ void EafFocuserWorker::doMoveAbsolute(TelescopeSlot slot, int target)
     }
 }
 
+void EafFocuserWorker::doMoveAbsoluteForAutoFocus(TelescopeSlot slot, int target)
+{
+    if (!checkAutoFocusMotionAllowed(slot, QStringLiteral("autoFocusMove"))) {
+        return;
+    }
+
+    const int idx = static_cast<int>(slot);
+    const bool manualMotionAllowed = m_slots[idx].motionAllowed;
+    m_slots[idx].motionAllowed = true;
+    doMoveAbsolute(slot, target);
+    m_slots[idx].motionAllowed = manualMotionAllowed;
+}
+
 void EafFocuserWorker::doMoveRelative(TelescopeSlot slot, int delta)
 {
     const int idx = static_cast<int>(slot);
@@ -405,6 +457,39 @@ void EafFocuserWorker::doMoveRelative(TelescopeSlot slot, int delta)
 
     const int target = (std::clamp)(position + delta, 0, maxStep);
     doMoveAbsolute(slot, target);
+}
+
+void EafFocuserWorker::doMoveRelativeForAutoFocus(TelescopeSlot slot, int delta)
+{
+    if (!checkAutoFocusMotionAllowed(slot, QStringLiteral("autoFocusMove"))) {
+        return;
+    }
+
+    const int idx = static_cast<int>(slot);
+    if (!m_slots[idx].opened) {
+        emit commandFailed(slot, QStringLiteral("autoFocusMove"), QStringLiteral("设备未打开"));
+        return;
+    }
+
+    int position = 0;
+    if (m_sdk->EAFGetPosition(m_slots[idx].deviceId, &position) != EAF_SUCCESS) {
+        emit commandFailed(slot, QStringLiteral("autoFocusMove"), QStringLiteral("无法读取当前位置"));
+        return;
+    }
+
+    int maxStep = 0;
+    if (m_sdk->EAFGetMaxStep(m_slots[idx].deviceId, &maxStep) != EAF_SUCCESS) {
+        maxStep = 100000;
+    }
+    const int target = (std::clamp)(position + delta, 0, maxStep);
+
+    // Autofocus is allowed to use its own slot while human commands are
+    // locked. The temporary flag is restored before returning to the event
+    // loop, so queued manual commands remain rejected.
+    const bool manualMotionAllowed = m_slots[idx].motionAllowed;
+    m_slots[idx].motionAllowed = true;
+    doMoveAbsolute(slot, target);
+    m_slots[idx].motionAllowed = manualMotionAllowed;
 }
 
 void EafFocuserWorker::doStopMotion(TelescopeSlot slot)
@@ -573,8 +658,14 @@ void EafFocuserWorker::doSetLed(TelescopeSlot slot, bool value)
 
 void EafFocuserWorker::doSetMotionAllowed(bool allowed)
 {
-    for (int i = 0; i < 2; ++i) {
-        m_slots[i].motionAllowed = allowed;
+    m_globalMotionAllowed = allowed;
+}
+
+void EafFocuserWorker::doSetManualMotionAllowed(TelescopeSlot slot, bool allowed)
+{
+    const int idx = static_cast<int>(slot);
+    if (idx >= 0 && idx < 2) {
+        m_slots[idx].motionAllowed = allowed;
     }
 }
 
@@ -611,9 +702,9 @@ bool EafFocuserWorker::checkMotionAllowed(TelescopeSlot slot, const QString& com
 {
     Q_UNUSED(command);
     const int idx = static_cast<int>(slot);
-    if (!m_slots[idx].motionAllowed) {
+    if (!isFocuserMotionAllowed(m_globalMotionAllowed, m_slots[idx].motionAllowed, false)) {
         emit commandFailed(slot, QStringLiteral("motion"),
-            QStringLiteral("Focuser motion is disabled while capture or alignment is active."));
+            QStringLiteral("Focuser motion is disabled while alignment is active."));
         return false;
     }
     return true;
@@ -631,6 +722,19 @@ EafFocuserManager::EafFocuserManager(QObject* parent)
     qRegisterMetaType<EafDeviceDescriptor>("EafDeviceDescriptor");
     qRegisterMetaType<EafDeviceState>("EafDeviceState");
     qRegisterMetaType<QVector<EafDeviceDescriptor>>("QVector<EafDeviceDescriptor>");
+}
+
+bool EafFocuserWorker::checkAutoFocusMotionAllowed(TelescopeSlot slot,
+                                                    const QString& command)
+{
+    Q_UNUSED(command);
+    const int idx = static_cast<int>(slot);
+    if (!isFocuserMotionAllowed(m_globalMotionAllowed, m_slots[idx].motionAllowed, true)) {
+        emit commandFailed(slot, QStringLiteral("autoFocusMove"),
+                           QStringLiteral("Focuser motion is disabled while alignment is active."));
+        return false;
+    }
+    return true;
 }
 
 EafFocuserManager::~EafFocuserManager()
@@ -668,7 +772,10 @@ void EafFocuserManager::initialize()
     connect(m_worker, &EafFocuserWorker::sdkAvailabilityChanged,
             this, &EafFocuserManager::sdkAvailabilityChanged);
     connect(m_worker, &EafFocuserWorker::deviceListChanged,
-            this, &EafFocuserManager::deviceListChanged);
+            this, [this](QVector<EafDeviceDescriptor> devices) {
+        restoreSavedMappings(devices);
+        emit deviceListChanged(devices);
+    });
     // Forward stateChanged with device identity enriched from slot mapping
     connect(m_worker, &EafFocuserWorker::stateChanged,
             this, [this](TelescopeSlot slot, EafDeviceState state) {
@@ -696,6 +803,46 @@ void EafFocuserManager::initialize()
 
     // Initialize on worker thread
     QMetaObject::invokeMethod(m_worker, "doInitialize", Qt::QueuedConnection);
+}
+
+void EafFocuserManager::restoreSavedMappings(const QVector<EafDeviceDescriptor>& devices)
+{
+    if (devices.isEmpty()) {
+        return;
+    }
+
+    QSettings settings;
+    QVector<bool> usedDevice(devices.size(), false);
+    for (int slotIndex = 0; slotIndex < 2; ++slotIndex) {
+        const QString prefix = QStringLiteral("focuser/telescope%1/").arg(slotIndex + 1);
+        const QString savedSerial = settings.value(prefix + QStringLiteral("serial")).toString();
+        const int savedDeviceId = settings.value(prefix + QStringLiteral("deviceId"), -1).toInt();
+        const int savedEnumerationIndex =
+            settings.value(prefix + QStringLiteral("enumIndex"), -1).toInt();
+        const int deviceIndex = resolveSavedEafDeviceIndex(
+            devices, savedSerial, savedDeviceId, savedEnumerationIndex);
+        if (deviceIndex < 0 || deviceIndex >= devices.size()) {
+            continue;
+        }
+
+        const auto& device = devices.at(deviceIndex);
+        if (usedDevice.at(deviceIndex)) {
+            qWarning() << "Skipping duplicate persisted EAF mapping for telescope"
+                       << slotIndex + 1;
+            continue;
+        }
+        usedDevice[deviceIndex] = true;
+
+        const bool sameMapping =
+            m_slotMapping[slotIndex].id == device.id &&
+            m_slotMapping[slotIndex].serialHex.compare(
+                device.serialHex, Qt::CaseInsensitive) == 0;
+        m_slotMapping[slotIndex] = device;
+        emit assignmentChanged(static_cast<TelescopeSlot>(slotIndex), device.serialHex);
+        if (!sameMapping) {
+            openDeviceForSlot(static_cast<TelescopeSlot>(slotIndex), device);
+        }
+    }
 }
 
 void EafFocuserManager::shutdown()
@@ -736,6 +883,13 @@ EafSdkLoader* EafFocuserManager::sdkLoader() const
     return m_sdk;
 }
 
+void EafFocuserManager::ensureInitialized()
+{
+    if (!m_workerThread) {
+        initialize();
+    }
+}
+
 void EafFocuserManager::openDeviceForSlot(TelescopeSlot slot, const EafDeviceDescriptor& desc)
 {
     const int idx = static_cast<int>(slot);
@@ -757,7 +911,7 @@ void EafFocuserManager::openDeviceForSlot(TelescopeSlot slot, const EafDeviceDes
 
 void EafFocuserManager::refreshDevices()
 {
-    if (!m_worker) return;
+    ensureInitialized();
     QMetaObject::invokeMethod(m_worker, "doRefreshDevices", Qt::QueuedConnection);
 }
 
@@ -771,6 +925,7 @@ void EafFocuserManager::openAssignedDevice(TelescopeSlot slot)
     // Use stored slot mapping if available; otherwise do nothing
     const int idx = static_cast<int>(slot);
     if (m_slotMapping[idx].id >= 0) {
+        ensureInitialized();
         openDeviceForSlot(slot, m_slotMapping[idx]);
     } else {
         emit commandFailed(slot, QStringLiteral("open"), QStringLiteral("No mapped focuser for this telescope. Apply a mapping first."));
@@ -796,10 +951,24 @@ void EafFocuserManager::moveAbsolute(TelescopeSlot slot, int target)
         Q_ARG(TelescopeSlot, slot), Q_ARG(int, target));
 }
 
+void EafFocuserManager::moveAbsoluteForAutoFocus(TelescopeSlot slot, int target)
+{
+    if (!m_worker) return;
+    QMetaObject::invokeMethod(m_worker, "doMoveAbsoluteForAutoFocus", Qt::QueuedConnection,
+        Q_ARG(TelescopeSlot, slot), Q_ARG(int, target));
+}
+
 void EafFocuserManager::moveRelative(TelescopeSlot slot, int delta)
 {
     if (!m_worker) return;
     QMetaObject::invokeMethod(m_worker, "doMoveRelative", Qt::QueuedConnection,
+        Q_ARG(TelescopeSlot, slot), Q_ARG(int, delta));
+}
+
+void EafFocuserManager::moveRelativeForAutoFocus(TelescopeSlot slot, int delta)
+{
+    if (!m_worker) return;
+    QMetaObject::invokeMethod(m_worker, "doMoveRelativeForAutoFocus", Qt::QueuedConnection,
         Q_ARG(TelescopeSlot, slot), Q_ARG(int, delta));
 }
 
@@ -858,6 +1027,21 @@ void EafFocuserManager::setMotionAllowed(bool allowed, QString reason)
     if (!m_worker) return;
     QMetaObject::invokeMethod(m_worker, "doSetMotionAllowed", Qt::QueuedConnection,
         Q_ARG(bool, allowed));
+}
+
+void EafFocuserManager::setManualMotionAllowed(TelescopeSlot slot,
+                                                bool allowed,
+                                                QString reason)
+{
+    const int index = static_cast<int>(slot);
+    if (index < 0 || index >= 2) {
+        return;
+    }
+    m_manualMotionAllowed[index] = allowed;
+    m_manualMotionDisallowedReason[index] = reason;
+    if (!m_worker) return;
+    QMetaObject::invokeMethod(m_worker, "doSetManualMotionAllowed", Qt::QueuedConnection,
+        Q_ARG(TelescopeSlot, slot), Q_ARG(bool, allowed));
 }
 
 #include "EafFocuserManager.moc"

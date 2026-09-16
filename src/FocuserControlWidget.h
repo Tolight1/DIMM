@@ -4,6 +4,7 @@
 #include <QVector>
 #include <QString>
 
+#include "AutoFocusSettings.h"
 #include "EafFocuserManager.h"
 
 class EafFocuserManager;
@@ -13,6 +14,7 @@ class QPushButton;
 class QComboBox;
 class QCheckBox;
 class QSpinBox;
+class QDoubleSpinBox;
 class QGroupBox;
 
 class FocuserControlWidget : public QWidget {
@@ -21,9 +23,18 @@ public:
     explicit FocuserControlWidget(QWidget* parent = nullptr);
 
     void setManager(EafFocuserManager* manager);
+    void setAutoFocusConfigUi(const AutoFocusConfig& config);
 
 public slots:
     void setMotionAllowed(bool allowed, const QString& reason);
+    void setAutoFocusMotionLocked(TelescopeSlot slot, bool locked);
+    void setAutoFocusTrackingAvailable(bool available);
+
+signals:
+    void autoFocusConfigApplied(AutoFocusConfig config);
+    void manualAutoFocusRequested();
+    // -1 means the master switch was disabled; 0/1 are camera-specific.
+    void autoFocusDisabled(int cameraIndex);
 
 private slots:
     void onRefreshDevices();
@@ -46,12 +57,18 @@ private slots:
     void onTelescopeSelectionChanged(int index);
     void onSdkAvailabilityChanged(bool available, QString detail);
     void onCommandFailed(TelescopeSlot slot, QString command, QString error);
+    void onApplyAutoFocus();
+    void onManualAutoFocus();
+    void onAutoFocusEnableChanged(bool enabled);
 
 private:
     void buildUi();
     void updateDeviceCombo();
     void updateStateDisplay();
     void updateControlStates();
+    void updateAutoFocusControlStates();
+    AutoFocusConfig autoFocusConfigFromUi() const;
+    bool applyAutoFocusConfiguration(bool showError);
     int currentSlotIndex() const;
     EafFocuserManager* manager() const { return m_manager; }
 
@@ -110,9 +127,45 @@ private:
     QSpinBox* m_maxStepSpin = nullptr;
     QPushButton* m_maxStepApplyBtn = nullptr;
 
+    // Autofocus configuration. Values default to zero and show "未设置";
+    // zero is rejected for every enabled field by AutoFocusController.
+    QCheckBox* m_autoFocusMasterCheck = nullptr;
+    QCheckBox* m_autoFocusCameraEnabled[2] = {nullptr, nullptr};
+    QDoubleSpinBox* m_autoFocusReferenceHfr[2] = {nullptr, nullptr};
+    QDoubleSpinBox* m_autoFocusReferenceRms[2] = {nullptr, nullptr};
+    QDoubleSpinBox* m_autoFocusReasonableHfrMinimum[2] = {nullptr, nullptr};
+    QCheckBox* m_autoFocusCalibrateHfr[2] = {nullptr, nullptr};
+    QCheckBox* m_autoFocusCalibrateRms[2] = {nullptr, nullptr};
+    QSpinBox* m_autoFocusFramesPerStateSpin = nullptr;
+    QSpinBox* m_autoFocusSettleTimeSpin = nullptr;
+    QSpinBox* m_autoFocusStageTimeoutSpin = nullptr;
+    QDoubleSpinBox* m_autoFocusTemperatureThresholdSpin = nullptr;
+    QComboBox* m_autoFocusStatisticsModeCombo = nullptr;
+    QDoubleSpinBox* m_autoFocusTrimRatioSpin = nullptr;
+    QSpinBox* m_autoFocusStepSpin = nullptr;
+    QSpinBox* m_autoFocusMaximumRangeSpin = nullptr;
+    QSpinBox* m_autoFocusMaximumIterationsSpin = nullptr;
+    QDoubleSpinBox* m_autoFocusDirectionImprovementSpin = nullptr;
+    QDoubleSpinBox* m_autoFocusDirectionWorseningSpin = nullptr;
+    QDoubleSpinBox* m_autoFocusHfrImprovementSpin = nullptr;
+    QDoubleSpinBox* m_autoFocusCallbackHfrToleranceSpin = nullptr;
+    QDoubleSpinBox* m_autoFocusHfrToleranceSpin = nullptr;
+    QDoubleSpinBox* m_autoFocusStabilitySpin = nullptr;
+    QDoubleSpinBox* m_autoFocusRmsToleranceSpin = nullptr;
+    QSpinBox* m_autoFocusCallbackStepSpin = nullptr;
+    QSpinBox* m_autoFocusStartupSearchRadiusSpin = nullptr;
+    QCheckBox* m_autoFocusLoggingCheck = nullptr;
+    QPushButton* m_autoFocusApplyBtn = nullptr;
+    QPushButton* m_autoFocusManualStartBtn = nullptr;
+    QLabel* m_autoFocusStatusLabel = nullptr;
+
     // State
     QVector<EafDeviceDescriptor> m_devices;
     EafDeviceState m_currentState;
     QLabel* m_motionLockLabel = nullptr;
     bool m_motionAllowed = true;
+    QString m_motionLockReason;
+    bool m_autoFocusMotionLocked[2] = {false, false};
+    bool m_autoFocusTrackingAvailable = false;
+    AutoFocusConfig m_autoFocusAppliedConfig;
 };

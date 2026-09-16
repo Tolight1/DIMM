@@ -83,13 +83,21 @@
     <!-- Left Panel -->
     <item>
     <widget class="QFrame" name="leftPanel">
-     <property name="fixedWidth"><number>260</number></property>
+      <property name="fixedWidth"><number>260</number></property>
      <layout class="QVBoxLayout" name="leftPanelLayout">
       <property name="spacing"><number>0</number></property>
       <property name="leftMargin"><number>8</number></property>
       <property name="topMargin"><number>8</number></property>
       <property name="rightMargin"><number>8</number></property>
       <property name="bottomMargin"><number>8</number></property>
+      <item>
+       <widget class="QScrollArea" name="leftPanelScrollArea">
+        <property name="frameShape"><enum>QFrame::NoFrame</enum></property>
+        <property name="horizontalScrollBarPolicy"><enum>Qt::ScrollBarAlwaysOff</enum></property>
+        <property name="verticalScrollBarPolicy"><enum>Qt::ScrollBarAsNeeded</enum></property>
+        <property name="widgetResizable"><bool>true</bool></property>
+        <widget class="QWidget" name="leftPanelScrollContent">
+         <layout class="QVBoxLayout" name="leftPanelScrollContentLayout">
       <!-- Camera Section -->
       <item>
       <widget class="QFrame" name="cameraSection">
@@ -445,11 +453,6 @@
             </widget>
            </item>
            <item>
-            <widget class="QLabel" name="lblStatWindow">
-             <property name="text"><string>统计窗口: 200 帧</string></property>
-            </widget>
-           </item>
-           <item>
             <widget class="QLabel" name="lblStatExposure">
              <property name="text"><string>曝光: 1000 μs | AE: 关闭</string></property>
             </widget>
@@ -473,6 +476,10 @@
          <size><width>20</width><height>40</height></size>
         </property>
        </spacer>
+      </item>
+         </layout>
+        </widget>
+       </widget>
       </item>
      </layout>
     </widget>
@@ -582,10 +589,10 @@
            <item>
             <widget class="QWidget" name="roiTablePanel">
              <property name="minimumSize">
-              <size><width>380</width><height>0</height></size>
+              <size><width>280</width><height>0</height></size>
              </property>
              <property name="maximumSize">
-              <size><width>500</width><height>16777215</height></size>
+              <size><width>420</width><height>16777215</height></size>
              </property>
              <property name="sizePolicy">
               <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
@@ -850,7 +857,7 @@
                 </sizepolicy>
                </property>
                <property name="minimumSize">
-                <size><width>0</width><height>230</height></size>
+                <size><width>0</width><height>0</height></size>
                </property>
                <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
               </widget>
@@ -886,7 +893,7 @@
                 </sizepolicy>
                </property>
                <property name="minimumSize">
-                <size><width>0</width><height>230</height></size>
+                <size><width>0</width><height>0</height></size>
                </property>
                <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
               </widget>

@@ -3,7 +3,6 @@
 #include "ConnectedDomain.h"
 #include "ImageProcessor.h"
 #include "InitialStarDetectionConfig.h"
-#include "StarSegmentation.h"
 
 #include <algorithm>
 #include <cmath>
@@ -68,9 +67,9 @@ QVector<InitialStarCandidate> detectInitialStarCandidates(const cv::Mat& graysca
         return candidates;
     }
 
-    // Match the reference implementation: Otsu must be calculated directly on
-    // the source image. Converting Mono12/16 to Mono8 first quantizes the
-    // histogram and changes both the threshold and the candidate signal scale.
+    // Keep the native image scale. Converting Mono12/16 to Mono8 first would
+    // quantize the histogram and change both the threshold and candidate
+    // signal scale.
     const cv::Mat detectionImage = grayscale;
     if (detectionImage.empty() ||
         (detectionImage.depth() != CV_8U &&
@@ -80,31 +79,47 @@ QVector<InitialStarCandidate> detectInitialStarCandidates(const cv::Mat& graysca
         return candidates;
     }
 
-    double minValue = 0.0;
     double maxValue = 0.0;
-    cv::minMaxLoc(detectionImage, &minValue, &maxValue);
+    cv::minMaxLoc(detectionImage, nullptr, &maxValue);
     if (peakValue) {
         *peakValue = maxValue;
     }
 
-    const StarSegmentation::ForegroundSegmentation segmentation =
-        StarSegmentation::segmentForegroundOtsu(detectionImage,
-                                                 config.sigmaThreshold,
-                                                 config.peakFraction);
-    if (!segmentation.valid) {
+    cv::Scalar mean;
+    cv::Scalar stddev;
+    cv::meanStdDev(detectionImage, mean, stddev);
+    const double background = mean[0];
+    const double noiseSigma = stddev[0];
+    const double nonOtsuThreshold =
+        std::max(background + config.sigmaThreshold * noiseSigma,
+                 background + (maxValue - background) * config.peakFraction);
+    if (!std::isfinite(background) ||
+        !std::isfinite(noiseSigma) ||
+        !std::isfinite(nonOtsuThreshold) ||
+        !std::isfinite(maxValue)) {
         return candidates;
     }
     if (thresholdValue) {
-        *thresholdValue = segmentation.actualThreshold;
+        *thresholdValue = nonOtsuThreshold;
     }
+    // Keep the legacy output slot for source compatibility. It now reports
+    // the actual non-Otsu threshold and must not expose an Otsu value.
     if (otsuThresholdValue) {
-        *otsuThresholdValue = segmentation.otsuThreshold;
+        *otsuThresholdValue = nonOtsuThreshold;
     }
-    if (maxValue <= segmentation.actualThreshold) {
+    if (maxValue <= nonOtsuThreshold) {
         return candidates;
     }
 
-    cv::Mat binary = segmentation.mask;
+    cv::Mat binary;
+    cv::threshold(detectionImage,
+                  binary,
+                  nonOtsuThreshold,
+                  255.0,
+                  cv::THRESH_BINARY);
+    if (binary.type() != CV_8UC1) {
+        binary.convertTo(binary, CV_8U);
+    }
 
     cv::Mat labels;
     cv::Mat stats;

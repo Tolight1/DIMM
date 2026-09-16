@@ -29,7 +29,7 @@ public:
     ~EnvironmentSensorManager() override;
 
     void start(const EnvironmentSensorConfig& config = EnvironmentSensorConfig());
-    void stop();
+    bool stop(int timeoutMs = 3000);
     bool isRunning() const;
     EnvironmentSensorData latestData() const;
 

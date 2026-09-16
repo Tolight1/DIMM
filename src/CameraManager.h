@@ -1,5 +1,7 @@
 #pragma once
 
+#include "CaptureRateWindow.h"
+
 #include <QObject>
 #include <QList>
 #include <QMetaType>
@@ -132,6 +134,7 @@ public:
     double getExposure(int index);
     double getGain(int index);
     double getFrameRate(int index);
+    double measuredCaptureFrameRateHz(int index) const;
     double getTemperature(int index);
     QString getSerialNumber(int index) const;
     QString getModelName(int index) const;
@@ -176,8 +179,9 @@ private:
         quint64 frameIdWrapOffset = 0;
         cv::Mat latestFrame;
         CameraFrame latestFramePacket;
+        CaptureRateWindow captureRate;
         mutable QMutex stateMutex;
-        QMutex frameMutex;
+        mutable QMutex frameMutex;
         std::atomic_bool frameNotificationPending = false;
         QWaitCondition callbackDrained;
         CameraInfo info;

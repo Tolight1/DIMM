@@ -8,12 +8,14 @@ struct ConfigApplicationCallbacks {
     std::function<void(double exposure, double gain, double continuousFrameRateHz)> applyCamera;
     std::function<void(const AutoExposureConfig& config)> applyAutoExposure;
     std::function<void(int mode)> applyTriggerMode;
-    std::function<void(int backgroundKernelSize,
-                       double backgroundSigmaMultiplier,
+    std::function<void(int backgroundThresholdClipIterations,
+                       double backgroundThresholdClipSigma,
+                       double backgroundThresholdSigmaMultiplier,
                        int centroidMode,
                        int peakKernelRadiusPx,
                        double strongHotPixelExcessDn,
                        int r0HistoryWindowFrames)> applyProcessing;
+    std::function<void(const CdimPsdAnalysisConfig& config)> applyPsdAnalysis;
     std::function<void(double thresholdPx,
                        int requiredFrames,
                        qint64 cooldownMs,
@@ -36,7 +38,8 @@ struct ConfigApplicationCallbacks {
                        double focalLengthCm,
                        double zenithAngleDeg,
                        double lambdaNm,
-                       double pixelSizeUm)> applyOptics;
+                       double pixelSizeUm,
+                       double outerScaleM)> applyOptics;
     std::function<void(bool autoRadius,
                        double focalLengthMm,
                        double pixelSizeUm,

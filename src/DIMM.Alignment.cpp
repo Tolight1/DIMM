@@ -20,7 +20,6 @@
 #include "PolarisSolver.h"
 #include "PolarisTracker.h"
 #include "SettingsDialog.h"
-#include "StarSegmentation.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1122,24 +1121,6 @@ void DIMM::updateAlignmentOverlay(int cameraIndex, const CameraFrame& packet)
         m_alignmentActualThreshold[cameraIndex] = detectedActualThreshold >= 0.0
                                                        ? detectedActualThreshold
                                                        : detectedOtsuThreshold;
-    } else if (m_alignmentOtsuThreshold[cameraIndex] < 0.0) {
-        const cv::Mat grayscale = ImageUtils::grayscaleDetectionFrame(frame);
-        const InitialStarDetectionConfig starConfig = currentInitialStarDetectionConfig();
-        const StarSegmentation::ForegroundSegmentation segmentation =
-            StarSegmentation::segmentForegroundOtsu(grayscale,
-                                                     starConfig.sigmaThreshold,
-                                                     starConfig.peakFraction);
-        if (segmentation.valid) {
-            m_alignmentOtsuThreshold[cameraIndex] = segmentation.otsuThreshold;
-            m_alignmentActualThreshold[cameraIndex] = segmentation.actualThreshold;
-        }
-    }
-    if (m_alignmentOtsuThreshold[cameraIndex] >= 0.0) {
-        setFullFrameThresholdDisplay(cameraIndex,
-                                     m_alignmentOtsuThreshold[cameraIndex],
-                                     m_alignmentActualThreshold[cameraIndex] >= 0.0
-                                         ? m_alignmentActualThreshold[cameraIndex]
-                                         : m_alignmentOtsuThreshold[cameraIndex]);
     }
     if (!candidates.isEmpty()) {
         m_alignmentCachedCandidates[cameraIndex] = candidates;

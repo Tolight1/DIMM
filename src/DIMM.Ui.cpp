@@ -43,32 +43,38 @@ void DIMM::setupMainWindowUi()
 {
     ui->leftPanel->setMinimumWidth(248);
     ui->leftPanel->setMaximumWidth(300);
-    ui->mainSplitter->setSizes({600, 340});
     ui->mainSplitter->setStretchFactor(0, 4);
     ui->mainSplitter->setStretchFactor(1, 3);
-    ui->roiImagesArea->setMinimumHeight(220);
-    ui->chartsArea->setMinimumHeight(320);
+    ui->topArea->setMinimumHeight(180);
+    ui->roiImagesArea->setMinimumHeight(180);
+    ui->chartsArea->setMinimumHeight(280);
     ui->environmentStrip->setMinimumHeight(58);
-    ui->cam1Card->setMinimumHeight(72);
-    ui->cam2Card->setMinimumHeight(72);
-    ui->statsCard->setMinimumHeight(150);
+    ui->statsCard->setMinimumHeight(190);
     for (QLabel* label : {ui->lblStatFrames,
                           ui->lblStatValid,
                           ui->lblStatLatency,
-                          ui->lblStatWindow,
                           ui->lblStatExposure,
                           ui->lblStatAutoExposure}) {
         label->setWordWrap(true);
-        label->setMinimumHeight(30);
+        label->setMinimumHeight(0);
     }
     for (QLabel* label : {ui->lblCam1Info, ui->lblCam2Info, ui->lblEnvironmentInfo}) {
         label->setWordWrap(false);
         label->setMinimumHeight(24);
     }
+    for (int camera = 0; camera < 2; ++camera) {
+        auto* label = new QLabel(ui->statsCard);
+        label->setObjectName(QStringLiteral("lblAutoFocusCam%1").arg(camera + 1));
+        label->setMinimumHeight(20);
+        label->setText(QStringLiteral("相机%1：-- |HFR --/--").arg(camera + 1));
+        label->setStyleSheet(QStringLiteral("color: #667085;"));
+        ui->statsCardLayout->addWidget(label);
+        m_lblAutoFocusCam[camera] = label;
+    }
     ui->stackedWidget->setCurrentIndex(0);
     for (QFrame* card : {ui->r0Card, ui->seeingCard, ui->thetaCard, ui->tauCard}) {
-        card->setMinimumHeight(70);
-        card->setMaximumHeight(86);
+        card->setMinimumHeight(92);
+        card->setMaximumHeight(116);
     }
     ui->thetaCard->setVisible(true);
     ui->tauCard->setVisible(true);
@@ -116,8 +122,6 @@ void DIMM::setupFullFramePreviewCanvases()
     cam1PanelLayout->setSpacing(6);
     m_lblFullFrameCam1 = new QLabel(QStringLiteral("全画幅预览: 相机1"), cam1Panel);
     m_lblFullFrameCam1->setAlignment(Qt::AlignCenter);
-    m_lblFullFrameThresholdCam1 = new QLabel(QStringLiteral("Otsu --"), cam1Panel);
-    m_lblFullFrameThresholdCam1->setAlignment(Qt::AlignCenter);
     m_lblAlignmentSolveCam1 = new QLabel(QStringLiteral("自动识别: 未启用"), cam1Panel);
     m_lblAlignmentSolveCam1->setAlignment(Qt::AlignCenter);
     m_lblAlignmentSolveCam1->setStyleSheet(QStringLiteral("color: %1").arg(uiStatusColor(UiStatusLevel::Muted)));
@@ -134,7 +138,6 @@ void DIMM::setupFullFramePreviewCanvases()
     cam1AlignmentControlsLayout->addWidget(m_btnConfirmCamera1Polaris);
     m_fullFrameCanvas1 = new FullFrameCanvas(cam1Panel);
     cam1PanelLayout->addWidget(m_lblFullFrameCam1);
-    cam1PanelLayout->addWidget(m_lblFullFrameThresholdCam1);
     cam1PanelLayout->addWidget(m_lblAlignmentSolveCam1);
     cam1PanelLayout->addWidget(cam1AlignmentControls);
     cam1PanelLayout->addWidget(m_fullFrameCanvas1, 1);
@@ -146,8 +149,6 @@ void DIMM::setupFullFramePreviewCanvases()
     cam2PanelLayout->setSpacing(6);
     m_lblFullFrameCam2 = new QLabel(QStringLiteral("全画幅预览: 相机2"), cam2Panel);
     m_lblFullFrameCam2->setAlignment(Qt::AlignCenter);
-    m_lblFullFrameThresholdCam2 = new QLabel(QStringLiteral("Otsu --"), cam2Panel);
-    m_lblFullFrameThresholdCam2->setAlignment(Qt::AlignCenter);
     m_lblAlignmentSolveCam2 = new QLabel(QStringLiteral("自动识别: 未启用"), cam2Panel);
     m_lblAlignmentSolveCam2->setAlignment(Qt::AlignCenter);
     m_lblAlignmentSolveCam2->setStyleSheet(QStringLiteral("color: %1").arg(uiStatusColor(UiStatusLevel::Muted)));
@@ -164,7 +165,6 @@ void DIMM::setupFullFramePreviewCanvases()
     cam2AlignmentControlsLayout->addWidget(m_btnConfirmCamera2Polaris);
     m_fullFrameCanvas2 = new FullFrameCanvas(cam2Panel);
     cam2PanelLayout->addWidget(m_lblFullFrameCam2);
-    cam2PanelLayout->addWidget(m_lblFullFrameThresholdCam2);
     cam2PanelLayout->addWidget(m_lblAlignmentSolveCam2);
     cam2PanelLayout->addWidget(cam2AlignmentControls);
     cam2PanelLayout->addWidget(m_fullFrameCanvas2, 1);
@@ -232,7 +232,7 @@ void DIMM::setupRoiPreviewCanvases()
     newCam1Layout->setSpacing(4);
     ui->lblCam1ROICoord = new QLabel(QStringLiteral("(0.0, 0.0)"), ui->cam1ROICanvas);
     ui->lblCam1ROICoord->setAlignment(Qt::AlignCenter);
-    m_lblRoiThresholdCam1 = new QLabel(QStringLiteral("Otsu --"), ui->cam1ROICanvas);
+    m_lblRoiThresholdCam1 = new QLabel(QStringLiteral("阈值 --"), ui->cam1ROICanvas);
     m_lblRoiThresholdCam1->setAlignment(Qt::AlignCenter);
     newCam1Layout->addWidget(ui->lblCam1ROICoord);
     newCam1Layout->addWidget(m_lblRoiThresholdCam1);
@@ -254,7 +254,7 @@ void DIMM::setupRoiPreviewCanvases()
     newCam2Layout->setSpacing(4);
     ui->lblCam2ROICoord = new QLabel(QStringLiteral("(0.0, 0.0)"), ui->cam2ROICanvas);
     ui->lblCam2ROICoord->setAlignment(Qt::AlignCenter);
-    m_lblRoiThresholdCam2 = new QLabel(QStringLiteral("Otsu --"), ui->cam2ROICanvas);
+    m_lblRoiThresholdCam2 = new QLabel(QStringLiteral("阈值 --"), ui->cam2ROICanvas);
     m_lblRoiThresholdCam2->setAlignment(Qt::AlignCenter);
     newCam2Layout->addWidget(ui->lblCam2ROICoord);
     newCam2Layout->addWidget(m_lblRoiThresholdCam2);
@@ -293,6 +293,26 @@ void DIMM::setupChartCanvases()
     auto* seeingChartLayout = new QVBoxLayout(ui->seeingChartCanvas);
     seeingChartLayout->setContentsMargins(0, 0, 0, 0);
     seeingChartLayout->addWidget(m_seeingChart);
+
+    auto* psdPanel = new QWidget(ui->chartsArea);
+    psdPanel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    auto* psdPanelLayout = new QVBoxLayout(psdPanel);
+    psdPanelLayout->setContentsMargins(18, 18, 18, 18);
+    psdPanelLayout->setSpacing(6);
+    auto* psdTitle = new QLabel(QStringLiteral("PSD / 方差去噪"), psdPanel);
+    psdPanelLayout->addWidget(psdTitle);
+    m_lblPsdSummary = new QLabel(QStringLiteral("等待完整 r0 窗口"), psdPanel);
+    m_lblPsdSummary->setWordWrap(true);
+    m_lblPsdSummary->setMinimumHeight(32);
+    psdPanelLayout->addWidget(m_lblPsdSummary);
+    m_longitudinalPsdChart = new PsdChartWidget(QStringLiteral("纵向差分 PSD（px²/Hz）"), psdPanel);
+    m_transversePsdChart = new PsdChartWidget(QStringLiteral("横向差分 PSD（px²/Hz）"), psdPanel);
+    psdPanelLayout->addWidget(m_longitudinalPsdChart, 1);
+    psdPanelLayout->addWidget(m_transversePsdChart, 1);
+    ui->chartsAreaLayout->addWidget(psdPanel, 1);
+    ui->chartsAreaLayout->setStretch(0, 5);
+    ui->chartsAreaLayout->setStretch(1, 5);
+    ui->chartsAreaLayout->setStretch(2, 2);
 
 }
 
@@ -401,9 +421,6 @@ void DIMM::refreshMeasurementUi()
         QStringLiteral("未配对丢帧延迟 %1 / %2 ms")
             .arg(QString::number(runtime.droppedUnpairedSampleCount),
                  QString::number(runtime.averageProcessingLatencyMs, 'f', 2)));
-    ui->lblStatWindow->setText(
-        QStringLiteral("同步抖动: %1 μs")
-            .arg(QString::number(runtime.averageSyncJitterUs, 'f', 1)));
     ui->lblStatExposure->setText(
         QStringLiteral("曝光: %1/%2 μs | 模板: %3/%4 μs | AE: %5")
             .arg(QString::number(m_cameraExposureUs[0], 'f', 0),
@@ -429,24 +446,13 @@ void DIMM::refreshMeasurementUi()
     }
 
     const AtmosphericParams& latestAtmosphere = runtime.latestAtmosphere;
-    QString r0Text = QString::number(latestAtmosphere.r0, 'f', 1);
-    if (latestAtmosphere.riskFlag) {
-        r0Text += QStringLiteral(" 风险");
-        ui->lblStatWindow->setText(
-            QStringLiteral("r0 风险窗口: %1 / %2 帧，%3")
-                .arg(QString::number(latestAtmosphere.sampleCount),
-                     QString::number(latestAtmosphere.targetSampleCount),
-                     latestAtmosphere.riskReason));
-    }
-    ui->lblR0Value->setText(r0Text);
+    ui->lblR0Value->setText(QString::number(latestAtmosphere.r0, 'f', 1));
     ui->lblSeeingValue->setText(QString::number(latestAtmosphere.seeing, 'f', 2));
     ui->lblThetaValue->setText(QString::number(latestAtmosphere.theta0, 'f', 2));
     if (!latestAtmosphere.tau0Valid) {
         ui->lblTauValue->setText(QStringLiteral("--"));
     } else if (latestAtmosphere.tau0UnderResolved) {
-        ui->lblTauValue->setText(
-            QStringLiteral("< %1")
-                .arg(latestAtmosphere.tau0ResolutionMs, 0, 'f', 2));
+        ui->lblTauValue->setText(QStringLiteral("<2"));
     } else {
         ui->lblTauValue->setText(
             QString::number(latestAtmosphere.tau0, 'f', 2));
@@ -462,12 +468,28 @@ void DIMM::refreshPanelUi()
     ui->roiImagesArea->setVisible(roiVisible);
     ui->chartsArea->setVisible(chartsVisible);
 
-    if (chartsVisible) {
-        ui->mainSplitter->setSizes({380, 560});
-    } else if (roiVisible) {
-        ui->mainSplitter->setSizes({600, 340});
-    } else {
-        ui->mainSplitter->setSizes({760, 140});
+    const int splitterHeight = ui->mainSplitter->height();
+    if (splitterHeight > 0 && isVisible() && m_mainSplitterLayoutPending) {
+        const double defaultBottomRatio = chartsVisible ? 0.48 : (roiVisible ? 0.35 : 0.16);
+        const int bottomMinimum = chartsVisible ? 280 : (roiVisible ? 180 : 120);
+        const int topMinimum = chartsVisible ? 240 : 180;
+        const bool hasSavedSizes = m_mainSplitterSizes.size() == 2 &&
+                                    m_mainSplitterSizes[0] > 0 &&
+                                    m_mainSplitterSizes[1] > 0;
+        const int savedTotal = hasSavedSizes
+                                   ? m_mainSplitterSizes[0] + m_mainSplitterSizes[1]
+                                   : 0;
+        const int preferredBottom = hasSavedSizes
+                                        ? qRound(splitterHeight *
+                                                 static_cast<double>(m_mainSplitterSizes[1]) /
+                                                 static_cast<double>(savedTotal))
+                                        : qRound(splitterHeight * defaultBottomRatio);
+        const int maximumBottom = std::max(bottomMinimum, splitterHeight - topMinimum);
+        const int bottom = qBound(bottomMinimum, preferredBottom, maximumBottom);
+        ui->mainSplitter->setSizes({std::max(0, splitterHeight - bottom), bottom});
+        m_mainSplitterSizes = ui->mainSplitter->sizes();
+        m_mainSplitterLayoutPending = false;
+        m_mainSplitterStartupLayoutApplied = true;
     }
 
     ui->btnToggleROI->setStyleSheet(toggleButtonStyle(roiVisible));
@@ -620,14 +642,21 @@ void DIMM::refreshActionStates()
 
 void DIMM::syncCameraSelectionUi()
 {
-    ui->lblFullframeLabel->setText(QStringLiteral("双相机全画幅预览"));
+    const bool alignmentActive = m_captureState == CaptureState::Alignment;
+    ui->lblFullframeLabel->setText(alignmentActive
+                                       ? QStringLiteral("双相机极轴对准观察窗（12h 时角刻度）")
+                                       : QStringLiteral("双相机全画幅预览"));
     ui->lblPreviewMode->setText(currentPreviewModeText());
 
     if (m_lblFullFrameCam1) {
-        m_lblFullFrameCam1->setText(QStringLiteral("全画幅预览: 相机1"));
+        m_lblFullFrameCam1->setText(alignmentActive
+                                        ? QStringLiteral("极轴对准观察窗: 相机1")
+                                        : QStringLiteral("全画幅预览: 相机1"));
     }
     if (m_lblFullFrameCam2) {
-        m_lblFullFrameCam2->setText(QStringLiteral("全画幅预览: 相机2"));
+        m_lblFullFrameCam2->setText(alignmentActive
+                                        ? QStringLiteral("极轴对准观察窗: 相机2")
+                                        : QStringLiteral("全画幅预览: 相机2"));
     }
 }
 
@@ -686,32 +715,20 @@ void DIMM::setStatusMessage(const QString& text, UiStatusLevel level)
     setStatusMessage(text, uiStatusColor(level));
 }
 
-void DIMM::setFullFrameThresholdDisplay(int cameraIndex,
-                                        double otsuThreshold,
-                                        double actualThreshold)
-{
-    QLabel* label = cameraIndex == 0 ? m_lblFullFrameThresholdCam1
-                                     : m_lblFullFrameThresholdCam2;
-    if (!label) {
-        return;
-    }
-    label->setText(QStringLiteral("Otsu %1 / 使用 %2")
-                      .arg(otsuThreshold, 0, 'f', 1)
-                      .arg(actualThreshold, 0, 'f', 1));
-}
-
-void DIMM::setRoiThresholdDisplay(int cameraIndex,
-                                  double otsuThreshold,
-                                  double actualThreshold)
+void DIMM::setRoiBackgroundThresholdDisplay(int cameraIndex,
+                                            double background,
+                                            double noiseSigma,
+                                            double threshold)
 {
     QLabel* label = cameraIndex == 0 ? m_lblRoiThresholdCam1
                                      : m_lblRoiThresholdCam2;
     if (!label) {
         return;
     }
-    label->setText(QStringLiteral("Otsu %1 / 使用 %2")
-                      .arg(otsuThreshold, 0, 'f', 1)
-                      .arg(actualThreshold, 0, 'f', 1));
+    label->setText(QStringLiteral("B %1 / σ %2 / T %3")
+                      .arg(background, 0, 'f', 1)
+                      .arg(noiseSigma, 0, 'f', 1)
+                      .arg(threshold, 0, 'f', 1));
 }
 void DIMM::setAlignmentSolveLabel(int cameraIndex, const QString& text, UiStatusLevel level)
 {
@@ -731,6 +748,11 @@ void DIMM::setAlignmentSolveLabel(int cameraIndex, const QString& text, UiStatus
 
 void DIMM::setDetailViewMode(DetailViewMode mode)
 {
+    const QVector<int> currentSizes = ui->mainSplitter->sizes();
+    if (currentSizes.size() == 2 && currentSizes[0] > 0 && currentSizes[1] > 0) {
+        m_mainSplitterSizes = currentSizes;
+    }
     m_detailViewMode = mode;
+    m_mainSplitterLayoutPending = true;
     refreshPanelUi();
 }

@@ -10,16 +10,17 @@
 struct RoiAxisRange;
 
 inline constexpr int kFixedRoiSize = 64;
+inline constexpr int kStarFindingExposureUs = 9000;
 inline constexpr int kLiveFullFramePreviewIntervalMs = 30000;
 inline constexpr int kAlignmentPreviewIntervalMs = 1000;
 inline constexpr int kAlignmentCandidateDetectionRefreshMs = 3000;
 inline constexpr int kMeasurementUiIntervalMs = 100;
-inline constexpr int kRoiEdgeUpdateMarginPx = 8;
 inline constexpr qint64 kLostCentroidRelocalizeTimeoutMs = 1500;
 inline constexpr qint64 kLiveRelocalizationMaxDurationMs = 15000;
 inline constexpr double kFullFrameLocalizationPulseHz = 2.0;
 inline constexpr double kAlignmentDefaultPolarisPolarDistanceArcmin = 37.6;
 inline constexpr const char* kHardwareTriggerLine = "Line0";
+inline constexpr const char* kPausedTriggerLine = "Line1";
 inline constexpr const char* kRoiUpdateGateLine = "Line2";
 
 double medianOfSamples(QVector<double> samples);

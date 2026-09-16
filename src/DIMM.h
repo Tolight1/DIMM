@@ -1,11 +1,19 @@
 #pragma once
 
+#include "AutoAcquisitionPreFocus.h"
+
+#include "AcquisitionCsv.h"
+#include "RateSwitchTiming.h"
 #include "AlignmentCoarseEstimator.h"
 #include "AlignmentTypes.h"
 #include "AlignmentSession.h"
 #include "AppConfig.h"
 #include "AutoAcquisitionRecoveryController.h"
 #include "AutoAcquisitionScheduler.h"
+#include "AutoFocusCompletionBarrier.h"
+#include "AutoFocusController.h"
+#include "AutoFocusLogWriter.h"
+#include "AutoFocusRealtimeMetricsSampler.h"
 #include "AutoExposureController.h"
 #include "CameraManager.h"
 #include "CameraTypes.h"
@@ -16,6 +24,7 @@
 #include "PolarisTrajectory.h"
 #include "PolarisSolver.h"
 #include "ResultWriter.h"
+#include "SearchEventGate.h"
 #include "SettingsDialog.h"
 #include "StableCandidateTracker.h"
 #include "ui_DIMM.h"
@@ -30,6 +39,8 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <optional>
 
 #include <opencv2/opencv.hpp>
 
@@ -37,8 +48,10 @@ class AlignmentCoarseController;
 class FullFrameCanvas;
 class RoiStarCanvas;
 class ChartWidget;
+class PsdChartWidget;
 class CommManager;
 class EafFocuserManager;
+struct EafDeviceState;
 class FocuserControlWidget;
 class PulseGeneratorManager;
 
@@ -49,6 +62,8 @@ class QComboBox;
 class QLabel;
 class QPushButton;
 class QAction;
+class QCloseEvent;
+class QShowEvent;
 
 enum class UiStatusLevel;
 class SettingsDialog;
@@ -59,6 +74,12 @@ class DIMM : public QMainWindow {
 public:
     explicit DIMM(QWidget* parent = nullptr);
     ~DIMM();
+
+protected:
+    void closeEvent(QCloseEvent* event) override;
+    void showEvent(QShowEvent* event) override;
+
+public:
 
     enum class CaptureState {
         Idle,
@@ -90,6 +111,13 @@ public:
         WaitingFullFramePair,
         WaitingRoiTrackingPair,
         Running
+    };
+
+    enum class ResultSessionEndReason {
+        ManualStop,
+        AutoWindowEnd,
+        UnrecoverableError,
+        Destruction
     };
 
 private slots:
@@ -167,6 +195,8 @@ private:
         int roiRecenteringCandidateFrameCount = 0;
         QSize frameSize[2] = {QSize(5120, 5120), QSize(5120, 5120)};
         AtmosphericParams latestAtmosphere;
+        CdimPsdAnalysisResult latestPsdAnalysis;
+        bool hasPsdAnalysis = false;
         int chartMinuteKey = -1;
         int chartSecond = -1;
         bool initialRoiConfirmed[2] = {false, false};
@@ -184,6 +214,9 @@ private:
         qint64 lastInitialCandidatePromptMs[2] = {-1, -1};
         qint64 liveRelocalizationStartedMs = -1;
         cv::Mat liveRelocalizationPreviewFrame[2];
+        cv::Mat latestFullFrame[2];
+        quint64 latestFullFrameId[2] = {0, 0};
+        qint64 latestFullFrameReceivedMs[2] = {-1, -1};
         QVector<PairedCentroidDetail> pendingPairedCentroidDetails;
     };
 
@@ -211,6 +244,7 @@ private:
     void setupNetworkSettingsCallbacks();
     void setupCameraConnections();
     void setupImageProcessorConnections();
+    void setupAutoFocusConnections();
     void setupCentroidProcessorConnection();
     void setupAutoExposureProcessorConnection();
     void setupDifferentialSampleProcessorConnections();
@@ -223,23 +257,59 @@ private:
     void setupCommConnections();
     void setupReportTimer();
     void setupConnections();
+    void applyAutoFocusConfig(const AutoFocusConfig& config);
+    void applyPendingAutoFocusConfigIfIdle();
+    void cancelAutoFocus(int cameraIndex, const QString& reason, bool stopFocuser);
+    void stopAutoFocusForTrackingExit(const QString& reason);
+    void startAutoFocusReferenceCalibration();
+    void startAutoFocusForAutoAcquisition();
+    void startManualAutoFocus();
+    void handleAutoFocusMeasurement(int cameraIndex,
+                                    const cv::Mat& calculationImage,
+                                    bool centroidValid,
+                                    double centroidX,
+                                    double centroidY);
+    void handleAutoFocusAction(int cameraIndex,
+                               const AutoFocusAction& action,
+                               const QString& context);
+    void handleAutoFocusFocuserState(int cameraIndex,
+                                     bool opened,
+                                     bool moving,
+                                     int position);
+    void completeAutoFocusCycle(int cameraIndex);
+    void setAutoFocusManualLock(int cameraIndex, bool locked);
+    void beginAutoAcquisitionPreFocus();
+    void handleAutoAcquisitionPreFocusFocuserState(int cameraIndex,
+                                                    const EafDeviceState& state);
+    void handleAutoAcquisitionPreFocusCommandFinished(int cameraIndex,
+                                                       const QString& command);
+    void handleAutoAcquisitionPreFocusCommandFailed(int cameraIndex,
+                                                     const QString& command,
+                                                     const QString& error);
+    void cancelAutoAcquisitionPreFocus(const QString& reason);
+    void resumeTrackingAutoFocusAfterPreFocus();
+    void logAutoFocusEvent(int cameraIndex,
+                           const AutoFocusAction& action,
+                           const QString& finalResult = {});
+    bool isTrackingForAutoFocus() const;
+    QString autoFocusStateText(AutoFocusRunState state) const;
+    QString autoFocusStatisticsText() const;
     void updateParams();
     void refreshUi();
     void refreshStatusUi();
     void refreshCameraUi();
     void refreshMeasurementUi();
+    void refreshPsdAnalysisUi(const CdimPsdAnalysisResult& result);
     void refreshPanelUi();
     void refreshActionStates();
     void syncCameraSelectionUi();
     QString currentPreviewModeText() const;
     void setStatusMessage(const QString& text, const QString& color = "#e0e0e0");
     void setStatusMessage(const QString& text, UiStatusLevel level);
-    void setFullFrameThresholdDisplay(int cameraIndex,
-                                      double otsuThreshold,
-                                      double actualThreshold);
-    void setRoiThresholdDisplay(int cameraIndex,
-                                double otsuThreshold,
-                                double actualThreshold);
+    void setRoiBackgroundThresholdDisplay(int cameraIndex,
+                                          double background,
+                                          double noiseSigma,
+                                          double threshold);
     void setAlignmentSolveLabel(int cameraIndex, const QString& text, UiStatusLevel level);
     void logPolarisSolveResult(const PolarisSolveResult& result) const;
     void setDetailViewMode(DetailViewMode mode);
@@ -265,7 +335,6 @@ private:
     void appendActualRoiTrackPoint(int cameraIndex, const RoiRect& roi);
     void updateActualRoiTrackOverlay(int cameraIndex);
     void clearActualRoiTracks();
-    bool isCentroidNearCurrentRoiEdge(int cameraIndex, double x, double y) const;
     bool isCentroidTooFarFromCurrentRoiCenter(int cameraIndex) const;
     bool tryApplyInitialCentroidSettleRoi();
     bool shouldUpdateRoiForRecentering();
@@ -277,6 +346,7 @@ private:
                                 double peakValue,
                                 double totalFlux,
                                 double background,
+                                double noiseSigma,
                                 double threshold,
                                 quint64 signalPixelCount,
                                 bool requireCentered = false) const;
@@ -287,7 +357,12 @@ private:
     void hideLegacyRoiScheduleUi();
     QString roiRuleDescription() const;
     bool configureLiveCameras(QString* reason = nullptr);
-    bool applyContinuousCameraFrameRate(QString* reason = nullptr);
+    bool applyContinuousCameraFrameRate(double targetFrameRateHz,
+                                        QString* reason = nullptr);
+    bool applyTrackingExposureAndFrameRate(const double targetExposureUs[2],
+                                           QString* reason = nullptr,
+                                           bool forceFrequencySwitch = false);
+    double currentTrackingFrameRateHz() const;
     bool startAlignmentMode(QString* reason = nullptr);
     void stopAlignmentMode();
     bool prepareAlignmentCamerasForPreview(QString* reason);
@@ -374,6 +449,7 @@ private:
                                QString* reason = nullptr,
                                RoiRect appliedRois[2] = nullptr);
     bool applyLiveFullFrameForRelocalization(QString* reason = nullptr);
+    bool restoreRoiTrackingFrequency(QString* reason = nullptr);
     void advanceLiveAcquisitionGeneration();
     void resetLiveFrameAcceptanceGates();
     bool validateAndCacheLiveRoiCapabilities(QString* reason = nullptr);
@@ -400,10 +476,58 @@ private:
     bool startFullFrameLocalizationPulse(QString* reason = nullptr);
     bool isFullFrameLocalizationPulseRunning() const;
     bool switchToRoiTrackingPulse(QString* reason = nullptr);
+    bool setLiveHardwareTriggerLine(const QString& inputLine,
+                                    QString* reason = nullptr);
+    bool beginResultSession(AcquisitionCsvSessionType sessionType);
+    bool ensureResultFileOpen();
+    void noteStarTrackingState(bool tracked,
+                                qint64 sourceTimestampMs,
+                                const QString& reason = QString());
+    void writeResultSessionEvent(const QString& recordType,
+                                 const QString& reason,
+                                 const QString& acquisitionState,
+                                 qint64 sourceTimestampMs,
+                                 std::uint32_t deviceStatus = 0u);
+    void writeSearchStartedEvent(const QString& reason, qint64 sourceTimestampMs);
+    void writeSearchEndedEvent(const QString& reason, qint64 sourceTimestampMs);
+    void writeSearchLifecycleEventsOnce(const QString& searchReason,
+                                        const QString& pauseReason,
+                                        qint64 sourceTimestampMs);
+    void writeHardwareErrorEvent(const QString& source,
+                                 int deviceIndex,
+                                 int errorCode,
+                                 const QString& operation,
+                                 const QString& detail,
+                                 bool recoverable,
+                                 qint64 sourceTimestampMs);
+    void writeAcquisitionPauseEvent(const QString& reason,
+                                    qint64 sourceTimestampMs,
+                                    std::uint32_t deviceStatus);
+    void writeAcquisitionResumeEvent(const QString& reason,
+                                     qint64 sourceTimestampMs,
+                                     std::uint32_t deviceStatus);
+    bool writeResultSettingsSnapshot(const AppConfig& config,
+                                     const QString& recordType,
+                                     const QString& settingsReason,
+                                     const QString& relativeFileName);
+    bool writeChangedResultSettingsSnapshot(const AppConfig& config,
+                                            const ConfigChangeSet& changes);
+    std::uint32_t currentDeviceStatusForResultLog(qint64 nowMs);
+    QDateTime nextResultRecordTimestamp(const QDateTime& candidate);
+    bool saveLiveFullFrameImage(int cameraIndex,
+                                const CameraFrame& packet,
+                                bool forceTrackingCooldownSave = false);
+    void armTrackingImageSaveAfterAutoExposureCooldown(qint64 cooldownUntilMs);
+    void clearTrackingImageSaveAfterAutoExposureCooldown();
     void initResultFile();
     void initDetailResultFile();
     void initSyncDiagnosticFile();
-    void closeResultFile();
+    void closeResultFile(ResultSessionEndReason reason = ResultSessionEndReason::ManualStop);
+    void closeResultSessionForHardwareError();
+    void logRateSwitchTiming(const RateSwitchTiming& timing,
+                             double oldRateHz,
+                             double newRateHz,
+                             const QString& mode);
     void saveResultRow(int frame);
     void saveDetailResultRows(int frame, const QVector<PairedCentroidDetail>& details);
     void flushPendingWrites();
@@ -424,12 +548,13 @@ private:
     bool stopLiveCapture();
     void updateCurrentRoi();
     void on1hzTick();
+    void verifyPendingFrequencySwitch();
     void evaluateAutoAcquisitionSchedule();
     void setAutoAcquisitionStatus(const QString& text,
                                   UiStatusLevel level,
                                   const QString& throttleKey = QString());
-    void stopAutoAcquisitionScanUntilNextInterval(const QString& reason,
-                                                  bool manualSelectionRequired);
+    void prepareAutoAcquisitionRelocalization(const QString& reason,
+                                              bool manualSelectionRequired);
     void noteManualAutoAcquisitionStopIfNeeded();
     void updateCameraInfo();
     void matchRoiTimeSlot();
@@ -437,9 +562,13 @@ private:
     void reportMeasurement();
     void handleAutoExposureSample(const AutoExposureFrameSample& sample);
     void resetAutoExposureState(bool applyInitialExposure = false);
+    void beginAutoExposureAdjustmentForAutoFocus(const QString& phase,
+                                                 int cameraMask);
+    void completeAutoExposureAdjustmentForAutoFocus(qint64 sourceTimestampMs);
     bool isAutoExposureRoiRelocalizationGraceActive(qint64 nowMs) const;
     AppConfig currentAppConfig() const;
     void applyStartupConfig(const AppConfig& config);
+    void shutdownForExit();
     void savePersistentSettings(const AppConfig& config, const ConfigChangeSet& changes);
     QString autoExposureStateName(AutoExposureState state) const;
     QString autoExposureStateShortText(AutoExposureState state) const;
@@ -459,11 +588,14 @@ private:
                                                        int exposureUs,
                                                        QString* maskPath,
                                                        QString* excessPath) const;
+    bool applyStarFindingExposure(QString* reason = nullptr);
     bool applyExposureAndHotPixelTemplate(int exposureUs, QString* reason = nullptr);
     bool applyExposureAndHotPixelTemplate(int cameraIndex, int exposureUs, QString* reason = nullptr);
     void refreshHotPixelTemplates();
     bool isSettingsApplyAllowed() const;
     bool canStartLiveCapture(QString* reason = nullptr) const;
+    bool ensureAutoAcquisitionCamerasReady(QString* reason = nullptr);
+    void closeAutoAcquisitionCameras();
     bool canConnectOrDisconnectCameras(QString* reason = nullptr) const;
     bool isPulseBoardResponseTimeout(const QString& reason) const;
     void setPulseBoardResponseTimeoutStatus(const QString& text,
@@ -514,10 +646,47 @@ private:
     bool m_connectingCameras = false;
     QString m_statusText = QStringLiteral("状态: 就绪");
     QString m_statusColor = QStringLiteral("#e0e0e0");
+    QVector<int> m_mainSplitterSizes;
+    bool m_mainSplitterLayoutPending = true;
+    bool m_mainSplitterStartupLayoutApplied = false;
 
     SettingsDialog* m_settingsDialog = nullptr;
     EafFocuserManager* m_focuserManager = nullptr;
     FocuserControlWidget* m_focuserControlWidget = nullptr;
+    AutoFocusConfig m_autoFocusConfig;
+    std::optional<AutoFocusConfig> m_pendingAutoFocusConfig;
+    std::unique_ptr<AutoFocusController> m_autoFocusController;
+    AutoFocusLogWriter m_autoFocusLogWriter;
+    AutoFocusCompletionBarrier m_autoFocusCompletionBarrier;
+    int m_autoFocusRunSequence[2] = {0, 0};
+    bool m_autoFocusRunActive[2] = {false, false};
+    int m_autoFocusPendingDirectionStep[2] = {0, 0};
+    bool m_autoFocusMainRecordActive[2] = {false, false};
+    bool m_autoFocusAwaitingPreExposure[2] = {false, false};
+    bool m_autoFocusPreExposureComplete[2] = {false, false};
+    bool m_autoFocusAwaitingTimeoutStop[2] = {false, false};
+    bool m_autoFocusTimeoutStopCommandFinished[2] = {false, false};
+    AutoFocusAction m_deferredAutoFocusAction[2];
+    QString m_deferredAutoFocusContext[2];
+    bool m_autoFocusReferenceCalibrationStarted[2] = {false, false};
+    bool m_autoFocusStartupPending[2] = {false, false};
+    bool m_autoFocusStartupTriggered[2] = {false, false};
+    AutoFocusSample m_latestAutoFocusSample[2];
+    bool m_hasLatestAutoFocusSample[2] = {false, false};
+    AutoFocusRealtimeMetricsSampler m_autoFocusRealtimeMetricsSampler;
+    bool m_autoFocusFocuserOpened[2] = {false, false};
+    bool m_autoFocusFocuserMoving[2] = {false, false};
+    int m_autoFocusFocuserPosition[2] = {0, 0};
+    bool m_autoFocusManualLocked[2] = {false, false};
+    AutoAcquisitionPreFocus m_autoAcquisitionPreFocus;
+    bool m_autoAcquisitionPreFocusMoveIssued[2] = {false, false};
+    bool m_autoAcquisitionPreFocusOpenRequestedByConfig[2] = {false, false};
+    bool m_autoFocusSensorOutageNotified = false;
+    bool m_autoFocusSensorHadValidData = false;
+    qint64 m_autoFocusSensorAlertNotBeforeMs = 0;
+    static constexpr qint64 kAutoFocusSensorStartupGraceMs = 5'000;
+    qint64 m_autoFocusReconnectAfterMs[2] = {-1, -1};
+    QLabel* m_lblAutoFocusCam[2] = {nullptr, nullptr};
     EnvironmentSensorManager* m_environmentSensor = nullptr;
     EnvironmentSensorData m_latestEnvironment;
     EnvironmentSensorConfig m_environmentSensorConfig;
@@ -526,8 +695,6 @@ private:
     QLabel* m_lblStatusFrames = nullptr;
     QLabel* m_lblFullFrameCam1 = nullptr;
     QLabel* m_lblFullFrameCam2 = nullptr;
-    QLabel* m_lblFullFrameThresholdCam1 = nullptr;
-    QLabel* m_lblFullFrameThresholdCam2 = nullptr;
     QLabel* m_lblRoiThresholdCam1 = nullptr;
     QLabel* m_lblRoiThresholdCam2 = nullptr;
     QLabel* m_lblAlignmentSolveCam1 = nullptr;
@@ -541,6 +708,9 @@ private:
     RoiStarCanvas* m_cam2RoiCanvas = nullptr;
     ChartWidget* m_r0Chart = nullptr;
     ChartWidget* m_seeingChart = nullptr;
+    PsdChartWidget* m_longitudinalPsdChart = nullptr;
+    PsdChartWidget* m_transversePsdChart = nullptr;
+    QLabel* m_lblPsdSummary = nullptr;
 
     QString m_dataPath = "D:/C-DIMM/data";
     int m_saveInterval = 1;
@@ -554,6 +724,25 @@ private:
     QString m_detailResultFilePath;
     QString m_syncDiagnosticFilePath;
     CaptureState m_resultFileState = CaptureState::Idle;
+    AcquisitionCsvSessionType m_resultSessionType = AcquisitionCsvSessionType::Manual;
+    QString m_resultSessionId;
+    QDateTime m_resultSessionStartedAt;
+    bool m_resultSessionActive = false;
+    int m_resultSettingsSnapshotSequence = 0;
+    qint64 m_lastResultRecordTimestampMs = -1;
+    StarTrackingState m_starTrackingState = StarTrackingState::Unknown;
+    SearchEventGate m_searchEventGate;
+    bool m_captureStopRequested = false;
+    int m_searchAttempt = 0;
+    qint64 m_searchAttemptStartedMs = -1;
+    qint64 lastSearchImageSavedMs[2] = {-1, -1};
+    qint64 lastTrackingImageSavedMs[2] = {-1, -1};
+    qint64 m_lastPeriodicTrackingRoiImageSavedMs[2] = {-1, -1};
+    quint64 lastSearchImageSavedFrameId[2] = {0, 0};
+    quint64 lastTrackingImageSavedFrameId[2] = {0, 0};
+    bool m_trackingImageSaveOnNextRoiFrame[2] = {false, false};
+    qint64 m_trackingImageSaveNextRetryMs[2] = {-1, -1};
+    qint64 m_trackingImageSaveCooldownUntilMs = -1;
     QTimer* m_fileFlushTimer = nullptr;
     quint64 m_diagnosticLastCapturedFrameId[2] = {0, 0};
     quint64 m_diagnosticCapturedPacketCount[2] = {0, 0};
@@ -567,6 +756,8 @@ private:
     double m_cameraExposureUs[2] = {1000.0, 1000.0};
     double m_configGainDb = 10.0;
     double m_configContinuousFrameRateHz = 200.0;
+    double m_activeContinuousFrameRateHz = 200.0;
+    double m_activeTriggerFrequencyHz = 200.0;
     double m_lastContinuousFrameRateReadback[2] = {0.0, 0.0};
     qint64 m_liveFrameAcceptAfterMs = -1;
     quint64 m_lastAcceptedLiveFrameId[2] = {0, 0};
@@ -576,7 +767,7 @@ private:
     quint64 m_roiUpdateCount = 0;
     qint64 m_lastRoiUpdateMs = -1;
     QString m_lastRoiUpdateReason;
-    int m_configTriggerMode = 0;
+    int m_configTriggerMode = 1;
     bool m_hotPixelTemplatesEnabled = false;
     QString m_hotPixelCamera0MaskPath;
     QString m_hotPixelCamera0ExcessPath;
@@ -592,6 +783,19 @@ private:
     int m_roiRecenteringRequiredFrames = 5;
     qint64 m_roiRecenteringCooldownMs = 3000;
     double m_roiRecenteringMinimumShiftPx = 8.0;
+    qint64 m_trackingImageIntervalMs = 5000;
+    bool m_rateSwitchInProgress = false;
+    bool m_rateSwitchTimingPending = false;
+    qint64 m_rateSwitchStartedMs = -1;
+    qint64 m_rateSwitchPauseMs = 0;
+    qint64 m_rateSwitchHardwareApplyMs = 0;
+    double m_rateSwitchOldRateHz = 0.0;
+    double m_rateSwitchNewRateHz = 0.0;
+    bool m_frequencyVerificationPending = false;
+    bool m_frequencyVerificationRollbackInProgress = false;
+    qint64 m_frequencyVerificationNotBeforeMs = -1;
+    double m_frequencyVerificationTargetHz = 0.0;
+    double m_frequencyVerificationPreviousExposureUs[2] = {0.0, 0.0};
     bool m_pulseGeneratorEnabled = false;
     QString m_pulseGeneratorPort = QStringLiteral("COM9");
     int m_pulseGeneratorBaudRate = 19200;
@@ -607,6 +811,7 @@ private:
     PolarisTrajectory::RoiTrajectoryAccumulator m_actualRoiTracks[kCameraCount];
     bool m_autoAcquisitionCommandInProgress = false;
     bool m_autoAcquisitionStartedCurrentRun = false;
+    bool m_autoAcquisitionCameraLifecycleActive = false;
     QString m_autoAcquisitionActiveWindowId;
     QString m_autoAcquisitionSuppressedWindowId;
     qint64 m_lastAutoAcquisitionAttemptMs = -1;
@@ -644,6 +849,7 @@ private:
     static constexpr int kRoiTrackingFirstFrameTimeoutMs = 3000;
     static constexpr int kLiveStartupRetryDelayMs = 3000;
     static constexpr int kLiveStartupMaxImmediateRetries = 3;
+    static constexpr qint64 kTrackingImageSaveRetryIntervalMs = 5000;
 
     AutoExposureConfig m_autoExposureConfig;
     AutoExposureController m_autoExposureController;
@@ -658,6 +864,9 @@ private:
     qint64 m_lastAutoExposureAdjustMs = -1;
     quint64 m_autoExposureFramesSinceAdjust = 0;
     bool m_autoExposureAdjustmentSessionActive = true;
+    bool m_autoExposureFocusAdjustmentActive = false;
+    qint64 m_autoExposureFocusAdjustmentStartedMs = -1;
+    bool m_autoExposureResultRecordActive = false;
     qint64 m_autoExposureCooldownRemainingMs = 0;
     static constexpr int kAutoExposureRoiRelocalizationGraceMs = 3000;
     double m_latestAutoExposurePeakDn[2] = {0.0, 0.0};
@@ -695,6 +904,7 @@ private:
 
     CommManager* m_commManager = nullptr;
     PulseGeneratorManager* m_pulseGenerator = nullptr;
+    bool m_shutdownCompleted = false;
     QTimer* m_reportTimer = nullptr;
     bool m_reporting = false;
     uint32_t m_startTimeMs = 0;

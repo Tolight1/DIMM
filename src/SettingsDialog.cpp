@@ -2,6 +2,7 @@
 #include "AppConfig.h"
 #include "ConfigApplicationController.h"
 #include "ConfigValidator.h"
+#include "ExposureFrameRateRules.h"
 #include "InitialStarDetectionConfig.h"
 #include "PathUtils.h"
 #include "SettingsApplyPolicy.h"
@@ -70,6 +71,7 @@ bool sameCameraConfig(const CameraConfig& lhs, const CameraConfig& rhs)
 bool sameAutoExposureConfig(const AutoExposureConfig& lhs, const AutoExposureConfig& rhs)
 {
     return lhs.enabled == rhs.enabled &&
+           lhs.exposureFrequencySwitchEnabled == rhs.exposureFrequencySwitchEnabled &&
            lhs.trendConflictEnabled == rhs.trendConflictEnabled &&
            sameDouble(lhs.targetPeakLowDn, rhs.targetPeakLowDn) &&
            sameDouble(lhs.targetPeakHighDn, rhs.targetPeakHighDn) &&
@@ -78,6 +80,7 @@ bool sameAutoExposureConfig(const AutoExposureConfig& lhs, const AutoExposureCon
            lhs.saturatedPixelCount == rhs.saturatedPixelCount &&
            sameDouble(lhs.darkSnrWarning, rhs.darkSnrWarning) &&
            sameDouble(lhs.darkSnrCritical, rhs.darkSnrCritical) &&
+           sameDouble(lhs.trackingLostSnr, rhs.trackingLostSnr) &&
            sameDouble(lhs.minValidCentroidRatio, rhs.minValidCentroidRatio) &&
            sameDouble(lhs.starLostValidRatio, rhs.starLostValidRatio) &&
            sameDouble(lhs.brightFrameRatioThreshold, rhs.brightFrameRatioThreshold) &&
@@ -93,6 +96,7 @@ bool sameAutoExposureConfig(const AutoExposureConfig& lhs, const AutoExposureCon
            lhs.trendConflictPersistenceSec == rhs.trendConflictPersistenceSec &&
            sameDouble(lhs.minExposureUs, rhs.minExposureUs) &&
            sameDouble(lhs.maxExposureUs, rhs.maxExposureUs) &&
+           lhs.exposureFrameRateWindows == rhs.exposureFrameRateWindows &&
            sameDouble(lhs.maxExposureChangeRatioUp, rhs.maxExposureChangeRatioUp) &&
            sameDouble(lhs.maxExposureChangeRatioDown, rhs.maxExposureChangeRatioDown) &&
            sameDouble(lhs.cameraAgreementRatio, rhs.cameraAgreementRatio) &&
@@ -107,14 +111,32 @@ bool sameAutoExposureConfig(const AutoExposureConfig& lhs, const AutoExposureCon
            sameDouble(lhs.minExposureChangeRatio, rhs.minExposureChangeRatio);
 }
 
+bool samePsdAnalysisConfig(const CdimPsdAnalysisConfig& lhs,
+                           const CdimPsdAnalysisConfig& rhs)
+{
+    return lhs.enabled == rhs.enabled &&
+           lhs.psdMode == rhs.psdMode &&
+           lhs.noiseDetectionMode == rhs.noiseDetectionMode &&
+           lhs.welchSegmentLength == rhs.welchSegmentLength &&
+           sameDouble(lhs.welchOverlap, rhs.welchOverlap) &&
+           lhs.nfft == rhs.nfft &&
+           sameDouble(lhs.noiseCandidateStartNyquist, rhs.noiseCandidateStartNyquist) &&
+           sameDouble(lhs.noiseCandidateEndNyquist, rhs.noiseCandidateEndNyquist) &&
+           lhs.minimumNoiseBandBins == rhs.minimumNoiseBandBins &&
+           sameDouble(lhs.minimumNoiseBandNyquistWidth, rhs.minimumNoiseBandNyquistWidth) &&
+           sameDouble(lhs.fitNoiseDominanceKappa, rhs.fitNoiseDominanceKappa);
+}
+
 bool sameProcessingConfig(const ProcessingConfig& lhs, const ProcessingConfig& rhs)
 {
-    return lhs.backgroundKernelSize == rhs.backgroundKernelSize &&
-           sameDouble(lhs.backgroundSigmaMultiplier, rhs.backgroundSigmaMultiplier) &&
+    return lhs.backgroundThresholdClipIterations == rhs.backgroundThresholdClipIterations &&
+           sameDouble(lhs.backgroundThresholdClipSigma, rhs.backgroundThresholdClipSigma) &&
+           sameDouble(lhs.backgroundThresholdSigmaMultiplier, rhs.backgroundThresholdSigmaMultiplier) &&
            lhs.centroidMode == rhs.centroidMode &&
            lhs.peakKernelRadiusPx == rhs.peakKernelRadiusPx &&
            sameDouble(lhs.strongHotPixelExcessDn, rhs.strongHotPixelExcessDn) &&
-           lhs.r0HistoryWindowFrames == rhs.r0HistoryWindowFrames;
+           lhs.r0HistoryWindowFrames == rhs.r0HistoryWindowFrames &&
+           samePsdAnalysisConfig(lhs.psdAnalysis, rhs.psdAnalysis);
 }
 
 bool sameRoiRecenteringConfig(const RoiRecenteringConfig& lhs, const RoiRecenteringConfig& rhs)
@@ -153,7 +175,8 @@ bool sameOpticalConfig(const OpticalConfig& lhs, const OpticalConfig& rhs)
            sameDouble(lhs.focalLengthCm, rhs.focalLengthCm) &&
            sameDouble(lhs.zenithAngleDeg, rhs.zenithAngleDeg) &&
            sameDouble(lhs.wavelengthNm, rhs.wavelengthNm) &&
-           sameDouble(lhs.pixelSizeUm, rhs.pixelSizeUm);
+           sameDouble(lhs.pixelSizeUm, rhs.pixelSizeUm) &&
+           sameDouble(lhs.outerScaleM, rhs.outerScaleM);
 }
 
 bool sameAlignmentConfig(const AlignmentConfig& lhs, const AlignmentConfig& rhs)
@@ -223,6 +246,8 @@ bool sameAutoAcquisitionConfig(const AutoAcquisitionConfig& lhs,
            lhs.startOffsetMinutesAfterSunset == rhs.startOffsetMinutesAfterSunset &&
            lhs.stopOffsetMinutesBeforeSunrise == rhs.stopOffsetMinutesBeforeSunrise &&
            lhs.recoveryScanIntervalMinutes == rhs.recoveryScanIntervalMinutes &&
+           lhs.searchMode == rhs.searchMode &&
+           lhs.starFindingAttemptDurationSec == rhs.starFindingAttemptDurationSec &&
            lhs.testTimeOverrideEnabled == rhs.testTimeOverrideEnabled &&
            lhs.testStartTime == rhs.testStartTime &&
            lhs.testStopTime == rhs.testStopTime;
@@ -370,8 +395,14 @@ SettingsDialog::SettingsDialog(QWidget* parent)
 
     autoExpMinEdit = new QLineEdit(QStringLiteral("500"));
     autoExpRangeLayout->addRow(QStringLiteral("最小曝光(μs):"), autoExpMinEdit);
-    autoExpMaxEdit = new QLineEdit(QStringLiteral("20000"));
+    autoExpMaxEdit = new QLineEdit(QStringLiteral("9000"));
     autoExpRangeLayout->addRow(QStringLiteral("最大曝光(μs):"), autoExpMaxEdit);
+    autoExpFrequencyWindowsEdit = new QLineEdit(QStringLiteral("1-4:200;4-9:100"));
+    autoExpRangeLayout->addRow(QStringLiteral("ROI 曝光区间-频率 (ms:Hz):"),
+                               autoExpFrequencyWindowsEdit);
+    autoExpFrequencySwitchCheck = new QCheckBox(QStringLiteral("允许曝光调整修改触发频率"));
+    autoExpFrequencySwitchCheck->setChecked(true);
+    autoExpRangeLayout->addRow(autoExpFrequencySwitchCheck);
     autoExpMaxChangeUpEdit = new QLineEdit(QStringLiteral("1.30"));
     autoExpRangeLayout->addRow(QStringLiteral("单次调亮比例上限:"), autoExpMaxChangeUpEdit);
     autoExpMaxChangeDownEdit = new QLineEdit(QStringLiteral("0.70"));
@@ -411,6 +442,8 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     autoExpDarkWeakLayout->addRow(QStringLiteral("偏暗 SNR 报警:"), autoExpDarkSnrWarningEdit);
     autoExpDarkSnrCriticalEdit = new QLineEdit(QStringLiteral("5.0"));
     autoExpDarkWeakLayout->addRow(QStringLiteral("严重偏暗 SNR:"), autoExpDarkSnrCriticalEdit);
+    autoExpTrackingLostSnrEdit = new QLineEdit(QStringLiteral("5.0"));
+    autoExpDarkWeakLayout->addRow(QStringLiteral("跟踪失星 SNR:"), autoExpTrackingLostSnrEdit);
     autoExpMinValidCentroidRatioEdit = new QLineEdit(QStringLiteral("0.50"));
     autoExpDarkWeakLayout->addRow(QStringLiteral("最小有效质心比例"), autoExpMinValidCentroidRatioEdit);
     autoExpStarLostValidRatioEdit = new QLineEdit(QStringLiteral("0.10"));
@@ -637,25 +670,26 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     centroidLayout->setHorizontalSpacing(16);
     centroidLayout->setVerticalSpacing(10);
     centroidModeCombo = new QComboBox();
-    centroidModeCombo->addItem(QStringLiteral("背景阈值重心"), 0);
-    centroidModeCombo->addItem(QStringLiteral("Otsu 连通域 + 小核质心"), 1);
+    centroidModeCombo->addItem(QStringLiteral("背景阈值 + 小核质心"), 0);
+    centroidModeCombo->addItem(QStringLiteral("背景扣除全 ROI 质心"), 1);
     centroidLayout->addRow(QStringLiteral("质心处理模式:"), centroidModeCombo);
     procLayout->addWidget(centroidGroup);
 
-    auto* preprocessGroup = new QGroupBox(QStringLiteral("背景阈值重心参数"));
+    auto* preprocessGroup = new QGroupBox(QStringLiteral("背景噪声阈值估计参数"));
     auto* preprocessLayout = new QGridLayout(preprocessGroup);
-    auto* backgroundKernelLabel = new QLabel(QStringLiteral("背景核大小:"));
-    preprocessLayout->addWidget(backgroundKernelLabel, 0, 0);
-    procKernelSize = new QLineEdit(QStringLiteral("5"));
-    preprocessLayout->addWidget(procKernelSize, 0, 1);
-    auto* backgroundSigmaLabel = new QLabel(QStringLiteral("背景标准差倍数:"));
-    preprocessLayout->addWidget(backgroundSigmaLabel, 1, 0);
-    procSigma = new QLineEdit(QStringLiteral("4.0"));
-    preprocessLayout->addWidget(procSigma, 1, 1);
+    preprocessLayout->addWidget(new QLabel(QStringLiteral("Sigma-clipping 迭代次数:")), 0, 0);
+    backgroundThresholdClipIterationsEdit = new QLineEdit(QStringLiteral("3"));
+    preprocessLayout->addWidget(backgroundThresholdClipIterationsEdit, 0, 1);
+    preprocessLayout->addWidget(new QLabel(QStringLiteral("Sigma-clipping 方差倍数:")), 1, 0);
+    backgroundThresholdClipSigmaEdit = new QLineEdit(QStringLiteral("3.0"));
+    preprocessLayout->addWidget(backgroundThresholdClipSigmaEdit, 1, 1);
+    preprocessLayout->addWidget(new QLabel(QStringLiteral("最终阈值噪声倍数:")), 2, 0);
+    backgroundThresholdSigmaMultiplierEdit = new QLineEdit(QStringLiteral("1.0"));
+    preprocessLayout->addWidget(backgroundThresholdSigmaMultiplierEdit, 2, 1);
     auto* centroidPipelineHint =
-        new QLabel(QStringLiteral("ROI质心流程: 热像素修正 -> Otsu/阈值分割 -> 连通域选星 -> 质心计算小核加权。"));
+        new QLabel(QStringLiteral("模式0：全 ROI Sigma-clipping 阈值 -> 连通域 -> 小核质心；模式1：全 ROI 扣除阈值后直接质心。"));
     centroidPipelineHint->setWordWrap(true);
-    preprocessLayout->addWidget(centroidPipelineHint, 2, 0, 1, 2);
+    preprocessLayout->addWidget(centroidPipelineHint, 3, 0, 1, 2);
     procLayout->addWidget(preprocessGroup);
 
     auto* atmosphereGroup = new QGroupBox(QStringLiteral("大气参数"));
@@ -667,6 +701,121 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     r0HistoryWindowFramesEdit = new QLineEdit(QStringLiteral("5000"));
     atmosphereLayout->addRow(QStringLiteral("r0 计算窗口（帧）:"), r0HistoryWindowFramesEdit);
     procLayout->addWidget(atmosphereGroup);
+
+    auto* psdGroup = new QGroupBox(QStringLiteral("方差去噪与 PSD 分析"));
+    auto* psdGroupLayout = new QVBoxLayout(psdGroup);
+    psdEnabledCheck = new QCheckBox(QStringLiteral("启用 PSD 方差去噪"));
+    psdEnabledCheck->setChecked(true);
+    psdGroupLayout->addWidget(psdEnabledCheck);
+    auto* psdControlsPanel = new QWidget(psdGroup);
+    auto* psdLayout = new QGridLayout(psdControlsPanel);
+    psdModeCombo = new QComboBox();
+    psdModeCombo->addItem(QStringLiteral("Welch（推荐）"),
+                          static_cast<int>(CdimPsdMode::Welch));
+    psdModeCombo->addItem(QStringLiteral("Periodogram"),
+                          static_cast<int>(CdimPsdMode::Periodogram));
+    psdNoiseDetectionModeCombo = new QComboBox();
+    psdNoiseDetectionModeCombo->addItem(QStringLiteral("自动平坦区（推荐）"),
+                                        static_cast<int>(CdimNoiseDetectionMode::AutoFlatRegion));
+    psdNoiseDetectionModeCombo->addItem(QStringLiteral("全谱拟合 Af^-β + N0"),
+                                        static_cast<int>(CdimNoiseDetectionMode::FullSpectrumFit));
+    psdWelchSegmentLengthEdit = new QLineEdit(QStringLiteral("400"));
+    psdWelchOverlapEdit = new QLineEdit(QStringLiteral("0.50"));
+    psdNfftEdit = new QLineEdit(QStringLiteral("400"));
+    psdNoiseCandidateStartEdit = new QLineEdit(QStringLiteral("0.60"));
+    psdNoiseCandidateEndEdit = new QLineEdit(QStringLiteral("0.90"));
+    psdMinimumNoiseBandBinsEdit = new QLineEdit(QStringLiteral("16"));
+    psdMinimumNoiseBandWidthEdit = new QLineEdit(QStringLiteral("0.05"));
+    psdFitNoiseDominanceKappaEdit = new QLineEdit(QStringLiteral("1.0"));
+    psdLayout->addWidget(new QLabel(QStringLiteral("PSD 方法:")), 0, 0);
+    psdLayout->addWidget(psdModeCombo, 0, 1);
+    psdLayout->addWidget(new QLabel(QStringLiteral("噪声识别模式:")), 0, 2);
+    psdLayout->addWidget(psdNoiseDetectionModeCombo, 0, 3);
+    psdWelchSegmentLengthLabel = new QLabel(QStringLiteral("Welch 分段 N:"));
+    psdLayout->addWidget(psdWelchSegmentLengthLabel, 1, 0);
+    psdLayout->addWidget(psdWelchSegmentLengthEdit, 1, 1);
+    psdWelchOverlapLabel = new QLabel(QStringLiteral("重叠比例:"));
+    psdLayout->addWidget(psdWelchOverlapLabel, 1, 2);
+    psdLayout->addWidget(psdWelchOverlapEdit, 1, 3);
+    psdLayout->addWidget(new QLabel(QStringLiteral("NFFT（0=自动 2^n）:")), 2, 0);
+    psdLayout->addWidget(psdNfftEdit, 2, 1);
+    psdLayout->addWidget(new QLabel(QStringLiteral("候选区起点/终点（Nyquist）:")), 2, 2);
+    auto* psdCandidateRange = new QWidget();
+    auto* psdCandidateRangeLayout = new QHBoxLayout(psdCandidateRange);
+    psdCandidateRangeLayout->setContentsMargins(0, 0, 0, 0);
+    psdCandidateRangeLayout->addWidget(psdNoiseCandidateStartEdit);
+    psdCandidateRangeLayout->addWidget(new QLabel(QStringLiteral("至")));
+    psdCandidateRangeLayout->addWidget(psdNoiseCandidateEndEdit);
+    psdLayout->addWidget(psdCandidateRange, 2, 3);
+    psdLayout->addWidget(new QLabel(QStringLiteral("最小噪声频点数:")), 3, 0);
+    psdLayout->addWidget(psdMinimumNoiseBandBinsEdit, 3, 1);
+    psdLayout->addWidget(new QLabel(QStringLiteral("最小频带宽度（Nyquist）:")), 3, 2);
+    psdLayout->addWidget(psdMinimumNoiseBandWidthEdit, 3, 3);
+    psdFitNoiseDominanceKappaLabel = new QLabel(QStringLiteral("拟合噪声主导系数 κ:"));
+    psdLayout->addWidget(psdFitNoiseDominanceKappaLabel, 4, 0);
+    psdLayout->addWidget(psdFitNoiseDominanceKappaEdit, 4, 1);
+    auto* psdHint = new QLabel(QStringLiteral(
+        "两种质心模式均先生成双相机差分质心坐标序列，再由此处统一进行 PSD 分析；"
+        "先用相机时间戳估算采样率，缺失时回退配置帧率。默认在 Nyquist 的 0.60–0.90 区间自动找平坦噪声区。"));
+    psdHint->setWordWrap(true);
+    psdLayout->addWidget(psdHint, 5, 0, 1, 4);
+    psdGroupLayout->addWidget(psdControlsPanel);
+    procLayout->addWidget(psdGroup);
+
+    const auto updatePsdModeControls = [this](int index) {
+        const bool isWelch = psdModeCombo &&
+                             psdModeCombo->itemData(index).toInt()
+                                 == static_cast<int>(CdimPsdMode::Welch);
+        if (psdWelchSegmentLengthLabel) {
+            psdWelchSegmentLengthLabel->setEnabled(isWelch);
+        }
+        if (psdWelchSegmentLengthEdit) {
+            psdWelchSegmentLengthEdit->setEnabled(isWelch);
+        }
+        if (psdWelchOverlapLabel) {
+            psdWelchOverlapLabel->setEnabled(isWelch);
+        }
+        if (psdWelchOverlapEdit) {
+            psdWelchOverlapEdit->setEnabled(isWelch);
+        }
+    };
+    connect(psdModeCombo,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this,
+            updatePsdModeControls);
+    updatePsdModeControls(psdModeCombo->currentIndex());
+
+    const auto updatePsdNoiseModeControls = [this](int index) {
+        const bool isFullSpectrumFit =
+            psdNoiseDetectionModeCombo &&
+            psdNoiseDetectionModeCombo->itemData(index).toInt()
+                == static_cast<int>(CdimNoiseDetectionMode::FullSpectrumFit);
+        if (psdFitNoiseDominanceKappaLabel) {
+            psdFitNoiseDominanceKappaLabel->setEnabled(isFullSpectrumFit);
+        }
+        if (psdFitNoiseDominanceKappaEdit) {
+            psdFitNoiseDominanceKappaEdit->setEnabled(isFullSpectrumFit);
+        }
+    };
+    connect(psdNoiseDetectionModeCombo,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this,
+            updatePsdNoiseModeControls);
+    updatePsdNoiseModeControls(psdNoiseDetectionModeCombo->currentIndex());
+
+    const auto updatePsdEnabledControls =
+        [psdControlsPanel, this, updatePsdModeControls, updatePsdNoiseModeControls]() {
+        const bool enabled = psdEnabledCheck && psdEnabledCheck->isChecked();
+        psdControlsPanel->setEnabled(enabled);
+        if (psdModeCombo) {
+            updatePsdModeControls(psdModeCombo->currentIndex());
+        }
+        if (psdNoiseDetectionModeCombo) {
+            updatePsdNoiseModeControls(psdNoiseDetectionModeCombo->currentIndex());
+        }
+    };
+    connect(psdEnabledCheck, &QCheckBox::toggled, this, updatePsdEnabledControls);
+    updatePsdEnabledControls();
 
     auto* peakKernelGroup = new QGroupBox(QStringLiteral("质心计算小核参数"));
     auto* peakKernelLayout = new QFormLayout(peakKernelGroup);
@@ -680,10 +829,10 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     peakKernelLayout->addRow(QStringLiteral("强固定热像素阈值(DN):"), strongHotPixelExcessEdit);
     procLayout->addWidget(peakKernelGroup);
 
-    const auto updateCentroidModeControls = [preprocessGroup, peakKernelGroup](int modeIndex) {
-        const bool peakKernelMode = modeIndex == 1;
-        preprocessGroup->setEnabled(!peakKernelMode);
-        peakKernelGroup->setEnabled(peakKernelMode);
+    const auto updateCentroidModeControls = [preprocessGroup, peakKernelGroup, this](int modeIndex) {
+        const int mode = centroidModeCombo->itemData(modeIndex).toInt();
+        preprocessGroup->setEnabled(true);
+        peakKernelGroup->setEnabled(mode == 0);
     };
     connect(centroidModeCombo,
             QOverload<int>::of(&QComboBox::currentIndexChanged),
@@ -806,6 +955,9 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     opticsLayout->addWidget(new QLabel(QStringLiteral("天顶角 Z (deg):")), 4, 0);
     opticsZenith = new QLineEdit(QStringLiteral("49.6"));
     opticsLayout->addWidget(opticsZenith, 4, 1);
+    opticsLayout->addWidget(new QLabel(QStringLiteral("外尺度 L0 (m):")), 5, 0);
+    opticsOuterScale = new QLineEdit(QStringLiteral("20"));
+    opticsLayout->addWidget(opticsOuterScale, 5, 1);
     sysLayout->addWidget(opticsGroup);
 
     auto* detectorGroup = new QGroupBox(QStringLiteral("探测"));
@@ -941,8 +1093,13 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     autoAcquisitionForm->addRow(QStringLiteral("日出前停止(min):"), autoAcquisitionStopOffsetEdit);
 
     autoAcquisitionRecoveryScanIntervalEdit = new QLineEdit(QStringLiteral("20"));
-    autoAcquisitionForm->addRow(QStringLiteral("丢星/无星扫描间隔(min):"),
+    autoAcquisitionForm->addRow(QStringLiteral("找星图像保存周期(min):"),
                                 autoAcquisitionRecoveryScanIntervalEdit);
+    autoAcquisitionForm->addRow(QStringLiteral("找星模式:"),
+                                new QLabel(QStringLiteral("连续搜索")));
+    autoAcquisitionAttemptDurationEdit = new QLineEdit(QStringLiteral("15"));
+    autoAcquisitionForm->addRow(QStringLiteral("单次找星时长(s):"),
+                                autoAcquisitionAttemptDurationEdit);
 
     autoAcquisitionTestOverrideCheck = new QCheckBox(QStringLiteral("启用测试时间"));
     autoAcquisitionForm->addRow(autoAcquisitionTestOverrideCheck);
@@ -1327,6 +1484,9 @@ void SettingsDialog::setCommittedConfig(const AppConfig& config)
 {
     m_committedConfig = config;
     m_hasCommittedConfig = true;
+    if (psdEnabledCheck) {
+        psdEnabledCheck->setChecked(config.processing.psdAnalysis.enabled);
+    }
     m_committedPulseFrequencyHz = config.pulseGenerator.frequencyHz;
     m_committedPulseCount = config.pulseGenerator.pulseCount;
     m_committedPulseDutyPercent = config.pulseGenerator.dutyPercent;
@@ -1418,6 +1578,8 @@ bool SettingsDialog::applySettings()
 
     AutoExposureConfig autoExposureConfig;
     autoExposureConfig.enabled = autoExposureCheck && autoExposureCheck->isChecked();
+    autoExposureConfig.exposureFrequencySwitchEnabled =
+        autoExpFrequencySwitchCheck && autoExpFrequencySwitchCheck->isChecked();
     autoExposureConfig.trendConflictEnabled =
         autoExpTrendConflictCheck && autoExpTrendConflictCheck->isChecked();
 
@@ -1449,6 +1611,7 @@ bool SettingsDialog::applySettings()
         !readIntField(autoExpSaturatedPixelCountEdit, QStringLiteral("硬饱和像素数"), &autoExposureConfig.saturatedPixelCount) ||
         !readDoubleField(autoExpDarkSnrWarningEdit, QStringLiteral("偏暗 SNR 报警"), &autoExposureConfig.darkSnrWarning) ||
         !readDoubleField(autoExpDarkSnrCriticalEdit, QStringLiteral("严重偏暗 SNR"), &autoExposureConfig.darkSnrCritical) ||
+        !readDoubleField(autoExpTrackingLostSnrEdit, QStringLiteral("跟踪失星 SNR"), &autoExposureConfig.trackingLostSnr) ||
         !readDoubleField(autoExpMinValidCentroidRatioEdit, QStringLiteral("最小有效质心比"), &autoExposureConfig.minValidCentroidRatio) ||
         !readDoubleField(autoExpStarLostValidRatioEdit, QStringLiteral("丢星有效质心比例"), &autoExposureConfig.starLostValidRatio) ||
         !readDoubleField(autoExpBrightFrameRatioEdit, QStringLiteral("过亮帧比例阈"), &autoExposureConfig.brightFrameRatioThreshold) ||
@@ -1562,15 +1725,26 @@ bool SettingsDialog::applySettings()
     autoExposureConfig.darkRatio = autoExposureConfig.maxExposureChangeRatioUp;
     autoExposureConfig.brightRatio = autoExposureConfig.maxExposureChangeRatioDown;
 
-    const int kernelSize = procKernelSize->text().toInt(&ok);
-    if (!ok || kernelSize <= 0) {
-        showInvalid(QStringLiteral("背景核大小必须为正整数"));
+    const int clipIterations = backgroundThresholdClipIterationsEdit->text().toInt(&ok);
+    if (!ok || clipIterations < 0 || clipIterations > 20) {
+        showInvalid(QStringLiteral("Sigma-clipping 迭代次数必须在 0 到 20 之间"));
+        return false;
+    }
+    if (autoExposureConfig.trackingLostSnr <= 0.0) {
+        showInvalid(QStringLiteral("跟踪失星 SNR 必须大于 0"));
         return false;
     }
 
-    const double sigma = procSigma->text().toDouble(&ok);
-    if (!ok || sigma < 0.0) {
-        showInvalid(QStringLiteral("背景标准差倍数必须不小于 0"));
+    const double clipSigma = backgroundThresholdClipSigmaEdit->text().toDouble(&ok);
+    if (!ok || clipSigma <= 0.0 || clipSigma > 20.0) {
+        showInvalid(QStringLiteral("Sigma-clipping 方差倍数必须大于 0 且不超过 20"));
+        return false;
+    }
+
+    const double thresholdSigmaMultiplier =
+        backgroundThresholdSigmaMultiplierEdit->text().toDouble(&ok);
+    if (!ok || thresholdSigmaMultiplier < 0.0 || thresholdSigmaMultiplier > 20.0) {
+        showInvalid(QStringLiteral("最终阈值噪声倍数必须在 0 到 20 之间"));
         return false;
     }
 
@@ -1598,6 +1772,71 @@ bool SettingsDialog::applySettings()
         showInvalid(QStringLiteral("r0 计算窗口必须在 50 到 60000 帧之间"));
         return false;
     }
+
+    CdimPsdAnalysisConfig psdAnalysisConfig;
+    psdAnalysisConfig.enabled = psdEnabledCheck && psdEnabledCheck->isChecked();
+    const int psdMode = psdModeCombo
+                            ? psdModeCombo->currentData().toInt()
+                            : static_cast<int>(CdimPsdMode::Welch);
+    const int psdNoiseDetectionMode = psdNoiseDetectionModeCombo
+                                          ? psdNoiseDetectionModeCombo->currentData().toInt()
+                                          : static_cast<int>(CdimNoiseDetectionMode::AutoFlatRegion);
+    if ((psdMode != static_cast<int>(CdimPsdMode::Periodogram) &&
+         psdMode != static_cast<int>(CdimPsdMode::Welch)) ||
+        (psdNoiseDetectionMode != static_cast<int>(CdimNoiseDetectionMode::AutoFlatRegion) &&
+         psdNoiseDetectionMode != static_cast<int>(CdimNoiseDetectionMode::FullSpectrumFit))) {
+        showInvalid(QStringLiteral("PSD 模式参数无效，请重新选择"));
+        return false;
+    }
+    psdAnalysisConfig.psdMode = static_cast<CdimPsdMode>(psdMode);
+    psdAnalysisConfig.noiseDetectionMode =
+        static_cast<CdimNoiseDetectionMode>(psdNoiseDetectionMode);
+    if (!readIntField(psdWelchSegmentLengthEdit, QStringLiteral("Welch 分段长度"),
+                      &psdAnalysisConfig.welchSegmentLength) ||
+        !readDoubleField(psdWelchOverlapEdit, QStringLiteral("Welch 重叠比例"),
+                         &psdAnalysisConfig.welchOverlap) ||
+        !readIntField(psdNfftEdit, QStringLiteral("NFFT"), &psdAnalysisConfig.nfft) ||
+        !readDoubleField(psdNoiseCandidateStartEdit, QStringLiteral("噪声候选区起点"),
+                         &psdAnalysisConfig.noiseCandidateStartNyquist) ||
+        !readDoubleField(psdNoiseCandidateEndEdit, QStringLiteral("噪声候选区终点"),
+                         &psdAnalysisConfig.noiseCandidateEndNyquist) ||
+        !readIntField(psdMinimumNoiseBandBinsEdit, QStringLiteral("最小噪声频点数"),
+                      &psdAnalysisConfig.minimumNoiseBandBins) ||
+        !readDoubleField(psdMinimumNoiseBandWidthEdit, QStringLiteral("最小噪声频带宽度"),
+                         &psdAnalysisConfig.minimumNoiseBandNyquistWidth) ||
+        !readDoubleField(psdFitNoiseDominanceKappaEdit, QStringLiteral("拟合噪声主导系数"),
+                         &psdAnalysisConfig.fitNoiseDominanceKappa)) {
+        return false;
+    }
+    if (psdAnalysisConfig.welchSegmentLength < 2 ||
+        psdAnalysisConfig.welchSegmentLength > 60000 ||
+        psdAnalysisConfig.welchOverlap < 0.0 || psdAnalysisConfig.welchOverlap >= 1.0 ||
+        psdAnalysisConfig.nfft < 0 ||
+        (psdAnalysisConfig.nfft > 0 &&
+         psdAnalysisConfig.nfft < psdAnalysisConfig.welchSegmentLength) ||
+        psdAnalysisConfig.noiseCandidateStartNyquist < 0.0 ||
+        psdAnalysisConfig.noiseCandidateEndNyquist > 1.0 ||
+        psdAnalysisConfig.noiseCandidateStartNyquist >= psdAnalysisConfig.noiseCandidateEndNyquist ||
+        psdAnalysisConfig.minimumNoiseBandBins < 4 ||
+        psdAnalysisConfig.minimumNoiseBandBins > 60000 ||
+        psdAnalysisConfig.minimumNoiseBandNyquistWidth < 0.0 ||
+        psdAnalysisConfig.minimumNoiseBandNyquistWidth > 1.0 ||
+        psdAnalysisConfig.fitNoiseDominanceKappa <= 0.0) {
+        showInvalid(QStringLiteral("PSD 参数范围无效，请检查分段、NFFT、重叠比例和噪声频带设置"));
+        return false;
+    }
+    QVector<ExposureFrameRateWindow> exposureFrameRateWindows;
+    QString exposureFrameRateWindowsReason;
+    if (!autoExpFrequencyWindowsEdit ||
+        !parseExposureFrameRateWindows(autoExpFrequencyWindowsEdit->text(),
+                                       &exposureFrameRateWindows,
+                                       &exposureFrameRateWindowsReason)) {
+        showInvalid(QStringLiteral("ROI 曝光区间-频率无效：%1")
+                        .arg(exposureFrameRateWindowsReason));
+        return false;
+    }
+    autoExposureConfig.exposureFrameRateWindows =
+        formatExposureFrameRateWindows(exposureFrameRateWindows);
 
     const double roiRecenterThreshold = roiRecenterThresholdEdit->text().toDouble(&ok);
     if (!ok || roiRecenterThreshold < 1.0 || roiRecenterThreshold > 31.0) {
@@ -1721,6 +1960,12 @@ bool SettingsDialog::applySettings()
     const double zenithAngle = opticsZenith->text().toDouble(&ok);
     if (!ok || zenithAngle < 0.0 || zenithAngle >= 90.0) {
         showInvalid(QStringLiteral("天顶角 Z 必须在 0 到 90 度之间"));
+        return false;
+    }
+
+    const double outerScaleM = opticsOuterScale->text().toDouble(&ok);
+    if (!ok || !std::isfinite(outerScaleM) || outerScaleM <= 0.0 || outerScaleM > 1000.0) {
+        showInvalid(QStringLiteral("外尺度 L0 必须大于 0 且不超过 1000 m"));
         return false;
     }
 
@@ -1903,7 +2148,18 @@ bool SettingsDialog::applySettings()
     if (!ok ||
         autoAcquisitionConfig.recoveryScanIntervalMinutes < 1 ||
         autoAcquisitionConfig.recoveryScanIntervalMinutes > 120) {
-        showInvalid(QStringLiteral("丢星/无星扫描间隔必须在 1 到 120 分钟之间"));
+        showInvalid(QStringLiteral("找星图像保存周期必须在 1 到 120 分钟之间"));
+        return false;
+    }
+
+    autoAcquisitionConfig.searchMode = AutoAcquisitionSearchMode::Continuous;
+    autoAcquisitionConfig.starFindingAttemptDurationSec =
+        autoAcquisitionAttemptDurationEdit
+            ? autoAcquisitionAttemptDurationEdit->text().toInt(&ok)
+            : 15;
+    if (!ok || autoAcquisitionConfig.starFindingAttemptDurationSec < 1 ||
+        autoAcquisitionConfig.starFindingAttemptDurationSec > 600) {
+        showInvalid(QStringLiteral("单次找星时长必须在 1 到 600 秒之间"));
         return false;
     }
 
@@ -1929,14 +2185,16 @@ bool SettingsDialog::applySettings()
     const TriggerConfig triggerConfig{
         triggerContinuous && triggerContinuous->isChecked() ? 0 : 1
     };
-    const ProcessingConfig processingConfig{
-        kernelSize,
-        sigma,
+    ProcessingConfig processingConfig{
+        clipIterations,
+        clipSigma,
+        thresholdSigmaMultiplier,
         centroidMode,
         peakKernelRadius,
         strongHotPixelExcess,
         r0HistoryWindowFrames
     };
+    processingConfig.psdAnalysis = psdAnalysisConfig;
     const RoiRecenteringConfig roiRecenteringConfig{
         roiRecenterThreshold,
         roiRecenterRequiredFrames,
@@ -1966,7 +2224,8 @@ bool SettingsDialog::applySettings()
         focal,
         zenithAngle,
         wavelength,
-        pixelSize
+        pixelSize,
+        outerScaleM
     };
     const AlignmentConfig alignmentConfig{
         alignmentAutoRadiusCheck ? alignmentAutoRadiusCheck->isChecked() : true,
@@ -2064,10 +2323,19 @@ bool SettingsDialog::applySettings()
         configCallbacks.applyTriggerMode = nullptr;
     }
     configCallbacks.applyProcessing = onApplyProcessing;
-    if (!centroidModeCombo || !procKernelSize || !procSigma ||
+    if (!centroidModeCombo || !backgroundThresholdClipIterationsEdit ||
+        !backgroundThresholdClipSigmaEdit || !backgroundThresholdSigmaMultiplierEdit ||
         !peakKernelRadiusEdit || !strongHotPixelExcessEdit ||
         !r0HistoryWindowFramesEdit) {
         configCallbacks.applyProcessing = nullptr;
+    }
+    configCallbacks.applyPsdAnalysis = onApplyPsdAnalysis;
+    if (!psdEnabledCheck || !psdModeCombo || !psdNoiseDetectionModeCombo ||
+        !psdWelchSegmentLengthEdit || !psdWelchOverlapEdit || !psdNfftEdit ||
+        !psdNoiseCandidateStartEdit || !psdNoiseCandidateEndEdit ||
+        !psdMinimumNoiseBandBinsEdit || !psdMinimumNoiseBandWidthEdit ||
+        !psdFitNoiseDominanceKappaEdit) {
+        configCallbacks.applyPsdAnalysis = nullptr;
     }
     configCallbacks.applyRoiRecentering = onApplyRoiRecentering;
     configCallbacks.applyFullFrameStarDetection = onApplyFullFrameStarDetection;

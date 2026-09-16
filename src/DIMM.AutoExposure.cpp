@@ -13,6 +13,7 @@ void DIMM::handleAutoExposureSample(const AutoExposureFrameSample& sample)
     if (!m_autoExposureConfig.enabled ||
         m_captureState != CaptureState::Live ||
         m_liveStartupPhase != LiveStartupPhase::Tracking ||
+        m_rateSwitchInProgress ||
         sample.cameraIndex < 0 ||
         sample.cameraIndex >= 2) {
         return;
@@ -22,9 +23,43 @@ void DIMM::handleAutoExposureSample(const AutoExposureFrameSample& sample)
         static_cast<int>(std::lround(std::max(1.0, m_cameraExposureUs[0]))),
         static_cast<int>(std::lround(std::max(1.0, m_cameraExposureUs[1])))
     };
+    const bool previousAdjustmentSessionActive = m_autoExposureAdjustmentSessionActive;
     const AutoExposureState previousState = m_autoExposureState;
     AutoExposureDecision decision =
         m_autoExposureController.addSampleAndEvaluate(sample, currentExposure, sample.timestampMs);
+    const bool enteredAutoExposureCooldown =
+        previousAdjustmentSessionActive && !decision.adjustmentSessionActive;
+    const bool enteredAutoExposureSession =
+        !previousAdjustmentSessionActive && decision.adjustmentSessionActive;
+
+    if (enteredAutoExposureSession && !m_autoExposureFocusAdjustmentActive) {
+        m_autoExposureResultRecordActive = m_resultSessionActive && m_resultWriter.isOpen();
+        if (m_autoExposureResultRecordActive) {
+            writeResultSessionEvent(
+                QStringLiteral("AutoExposureStart"),
+                QStringLiteral("periodic_session_start; cooldown_elapsed"),
+                QStringLiteral("Tracking"),
+                sample.timestampMs);
+        }
+    }
+
+    const auto finishResultRecord = [this, &currentExposure, &sample]() {
+        if (m_autoExposureFocusAdjustmentActive) {
+            completeAutoExposureAdjustmentForAutoFocus(sample.timestampMs);
+            return;
+        }
+        if (!m_autoExposureResultRecordActive) {
+            return;
+        }
+        writeResultSessionEvent(
+            QStringLiteral("AutoExposureEnd"),
+            QStringLiteral("periodic_session_complete; exposureA=%1; exposureB=%2")
+                .arg(currentExposure[0])
+                .arg(currentExposure[1]),
+            QStringLiteral("Tracking"),
+            sample.timestampMs);
+        m_autoExposureResultRecordActive = false;
+    };
 
     m_autoExposureState = decision.state;
     m_autoExposureReason = decision.reason;
@@ -47,6 +82,21 @@ void DIMM::handleAutoExposureSample(const AutoExposureFrameSample& sample)
             m_cameraAutoExposureState[i] = decision.state;
         }
     }
+    if (m_autoExposureFocusAdjustmentActive) {
+        for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+            if (!shouldReleaseAutoFocusPreExposure(
+                    m_autoFocusAwaitingPreExposure[cameraIndex],
+                    m_cameraAutoExposureState[cameraIndex],
+                    m_hasLatestAutoFocusSample[cameraIndex],
+                    m_autoExposureFocusAdjustmentStartedMs,
+                    sample.timestampMs,
+                    m_autoExposureConfig.sampleWindowSec)) {
+                continue;
+            }
+            completeAutoExposureAdjustmentForAutoFocus(sample.timestampMs);
+            break;
+        }
+    }
     if (m_autoExposureFramesSinceAdjust < std::numeric_limits<quint64>::max()) {
         ++m_autoExposureFramesSinceAdjust;
     }
@@ -62,44 +112,150 @@ void DIMM::handleAutoExposureSample(const AutoExposureFrameSample& sample)
     }
 
     if (!decision.shouldAdjustExposure) {
+        if (enteredAutoExposureCooldown) {
+            finishResultRecord();
+            armTrackingImageSaveAfterAutoExposureCooldown(
+                sample.timestampMs + std::max<qint64>(1, decision.cooldownRemainingMs));
+        }
         return;
     }
 
+    double targetExposureUs[2] = {
+        static_cast<double>(currentExposure[0]),
+        static_cast<double>(currentExposure[1]),
+    };
+    bool hasExposureAdjustment = false;
     for (int i = 0; i < 2; ++i) {
         if (!decision.hasCameraDecision[i] ||
             !decision.camera[i].shouldAdjustExposure ||
             decision.camera[i].targetExposureUs <= 0) {
             continue;
         }
-        const int oldExposure = currentExposure[i];
-        QString reason;
-        if (!applyExposureAndHotPixelTemplate(i, decision.camera[i].targetExposureUs, &reason)) {
-            m_cameraAutoExposureReason[i] = reason;
-            m_autoExposureReason = reason;
-            setStatusMessage(reason.isEmpty()
-                                 ? QStringLiteral("自动曝光: 曝光/热像素模板切换失败")
-                                 : reason,
-                             UiStatusLevel::Error);
+        targetExposureUs[i] = decision.camera[i].targetExposureUs;
+        hasExposureAdjustment = true;
+    }
+    if (!hasExposureAdjustment) {
+        if (enteredAutoExposureCooldown) {
+            finishResultRecord();
+            armTrackingImageSaveAfterAutoExposureCooldown(
+                sample.timestampMs + std::max<qint64>(1, decision.cooldownRemainingMs));
+        }
+        return;
+    }
+
+    QString reason;
+    if (!applyTrackingExposureAndFrameRate(targetExposureUs, &reason)) {
+        m_autoExposureReason = reason;
+        for (int i = 0; i < 2; ++i) {
+            if (decision.hasCameraDecision[i] && decision.camera[i].shouldAdjustExposure) {
+                m_cameraAutoExposureReason[i] = reason;
+            }
+        }
+        setStatusMessage(reason.isEmpty()
+                             ? QStringLiteral("自动曝光: 曝光/热像素模板/帧率切换失败")
+                             : reason,
+                         UiStatusLevel::Error);
+        return;
+    }
+
+    ++m_autoExposureSequenceId;
+    m_lastAutoExposureAdjustMs = sample.timestampMs;
+    m_autoExposureFramesSinceAdjust = 0;
+    for (int i = 0; i < 2; ++i) {
+        if (!decision.hasCameraDecision[i] ||
+            !decision.camera[i].shouldAdjustExposure ||
+            decision.camera[i].targetExposureUs <= 0) {
             continue;
         }
-
         m_autoExposureController.markExposureApplied(i, sample.timestampMs);
-        ++m_autoExposureSequenceId;
         m_autoExposureTargetExposureUs = decision.camera[i].targetExposureUs;
         m_cameraAutoExposureTargetExposureUs[i] = decision.camera[i].targetExposureUs;
-        m_lastAutoExposureAdjustMs = sample.timestampMs;
-        m_autoExposureFramesSinceAdjust = 0;
-        setStatusMessage(QStringLiteral("自动曝光: 相机%1 %2 -> %3 μs，状态:%4")
+        setStatusMessage(QStringLiteral("自动曝光: 相机%1 %2 -> %3 μs，当前有效帧率 %4 Hz，状态:%5")
                              .arg(i + 1)
-                             .arg(oldExposure)
+                             .arg(currentExposure[i])
                              .arg(decision.camera[i].targetExposureUs)
+                             .arg(currentTrackingFrameRateHz(), 0, 'f', 1)
                              .arg(autoExposureStateName(decision.camera[i].state)),
-                         UiStatusLevel::Warning);
+                             UiStatusLevel::Warning);
+    }
+    if (enteredAutoExposureCooldown) {
+        finishResultRecord();
+        armTrackingImageSaveAfterAutoExposureCooldown(
+            sample.timestampMs + std::max<qint64>(1, decision.cooldownRemainingMs));
+    }
+}
+
+void DIMM::beginAutoExposureAdjustmentForAutoFocus(const QString& phase, int cameraMask)
+{
+    if (cameraMask <= 0 || (cameraMask & ~0x3) != 0 ||
+        m_captureState != CaptureState::Live || m_liveStartupPhase != LiveStartupPhase::Tracking) {
+        return;
+    }
+
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    QString cameras;
+    for (int camera = 0; camera < 2; ++camera) {
+        if ((cameraMask & (1 << camera)) == 0) {
+            continue;
+        }
+        if (!cameras.isEmpty()) {
+            cameras += QLatin1Char(',');
+        }
+        cameras += QString::number(camera + 1);
+    }
+    if (!m_autoExposureConfig.enabled) {
+        const QString reason = QStringLiteral("cameras=%1; phase=%2; disabled")
+                                   .arg(cameras)
+                                   .arg(phase);
+        writeResultSessionEvent(QStringLiteral("AutoExposureStart"), reason,
+                                QStringLiteral("Tracking"), nowMs);
+        writeResultSessionEvent(QStringLiteral("AutoExposureEnd"), reason,
+                                QStringLiteral("Tracking"), nowMs);
+        return;
+    }
+    if (m_autoExposureFocusAdjustmentActive) {
+        writeResultSessionEvent(QStringLiteral("AutoExposureEnd"),
+                                QStringLiteral("focus_adjustment_restarted"),
+                                QStringLiteral("Tracking"), nowMs);
+    }
+    m_autoExposureFocusAdjustmentActive = true;
+    resetAutoExposureState(false);
+    m_autoExposureFocusAdjustmentStartedMs = nowMs;
+    writeResultSessionEvent(QStringLiteral("AutoExposureStart"),
+                            QStringLiteral("cameras=%1; phase=%2")
+                                .arg(cameras)
+                                .arg(phase),
+                            QStringLiteral("Tracking"), nowMs);
+}
+
+void DIMM::completeAutoExposureAdjustmentForAutoFocus(qint64 sourceTimestampMs)
+{
+    if (!m_autoExposureFocusAdjustmentActive) {
+        return;
+    }
+
+    writeResultSessionEvent(QStringLiteral("AutoExposureEnd"),
+                            QStringLiteral("focus_adjustment_complete"),
+                            QStringLiteral("Tracking"), sourceTimestampMs);
+    m_autoExposureFocusAdjustmentActive = false;
+    m_autoExposureFocusAdjustmentStartedMs = -1;
+    for (int cameraIndex = 0; cameraIndex < 2; ++cameraIndex) {
+        if (!m_autoFocusAwaitingPreExposure[cameraIndex]) {
+            continue;
+        }
+        const AutoFocusAction action = m_deferredAutoFocusAction[cameraIndex];
+        const QString context = m_deferredAutoFocusContext[cameraIndex];
+        m_autoFocusAwaitingPreExposure[cameraIndex] = false;
+        m_autoFocusPreExposureComplete[cameraIndex] = true;
+        m_deferredAutoFocusAction[cameraIndex] = {};
+        m_deferredAutoFocusContext[cameraIndex].clear();
+        handleAutoFocusAction(cameraIndex, action, context);
     }
 }
 
 void DIMM::resetAutoExposureState(bool applyInitialExposure)
 {
+    clearTrackingImageSaveAfterAutoExposureCooldown();
     m_autoExposureController.configure(m_autoExposureConfig);
     m_latestAutoExposureTrend = AutoExposureTrendSnapshot();
     m_autoExposureState = AutoExposureState::Normal;
@@ -118,25 +274,19 @@ void DIMM::resetAutoExposureState(bool applyInitialExposure)
         m_latestAutoExposureValidRatio[i] = 0.0;
         m_latestAutoExposureUsableRatio[i] = 0.0;
     }
-    if (!applyInitialExposure ||
-        !shouldApplyAutoExposureInitialExposure(m_autoAcquisitionConfig.enabled,
-                                                 m_autoExposureConfig.enabled)) {
+    if (!applyInitialExposure) {
         return;
     }
 
-    if (m_autoExposureConfig.enabled) {
-        const int initialExposureUs =
-            static_cast<int>(std::lround(std::clamp(m_autoExposureConfig.initialExposureUs,
-                                                    m_autoExposureConfig.minExposureUs,
-                                                    m_autoExposureConfig.maxExposureUs)));
-        QString reason;
-        if (!applyExposureAndHotPixelTemplate(initialExposureUs, &reason)) {
-            m_autoExposureReason = reason;
-            setStatusMessage(reason.isEmpty()
-                                 ? QStringLiteral("自动曝光: 启动默认曝光应用失败")
-                                 : reason,
-                             UiStatusLevel::Warning);
-        }
+    QString reason;
+    const int initialExposureUs =
+        static_cast<int>(std::lround(m_autoExposureConfig.initialExposureUs));
+    if (!applyExposureAndHotPixelTemplate(initialExposureUs, &reason)) {
+        m_autoExposureReason = reason;
+        setStatusMessage(reason.isEmpty()
+                             ? QStringLiteral("自动采集: 启动默认曝光应用失败")
+                             : reason,
+                         UiStatusLevel::Warning);
     }
 }
 

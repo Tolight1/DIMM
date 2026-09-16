@@ -226,3 +226,33 @@ private:
     double smoothDisplayMaxY(double targetMaxY);
     static double niceCeil(double value);
 };
+
+class PsdChartWidget : public QWidget {
+    Q_OBJECT
+
+public:
+    explicit PsdChartWidget(const QString& title, QWidget* parent = nullptr);
+
+    void setResult(const CdimPsdChannelResult& result, double fsActualHz);
+    void clear();
+
+protected:
+    void paintEvent(QPaintEvent*) override;
+
+private:
+    QString m_title;
+    CdimPsdChannelResult m_result;
+    double m_fsActualHz = 0.0;
+    bool m_hasData = false;
+
+    void drawCurve(QPainter& painter,
+                   const QVector<double>& x,
+                   const QVector<double>& y,
+                   QRect chartRect,
+                   double xMax,
+                   double logMin,
+                   double logMax,
+                   const QColor& color,
+                   Qt::PenStyle style = Qt::SolidLine,
+                   qreal width = 1.5) const;
+};

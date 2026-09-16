@@ -4,6 +4,7 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDoubleSpinBox>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -224,6 +225,147 @@ void FocuserControlWidget::buildUi()
 
     mainLayout->addWidget(paramGroup);
 
+    auto* autoFocusGroup = new QGroupBox(QStringLiteral("自动调焦"));
+    auto* autoFocusLayout = new QVBoxLayout(autoFocusGroup);
+    autoFocusLayout->setSpacing(10);
+
+    auto makeRequiredSpin = []() {
+        auto* spin = new QSpinBox();
+        spin->setRange(0, 1000000);
+        spin->setSpecialValueText(QStringLiteral("未设置"));
+        return spin;
+    };
+    auto makeRequiredDouble = []() {
+        auto* spin = new QDoubleSpinBox();
+        spin->setRange(0.0, 1000000000.0);
+        spin->setDecimals(6);
+        spin->setSingleStep(0.01);
+        spin->setSpecialValueText(QStringLiteral("未设置"));
+        return spin;
+    };
+    auto makeRatio = []() {
+        auto* spin = new QDoubleSpinBox();
+        spin->setRange(0.0, 0.499999);
+        spin->setDecimals(6);
+        spin->setSingleStep(0.01);
+        spin->setSpecialValueText(QStringLiteral("未设置"));
+        return spin;
+    };
+
+    auto* enableLayout = new QHBoxLayout();
+    m_autoFocusMasterCheck = new QCheckBox(QStringLiteral("启用自动调焦"));
+    m_autoFocusMasterCheck->setToolTip(
+        QStringLiteral("只在 Tracking 状态使用既有的 64x64 ROI 图像。"));
+    enableLayout->addWidget(m_autoFocusMasterCheck);
+    enableLayout->addStretch();
+    autoFocusLayout->addLayout(enableLayout);
+
+    for (int camera = 0; camera < 2; ++camera) {
+        auto* cameraGroup = new QGroupBox(QStringLiteral("相机 %1 参考标定").arg(camera + 1));
+        auto* cameraLayout = new QFormLayout(cameraGroup);
+        cameraLayout->setHorizontalSpacing(16);
+        cameraLayout->setVerticalSpacing(8);
+        m_autoFocusCameraEnabled[camera] = new QCheckBox(QStringLiteral("启用相机 %1 自动调焦").arg(camera + 1));
+        cameraLayout->addRow(m_autoFocusCameraEnabled[camera]);
+
+        const auto addReferenceRow = [&cameraLayout, &makeRequiredDouble](const QString& name,
+                                                                             QDoubleSpinBox*& value,
+                                                                             QCheckBox*& autoCalibrate) {
+            auto* row = new QHBoxLayout();
+            value = makeRequiredDouble();
+            autoCalibrate = new QCheckBox(QStringLiteral("Tracking 自动标定"));
+            row->addWidget(value);
+            row->addWidget(autoCalibrate);
+            cameraLayout->addRow(name, row);
+        };
+        addReferenceRow(QStringLiteral("Reference HFR:"),
+                        m_autoFocusReferenceHfr[camera],
+                        m_autoFocusCalibrateHfr[camera]);
+        m_autoFocusReasonableHfrMinimum[camera] = makeRequiredDouble();
+        cameraLayout->addRow(QStringLiteral("合理 HFR 最小值:"),
+                             m_autoFocusReasonableHfrMinimum[camera]);
+        addReferenceRow(QStringLiteral("Reference RMS:"),
+                        m_autoFocusReferenceRms[camera],
+                        m_autoFocusCalibrateRms[camera]);
+        autoFocusLayout->addWidget(cameraGroup);
+    }
+
+    auto* samplingGroup = new QGroupBox(QStringLiteral("采样与触发"));
+    auto* samplingLayout = new QFormLayout(samplingGroup);
+    m_autoFocusFramesPerStateSpin = makeRequiredSpin();
+    samplingLayout->addRow(QStringLiteral("每阶段有效帧数 N:"), m_autoFocusFramesPerStateSpin);
+    m_autoFocusSettleTimeSpin = makeRequiredSpin();
+    samplingLayout->addRow(QStringLiteral("停止后稳定等待 (ms):"), m_autoFocusSettleTimeSpin);
+    m_autoFocusStageTimeoutSpin = makeRequiredSpin();
+    samplingLayout->addRow(QStringLiteral("调焦阶段超时 (ms):"), m_autoFocusStageTimeoutSpin);
+    m_autoFocusTemperatureThresholdSpin = makeRequiredDouble();
+    samplingLayout->addRow(QStringLiteral("温度触发阈值 (°C):"), m_autoFocusTemperatureThresholdSpin);
+    m_autoFocusStatisticsModeCombo = new QComboBox();
+    m_autoFocusStatisticsModeCombo->addItem(QStringLiteral("均值"),
+                                             static_cast<int>(AutoFocusStatisticsMode::Mean));
+    m_autoFocusStatisticsModeCombo->addItem(QStringLiteral("中位数"),
+                                             static_cast<int>(AutoFocusStatisticsMode::Median));
+    m_autoFocusStatisticsModeCombo->addItem(QStringLiteral("截尾均值"),
+                                             static_cast<int>(AutoFocusStatisticsMode::TrimmedMean));
+    samplingLayout->addRow(QStringLiteral("统计方式:"), m_autoFocusStatisticsModeCombo);
+    m_autoFocusTrimRatioSpin = makeRatio();
+    samplingLayout->addRow(QStringLiteral("截尾比例 (仅截尾均值):"), m_autoFocusTrimRatioSpin);
+    autoFocusLayout->addWidget(samplingGroup);
+
+    auto* searchGroup = new QGroupBox(QStringLiteral("调焦方向与调整搜索"));
+    auto* searchLayout = new QFormLayout(searchGroup);
+    m_autoFocusStepSpin = makeRequiredSpin();
+    searchLayout->addRow(QStringLiteral("搜索步长:"), m_autoFocusStepSpin);
+    m_autoFocusMaximumRangeSpin = makeRequiredSpin();
+    searchLayout->addRow(QStringLiteral("最大搜索行程:"), m_autoFocusMaximumRangeSpin);
+    m_autoFocusStartupSearchRadiusSpin = makeRequiredSpin();
+    searchLayout->addRow(QStringLiteral("启动调焦搜索半径 (±步):"),
+                         m_autoFocusStartupSearchRadiusSpin);
+    m_autoFocusMaximumIterationsSpin = makeRequiredSpin();
+    searchLayout->addRow(QStringLiteral("最大搜索次数:"), m_autoFocusMaximumIterationsSpin);
+    m_autoFocusDirectionImprovementSpin = makeRatio();
+    searchLayout->addRow(QStringLiteral("方向搜索连续改善幅度 (比例):"),
+                         m_autoFocusDirectionImprovementSpin);
+    m_autoFocusDirectionWorseningSpin = makeRatio();
+    searchLayout->addRow(QStringLiteral("方向搜索连续恶化幅度 (比例):"),
+                         m_autoFocusDirectionWorseningSpin);
+    m_autoFocusHfrImprovementSpin = makeRatio();
+    searchLayout->addRow(QStringLiteral("调整阶段越焦判定容差 (比例):"),
+                         m_autoFocusHfrImprovementSpin);
+    m_autoFocusHfrToleranceSpin = makeRatio();
+    searchLayout->addRow(QStringLiteral("HFR 最终容差 (比例):"), m_autoFocusHfrToleranceSpin);
+    m_autoFocusStabilitySpin = makeRequiredDouble();
+    searchLayout->addRow(QStringLiteral("HFR 稳定性阈值 (比例):"), m_autoFocusStabilitySpin);
+    m_autoFocusRmsToleranceSpin = makeRatio();
+    searchLayout->addRow(QStringLiteral("RMS 辅助容差 (比例):"), m_autoFocusRmsToleranceSpin);
+    autoFocusLayout->addWidget(searchGroup);
+
+    auto* callbackGroup = new QGroupBox(QStringLiteral("回调补偿"));
+    auto* callbackLayout = new QFormLayout(callbackGroup);
+    m_autoFocusCallbackStepSpin = makeRequiredSpin();
+    callbackLayout->addRow(QStringLiteral("回调步长:"), m_autoFocusCallbackStepSpin);
+    m_autoFocusCallbackHfrToleranceSpin = makeRatio();
+    callbackLayout->addRow(QStringLiteral("越焦回调达标 HFR 容差 (比例):"),
+                           m_autoFocusCallbackHfrToleranceSpin);
+    autoFocusLayout->addWidget(callbackGroup);
+
+    auto* autoFocusActions = new QHBoxLayout();
+    m_autoFocusLoggingCheck = new QCheckBox(QStringLiteral("启用自动调焦数据日志"));
+    autoFocusActions->addWidget(m_autoFocusLoggingCheck);
+    autoFocusActions->addStretch();
+    m_autoFocusApplyBtn = new QPushButton(QStringLiteral("应用自动调焦设置"));
+    m_autoFocusManualStartBtn = new QPushButton(QStringLiteral("立即自动调焦"));
+    m_autoFocusManualStartBtn->setToolTip(
+        QStringLiteral("仅在 Tracking 中可用；对所有已启用且可调的相机并行开始。"));
+    autoFocusActions->addWidget(m_autoFocusApplyBtn);
+    autoFocusActions->addWidget(m_autoFocusManualStartBtn);
+    autoFocusLayout->addLayout(autoFocusActions);
+    m_autoFocusStatusLabel = new QLabel();
+    m_autoFocusStatusLabel->setWordWrap(true);
+    m_autoFocusStatusLabel->setStyleSheet(QStringLiteral("QLabel { color: #f0c060; }"));
+    autoFocusLayout->addWidget(m_autoFocusStatusLabel);
+    mainLayout->addWidget(autoFocusGroup);
+
     m_motionLockLabel = new QLabel();
     m_motionLockLabel->setWordWrap(true);
     m_motionLockLabel->setStyleSheet(QStringLiteral("QLabel { color: #ff6666; padding: 8px; }"));
@@ -231,6 +373,11 @@ void FocuserControlWidget::buildUi()
     mainLayout->addWidget(m_motionLockLabel);
 
     mainLayout->addStretch();
+
+    {
+        QSettings settings;
+        setAutoFocusConfigUi(AutoFocusSettings::load(settings));
+    }
 
     connect(m_refreshBtn, &QPushButton::clicked, this, &FocuserControlWidget::onRefreshDevices);
     connect(m_applyMappingBtn, &QPushButton::clicked, this, &FocuserControlWidget::onApplyMapping);
@@ -249,6 +396,18 @@ void FocuserControlWidget::buildUi()
     connect(m_maxStepApplyBtn, &QPushButton::clicked, this, &FocuserControlWidget::onApplyMaxStep);
     connect(m_telescopeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &FocuserControlWidget::onTelescopeSelectionChanged);
+    connect(m_autoFocusApplyBtn, &QPushButton::clicked,
+            this, &FocuserControlWidget::onApplyAutoFocus);
+    connect(m_autoFocusManualStartBtn, &QPushButton::clicked,
+            this, &FocuserControlWidget::onManualAutoFocus);
+    connect(m_autoFocusMasterCheck, &QCheckBox::toggled,
+            this, &FocuserControlWidget::onAutoFocusEnableChanged);
+    connect(m_autoFocusCameraEnabled[0], &QCheckBox::toggled,
+            this, &FocuserControlWidget::onAutoFocusEnableChanged);
+    connect(m_autoFocusCameraEnabled[1], &QCheckBox::toggled,
+            this, &FocuserControlWidget::onAutoFocusEnableChanged);
+    connect(m_autoFocusStatisticsModeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int) { updateAutoFocusControlStates(); });
 
     updateControlStates();
 }
@@ -558,6 +717,7 @@ void FocuserControlWidget::onTelescopeSelectionChanged(int index)
         const TelescopeSlot slot = static_cast<TelescopeSlot>(m_telescopeCombo->currentData().toInt());
         m_manager->requestStateRefresh(slot);
     }
+    updateControlStates();
 }
 
 void FocuserControlWidget::onSdkAvailabilityChanged(bool available, QString detail)
@@ -580,13 +740,177 @@ void FocuserControlWidget::onCommandFailed(TelescopeSlot slot, QString command, 
 void FocuserControlWidget::setMotionAllowed(bool allowed, const QString& reason)
 {
     m_motionAllowed = allowed;
-    if (allowed) {
-        m_motionLockLabel->hide();
-    } else {
-        m_motionLockLabel->setText(reason);
-        m_motionLockLabel->show();
-    }
+    m_motionLockReason = reason;
     updateControlStates();
+}
+
+void FocuserControlWidget::setAutoFocusMotionLocked(TelescopeSlot slot, bool locked)
+{
+    const int index = static_cast<int>(slot);
+    if (index < 0 || index >= 2) {
+        return;
+    }
+    m_autoFocusMotionLocked[index] = locked;
+    updateControlStates();
+}
+
+void FocuserControlWidget::setAutoFocusTrackingAvailable(bool available)
+{
+    m_autoFocusTrackingAvailable = available;
+    updateAutoFocusControlStates();
+}
+
+AutoFocusConfig FocuserControlWidget::autoFocusConfigFromUi() const
+{
+    AutoFocusConfig config;
+    config.masterEnabled = m_autoFocusMasterCheck->isChecked();
+    for (int camera = 0; camera < 2; ++camera) {
+        config.cameraEnabled[camera] = m_autoFocusCameraEnabled[camera]->isChecked();
+        config.reference[camera].hfr = m_autoFocusReferenceHfr[camera]->value();
+        config.reference[camera].rms = m_autoFocusReferenceRms[camera]->value();
+        config.reasonableHfrMinimum[camera] = m_autoFocusReasonableHfrMinimum[camera]->value();
+        config.autoCalibrateHfr[camera] = m_autoFocusCalibrateHfr[camera]->isChecked();
+        config.autoCalibrateRms[camera] = m_autoFocusCalibrateRms[camera]->isChecked();
+    }
+    config.framesPerState = m_autoFocusFramesPerStateSpin->value();
+    config.settleTimeMs = m_autoFocusSettleTimeSpin->value();
+    config.focuserStageTimeoutMs = m_autoFocusStageTimeoutSpin->value();
+    config.temperatureTriggerThreshold = m_autoFocusTemperatureThresholdSpin->value();
+    config.statisticsMode = static_cast<AutoFocusStatisticsMode>(
+        m_autoFocusStatisticsModeCombo->currentData().toInt());
+    config.trimRatio = m_autoFocusTrimRatioSpin->value();
+    config.focusStep = m_autoFocusStepSpin->value();
+    config.maximumSearchRange = m_autoFocusMaximumRangeSpin->value();
+    config.startupSearchRadius = m_autoFocusStartupSearchRadiusSpin->value();
+    config.maximumIterations = m_autoFocusMaximumIterationsSpin->value();
+    config.directionImprovementThreshold = m_autoFocusDirectionImprovementSpin->value();
+    config.directionWorseningThreshold = m_autoFocusDirectionWorseningSpin->value();
+    config.hfrImprovementThreshold = m_autoFocusHfrImprovementSpin->value();
+    config.callbackHfrTolerance = m_autoFocusCallbackHfrToleranceSpin->value();
+    config.hfrFinalTolerance = m_autoFocusHfrToleranceSpin->value();
+    config.focusStabilityThreshold = m_autoFocusStabilitySpin->value();
+    config.rmsAuxiliaryThreshold = m_autoFocusRmsToleranceSpin->value();
+    config.callbackStep = m_autoFocusCallbackStepSpin->value();
+    config.dataLoggingEnabled = m_autoFocusLoggingCheck->isChecked();
+    return config;
+}
+
+// Kept out of line because DIMM refreshes these values after a reference calibration.
+void FocuserControlWidget::setAutoFocusConfigUi(const AutoFocusConfig& config)
+{
+    m_autoFocusAppliedConfig = config;
+    m_autoFocusMasterCheck->setChecked(config.masterEnabled);
+    for (int camera = 0; camera < 2; ++camera) {
+        m_autoFocusCameraEnabled[camera]->setChecked(config.cameraEnabled[camera]);
+        m_autoFocusReferenceHfr[camera]->setValue(config.reference[camera].hfr);
+        m_autoFocusReferenceRms[camera]->setValue(config.reference[camera].rms);
+        m_autoFocusReasonableHfrMinimum[camera]->setValue(config.reasonableHfrMinimum[camera]);
+        m_autoFocusCalibrateHfr[camera]->setChecked(config.autoCalibrateHfr[camera]);
+        m_autoFocusCalibrateRms[camera]->setChecked(config.autoCalibrateRms[camera]);
+    }
+    m_autoFocusFramesPerStateSpin->setValue(config.framesPerState);
+    m_autoFocusSettleTimeSpin->setValue(config.settleTimeMs);
+    m_autoFocusStageTimeoutSpin->setValue(config.focuserStageTimeoutMs);
+    m_autoFocusTemperatureThresholdSpin->setValue(config.temperatureTriggerThreshold);
+    const int statisticsIndex = m_autoFocusStatisticsModeCombo->findData(
+        static_cast<int>(config.statisticsMode));
+    m_autoFocusStatisticsModeCombo->setCurrentIndex(statisticsIndex >= 0 ? statisticsIndex : 0);
+    m_autoFocusTrimRatioSpin->setValue(config.trimRatio);
+    m_autoFocusStepSpin->setValue(config.focusStep);
+    m_autoFocusMaximumRangeSpin->setValue(config.maximumSearchRange);
+    m_autoFocusStartupSearchRadiusSpin->setValue(config.startupSearchRadius);
+    m_autoFocusMaximumIterationsSpin->setValue(config.maximumIterations);
+    m_autoFocusDirectionImprovementSpin->setValue(config.directionImprovementThreshold);
+    m_autoFocusDirectionWorseningSpin->setValue(config.directionWorseningThreshold);
+    m_autoFocusHfrImprovementSpin->setValue(config.hfrImprovementThreshold);
+    m_autoFocusCallbackHfrToleranceSpin->setValue(config.callbackHfrTolerance);
+    m_autoFocusHfrToleranceSpin->setValue(config.hfrFinalTolerance);
+    m_autoFocusStabilitySpin->setValue(config.focusStabilityThreshold);
+    m_autoFocusRmsToleranceSpin->setValue(config.rmsAuxiliaryThreshold);
+    m_autoFocusCallbackStepSpin->setValue(config.callbackStep);
+    m_autoFocusLoggingCheck->setChecked(config.dataLoggingEnabled);
+    updateAutoFocusControlStates();
+}
+
+bool FocuserControlWidget::applyAutoFocusConfiguration(bool showError)
+{
+    const AutoFocusConfig config = autoFocusConfigFromUi();
+    const QString error = AutoFocusSettings::validationError(config);
+    if (!error.isEmpty()) {
+        const QString text = QStringLiteral("自动调焦设置无效：%1").arg(error);
+        m_autoFocusStatusLabel->setText(text);
+        if (showError) {
+            QMessageBox::warning(this, QStringLiteral("自动调焦设置"), text);
+        }
+        return false;
+    }
+
+    QSettings settings;
+    AutoFocusSettings::save(settings, config);
+    settings.sync();
+    m_autoFocusAppliedConfig = config;
+    m_autoFocusStatusLabel->setText(
+        QStringLiteral("自动调焦设置已应用；非禁用参数将在当前轮次结束后生效。"));
+    emit autoFocusConfigApplied(config);
+    return true;
+}
+
+void FocuserControlWidget::onApplyAutoFocus()
+{
+    applyAutoFocusConfiguration(true);
+}
+
+void FocuserControlWidget::onManualAutoFocus()
+{
+    if (!m_autoFocusTrackingAvailable || !m_motionAllowed) {
+        return;
+    }
+    if (!applyAutoFocusConfiguration(true)) {
+        return;
+    }
+    emit manualAutoFocusRequested();
+}
+
+void FocuserControlWidget::onAutoFocusEnableChanged(bool enabled)
+{
+    if (enabled) {
+        return;
+    }
+
+    int cameraIndex = -1;
+    if (sender() == m_autoFocusCameraEnabled[0]) {
+        cameraIndex = 0;
+    } else if (sender() == m_autoFocusCameraEnabled[1]) {
+        cameraIndex = 1;
+    }
+
+    QSettings settings;
+    if (cameraIndex < 0) {
+        m_autoFocusAppliedConfig.masterEnabled = false;
+        settings.setValue(QStringLiteral("autofocus/master_enabled"), false);
+    } else {
+        m_autoFocusAppliedConfig.cameraEnabled[cameraIndex] = false;
+        settings.setValue(QStringLiteral("autofocus/camera%1/enabled").arg(cameraIndex + 1), false);
+    }
+    settings.sync();
+    m_autoFocusStatusLabel->setText(
+        QStringLiteral("自动调焦已停止；相关焦点器人工控制已恢复。"));
+    emit autoFocusDisabled(cameraIndex);
+}
+
+void FocuserControlWidget::updateAutoFocusControlStates()
+{
+    m_autoFocusTrimRatioSpin->setEnabled(
+        static_cast<AutoFocusStatisticsMode>(
+            m_autoFocusStatisticsModeCombo->currentData().toInt()) ==
+        AutoFocusStatisticsMode::TrimmedMean);
+    const bool manualStartAvailable =
+        AutoFocusSettings::manualStartAvailable(m_autoFocusTrackingAvailable) && m_motionAllowed;
+    m_autoFocusManualStartBtn->setEnabled(manualStartAvailable);
+    if (!m_autoFocusTrackingAvailable) {
+        m_autoFocusStatusLabel->setText(
+            QStringLiteral("仅在 Tracking 状态可立即调焦或接收自动调焦 ROI 帧。"));
+    }
 }
 
 void FocuserControlWidget::updateControlStates()
@@ -594,19 +918,32 @@ void FocuserControlWidget::updateControlStates()
     const bool sdkOk = m_manager && m_manager->sdkLoader() && m_manager->sdkLoader()->isLoaded();
     const bool deviceOpened = m_currentState.opened;
     const bool moving = m_currentState.moving;
-    const bool canMove = sdkOk && deviceOpened && !moving && m_motionAllowed;
-    const bool canWrite = sdkOk && deviceOpened && !moving && m_motionAllowed;
+    const int selectedSlot = currentSlotIndex();
+    const bool autoFocusLocked = selectedSlot >= 0 && selectedSlot < 2 &&
+                                 m_autoFocusMotionLocked[selectedSlot];
+    const bool motionAllowed = m_motionAllowed && !autoFocusLocked;
+    if (!motionAllowed) {
+        m_motionLockLabel->setText(
+            autoFocusLocked
+                ? QStringLiteral("当前光路正在自动调焦。请先关闭该路自动调焦，再进行人工焦点器操作。")
+                : m_motionLockReason);
+        m_motionLockLabel->show();
+    } else {
+        m_motionLockLabel->hide();
+    }
+    const bool canMove = sdkOk && deviceOpened && !moving && motionAllowed;
+    const bool canWrite = sdkOk && deviceOpened && !moving && motionAllowed;
 
     m_refreshBtn->setEnabled(true);
     m_applyMappingBtn->setEnabled(sdkOk && !m_devices.isEmpty());
     m_swapMappingBtn->setEnabled(sdkOk && m_devices.size() >= 2);
     m_openBtn->setEnabled(sdkOk && !m_devices.isEmpty() && !deviceOpened);
-    m_closeBtn->setEnabled(sdkOk && deviceOpened);
+    m_closeBtn->setEnabled(sdkOk && deviceOpened && motionAllowed);
 
     m_decreaseBtn->setEnabled(canMove);
     m_increaseBtn->setEnabled(canMove);
     m_moveToTargetBtn->setEnabled(canMove);
-    m_stopBtn->setEnabled(sdkOk && deviceOpened);
+    m_stopBtn->setEnabled(canMove);
 
     m_reverseApplyBtn->setEnabled(canWrite);
     m_backlashApplyBtn->setEnabled(canWrite);
@@ -621,6 +958,8 @@ void FocuserControlWidget::updateControlStates()
     m_reverseCheck->setEnabled(canWrite);
     m_beepCheck->setEnabled(canWrite);
     m_ledCheck->setEnabled(canWrite);
+
+    updateAutoFocusControlStates();
 }
 
 int FocuserControlWidget::currentSlotIndex() const
